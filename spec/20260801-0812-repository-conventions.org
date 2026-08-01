@@ -1,0 +1,47 @@
+#+title: Repository conventions migration
+#+date: 2026-08-01 08:12 UTC
+
+* Goal
+
+Align repository coordination and project-tracking files with =AGENTS.md=
+without changing application behavior.
+
+* Scope
+
+- Replace Make task coordination with mise tasks.
+- Convert the roadmap from Markdown to Org mode.
+- Convert the README from Markdown to Org mode.
+- Establish the deliberately-deferred-work index required by the workflow.
+- Update contributor-facing commands that are affected by the migration.
+
+Rust and eBPF implementation changes are out of scope.
+
+* Decisions
+
+- Define mise tasks in =mise.toml= so task discovery and execution use the
+  repository's preferred coordinator.
+- Preserve the existing build, privileged run, and debug-server behaviors.
+- Keep roadmap wording and checkbox state intact during the Org conversion.
+- Preserve README wording, commands, and license links during its Org conversion.
+- Start =TODO.org= empty apart from guidance because this migration does not
+  intentionally defer work.
+
+* TODO
+
+- [X] S1 Convert =Makefile= tasks to mise and update command documentation.
+- [X] S2 Convert =ROADMAP.md= to =ROADMAP.org= without semantic changes.
+- [X] S3 Add the required =TODO.org= deferred-work index.
+- [ ] S4 Validate mise task discovery, Org files, and the Rust workspace.
+- [X] S5 Convert =README.md= to =README.org= without semantic changes.
+
+* Validation
+
+- =mise tasks --json=: passed; =build=, =run=, and =debug= are discovered from
+  =mise.toml=.
+- =cargo test --workspace=: 4 tests passed and 1 failed. The pre-existing
+  =tests::renders_invalid_utf8_without_changing_the_payload= test depends on PID
+  123 existing in the host's =/proc= and rendered an empty process name. This is
+  tracked in =TODO.org=; S4 remains unchecked because the local suite is not
+  fully passing.
+- =README.org=: headings, source blocks, inline code, and local license links
+  were converted to native Org syntax; no stale =README.md= references remain.

@@ -1,0 +1,86 @@
+#+title: boring-logtail
+
+* Prerequisites
+
+1. stable rust toolchains: =rustup toolchain install stable=
+2. nightly rust toolchains: =rustup toolchain install nightly --component rust-src=
+3. (if cross-compiling) rustup target: =rustup target add ${ARCH}-unknown-linux-musl=
+4. (if cross-compiling) LLVM: (e.g.) =brew install llvm= (on macOS)
+5. bpf-linker: =cargo install bpf-linker= (=--no-default-features= on macOS)
+
+* Build & Run
+
+Use =cargo check= and =cargo test= as normal. Repository workflows are exposed
+as mise tasks. Build and run the program with the privileges required to load
+eBPF programs:
+
+#+begin_src shell
+mise run build
+mise run run
+#+end_src
+
+Use =mise tasks= to list all available tasks.
+
+* Kubernetes development
+
+The application runs as a privileged DaemonSet because loading and attaching
+its eBPF programs requires access to each node's kernel. Ensure your cluster's
+pod-security policy permits privileged workloads in the =boring-logtail=
+namespace.
+
+Authenticate the local Docker daemon to the GitLab Container Registry with a
+token that has =write_registry=, then start the development loop:
+
+#+begin_src shell
+docker login registry.gitlab.com
+skaffold dev
+#+end_src
+
+The cluster pulls with the =gitlab-registry= Secret in the =boring-logtail=
+namespace. Provision it through GitOps as a SOPS-encrypted
+=kubernetes.io/dockerconfigjson= Secret using a deploy token with only
+=read_registry=; do not commit an unencrypted registry token.
+
+Skaffold builds the image, deploys =k8s/boring-logtail.yaml=, streams logs, and
+rebuilds after source changes. Use =skaffold delete= to remove the development
+resources.
+
+The userspace logger shows eBPF =info!= messages by default. Set =RUST_LOG= to
+override the filter. In a second terminal, write to stdout or stderr to exercise
+the tracepoint.
+
+Cargo build scripts are used to automatically build the eBPF correctly and
+include it in the program.
+
+* Cross-compiling on macOS
+
+Cross compilation should work on both Intel and Apple Silicon Macs.
+
+#+begin_src shell
+cargo build --package boring-logtail --release \
+  --target=${ARCH}-unknown-linux-musl \
+  --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
+#+end_src
+
+The cross-compiled program
+=target/${ARCH}-unknown-linux-musl/release/boring-logtail= can be copied to a
+Linux server or VM and run there.
+
+* License
+
+With the exception of eBPF code, boring-logtail is distributed under the terms
+of either the [[file:LICENSE-MIT][MIT license]] or the [[file:LICENSE-APACHE][Apache License]] (version 2.0), at your
+option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+
+** eBPF
+
+All eBPF code is distributed under either the terms of the
+[[file:LICENSE-GPL2][GNU General Public License, Version 2]] or the [[file:LICENSE-MIT][MIT license]], at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the GPL-2 license, shall be
+dual licensed as above, without any additional terms or conditions.

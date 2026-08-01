@@ -1,0 +1,15 @@
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.run]
+description = "Build and run boring-logtail with eBPF privileges"
+depends = ["build"]
+run = "sudo -E target/release/boring-logtail"
+
+[tasks.debug]
+description = "Build and expose boring-logtail to LLDB on port 1234"
+run = [
+  "cargo build",
+  "sudo -E lldb-server gdbserver 127.0.0.1:1234 target/debug/boring-logtail",
+]

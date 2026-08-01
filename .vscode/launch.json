@@ -1,0 +1,17 @@
+  {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Debug privileged boring-logtail",
+        "type": "lldb",
+        "request": "launch",
+        "targetCreateCommands": [
+          "target create ${workspaceFolder}/target/debug/boring-logtail"
+        ],
+        "processCreateCommands": [
+          "gdb-remote 127.0.0.1:1234"
+        ],
+        "sourceLanguages": ["rust"]
+      }
+    ]
+  }

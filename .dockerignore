@@ -1,0 +1,9 @@
+.git
+.github
+.vscode
+target
+*.log
+Dockerfile*
+README.md
+ROADMAP.md
+LICENSE-*

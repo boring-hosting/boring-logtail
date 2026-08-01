@@ -1,0 +1,10 @@
+#+title: Deferred work and ideas
+
+This file indexes deliberately deferred work and ideas worth revisiting. Active
+execution steps belong in the TODO section of their corresponding file under
+=spec/=.
+
+* TODO Make process-name rendering tests independent of host =/proc= state
+
+The test currently assumes PID 123 exists, so =cargo test --workspace= can fail
+on otherwise valid hosts. See [[file:spec/20260801-0812-repository-conventions.org][repository conventions migration]].

@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boring-logtail
+  labels:
+    app.kubernetes.io/name: boring-logtail
+    app.kubernetes.io/part-of: boring-logtail
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: boring-logtail
+  namespace: boring-logtail
+  labels:
+    app.kubernetes.io/name: boring-logtail
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: boring-logtail
+automountServiceAccountToken: false
+imagePullSecrets:
+  - name: gitlab-registry
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: boring-logtail
+  namespace: boring-logtail
+  labels:
+    app.kubernetes.io/name: boring-logtail
+    app.kubernetes.io/component: collector
+    app.kubernetes.io/part-of: boring-logtail
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: boring-logtail
+      app.kubernetes.io/component: collector
+  minReadySeconds: 5
+  revisionHistoryLimit: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: boring-logtail
+        app.kubernetes.io/component: collector
+        app.kubernetes.io/part-of: boring-logtail
+    spec:
+      serviceAccountName: boring-logtail
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: boring-logtail
+          image: registry.gitlab.com/biomehub/boring-logtail
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
+      volumes:
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
+            type: Directory

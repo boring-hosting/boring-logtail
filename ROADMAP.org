@@ -1,0 +1,62 @@
+#+title: boring-logtail roadmap
+
+The capture source of truth is the byte sequence that the kernel reports as
+successfully written to a container output stream. The eBPF transport emits
+versioned =WriteEvent= chunks; userspace reconstructs application log records
+and enriches them with Kubernetes identity.
+
+* Capture contract
+
+- [X] Name the kernel/userspace model =WriteEvent=.
+- [X] Keep payloads as opaque bytes; do not construct log or JSON objects in eBPF.
+- [X] Include ABI version, timestamp, cgroup ID, PID, TID, descriptor, syscall
+  kind, operation ID, chunk offset, requested length, result, and flags.
+- [X] Make truncation and read failure representable.
+- [ ] Reject unsupported ABI versions in userspace.
+- [ ] Add loss counters for ring-buffer reservation and userspace eviction.
+- [ ] Define an ordering guarantee and operation-ID uniqueness across chunks.
+
+* Syscall coverage
+
+- [X] Pair =sys_enter_write= with =sys_exit_write=; publish only the bytes that
+  the syscall reports as written.
+- [ ] Capture and reconstruct writes larger than one chunk without silent loss.
+- [ ] Pair and capture =writev=, including writes spanning multiple iovecs.
+- [ ] Measure =write=/=writev= coverage against representative Node, JVM, Go,
+  Python, Rust, and native workloads.
+- [ ] Investigate and measure =pwrite=/=pwritev= to redirected output streams.
+- [ ] Investigate and measure =sendfile=.
+- [ ] Investigate and measure =splice=/=vmsplice=.
+- [ ] Investigate and measure =io_uring= output operations.
+- [ ] Maintain fixtures for every supported syscall path and an explicit metric
+  for recognized-but-unsupported paths.
+
+* Stream identity coverage
+
+- [X] Initially recognize numeric descriptors 1 and 2.
+- [ ] Observe =close=, =dup=, =dup2=, =dup3=, and =fcntl= descriptor duplication.
+- [ ] Track the underlying file/pipe identity of container stdout and stderr.
+- [ ] Capture writes through duplicated descriptors referring to those streams.
+- [ ] Distinguish fd 1/2 after they have been redirected to unrelated files.
+- [ ] Support multiple processes sharing one container output stream.
+- [ ] Test close, replacement, redirection, inheritance, PID reuse, and container
+  restart explicitly.
+
+* Reconstruction and Kubernetes identity
+
+- [ ] Join chunks by stable operation identity and report missing chunks.
+- [ ] Frame newline, multiline, JSON, and opaque-byte records in userspace.
+- [ ] Preserve raw bytes and integrity status even when decoding fails.
+- [ ] Resolve cgroup ID to runtime container ID.
+- [ ] Enrich through a node-scoped Pod cache with node, namespace, Pod name and
+  UID, container name and ID, attempt, stream, PID, and TID.
+- [ ] Retain metadata tombstones long enough to drain terminated containers.
+- [ ] Keep Kubernetes API and runtime lookups outside the capture hot path.
+
+* Release gates
+
+- [ ] No silent byte loss: every loss boundary has a counter or integrity marker.
+- [ ] Coverage is reported by syscall path and stream-identity scenario.
+- [ ] Sustained-throughput, burst, backpressure, agent-restart, and metadata-delay
+  tests pass at documented limits.
+- [ ] Unsupported behavior is documented from measurements rather than assumed.

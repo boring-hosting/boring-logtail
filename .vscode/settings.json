@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.cargo.extraEnv": {
+    "PATH": "/home/alfie/.cargo/bin:/usr/local/bin:/usr/bin"
+  },
+  "rust-analyzer.runnables.extraEnv": {
+    "PATH": "/home/alfie/.cargo/bin:/usr/local/bin:/usr/bin"
+  }
+}

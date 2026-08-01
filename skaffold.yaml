@@ -1,0 +1,17 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: boring-logtail
+build:
+  artifacts:
+    - image: registry.gitlab.com/biomehub/boring-logtail
+      context: .
+      docker:
+        dockerfile: Dockerfile
+  local:
+    useBuildkit: true
+manifests:
+  rawYaml:
+    - k8s/boring-logtail.yaml
+deploy:
+  kubectl: {}
