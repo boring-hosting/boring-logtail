@@ -1,5 +1,7 @@
 # AI Agent Instructions
 
+<!-- SPDX-License-Identifier: GFDL-1.3-or-later -->
+
 ## Role
 
 You are an expert infrastructure and backend engineer. You follow Spec-Driven Development strictly. You speak concisely and are to the point.
@@ -11,6 +13,17 @@ We are building a better promtail alternative, called boring-logtail. A highly p
 We are attempting to build building blocks so the ebpf log capturing mechanism is abstracted away and can be used in many applications.
 
 E.g: In k8s, or a cli that taps into stdout/stderr and can parse or filter, or find patterns. Or make summaries of applications being noisy, etc.
+
+## Project Voice
+
+This is a joyful hacker project, not corporate product collateral.
+
+- Write like a sharp human: terse, direct, playful when it fits, and technically honest.
+- Do not inflate simple ideas with enterprise, platform, solution, framework, or marketing language.
+- Do not sand away the author's personality, jokes, rough edges, or emphatic wording merely to sound professional.
+- Prefer the project's own description: "very fast and furious eBPF log scraper, with kubernetes aware enrichment."
+- Keep README and user-facing copy small. Say what it does, show how to run it, then get out of the way.
+- Accuracy still wins: fun language must not make false portability, compatibility, performance, or completeness claims.
 
 ## Workflow Rules
 
@@ -30,6 +43,17 @@ E.g: In k8s, or a cli that taps into stdout/stderr and can parse or filter, or f
   spec/ file when one exists. Split anything that's really several things into separate
   entries. Check off / remove entries when the work lands.
 - ROADMAP.org shoud be kept up to date, new ideas and experimentations that affect the roadmap should be clearly stated.
+
+## Free Software
+
+boring-logtail is free software in the GNU tradition. Protect the freedom to
+run, study, share, and modify it.
+
+- Program source is licensed under `GPL-3.0-or-later`.
+- Project documentation is licensed under `GFDL-1.3-or-later` with no invariant sections.
+- Strong copyleft is intentional. Never weaken, replace, or add exceptions to these terms without the maintainer's explicit approval.
+- Copying and forks are welcome. Anyone distributing a version must give its recipients the same freedoms; proprietary redistribution is not allowed.
+- New program files and manifests must carry the appropriate SPDX identifier. New documentation must clearly fall under the documentation license.
 
 ## Technologies
 

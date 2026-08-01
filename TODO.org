@@ -1,4 +1,5 @@
 #+title: Deferred work and ideas
+#+license: GFDL-1.3-or-later
 
 This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
@@ -8,3 +9,9 @@ execution steps belong in the TODO section of their corresponding file under
 
 The test currently assumes PID 123 exists, so =cargo test --workspace= can fail
 on otherwise valid hosts. See [[file:spec/20260801-0812-repository-conventions.org][repository conventions migration]].
+
+* TODO Exclude boring-logtail itself across PID namespaces
+
+The container inserts namespace PID 1 into =IGNORED_PIDS=, while the eBPF
+tracepoint observes the host PID; printing captured data can therefore feed back
+into capture recursively. Define the fix in a dedicated capture-filter spec.

@@ -1,60 +1,67 @@
 #+title: boring-logtail
+#+license: GFDL-1.3-or-later
 
-* Prerequisites
+very fast and furious eBPF log scraper, with kubernetes aware enrichment
 
-1. stable rust toolchains: =rustup toolchain install stable=
-2. nightly rust toolchains: =rustup toolchain install nightly --component rust-src=
-3. (if cross-compiling) rustup target: =rustup target add ${ARCH}-unknown-linux-musl=
-4. (if cross-compiling) LLVM: (e.g.) =brew install llvm= (on macOS)
-5. bpf-linker: =cargo install bpf-linker= (=--no-default-features= on macOS)
+It grabs writes on the way through the Linux kernel, rebuilds the log stream in
+userspace, and figures out which kubernetes workload made the noise.
 
-* Build & Run
+Very early. My goal is to replace Promtail. Get into Observability at root.
 
-Use =cargo check= and =cargo test= as normal. Repository workflows are exposed
-as mise tasks. Build and run the program with the privileges required to load
-eBPF programs:
+* Build it
+
+You need stable Rust, nightly Rust with =rust-src=, and =bpf-linker=.
 
 #+begin_src shell
+rustup toolchain install stable
+rustup toolchain install nightly --component rust-src
+cargo install bpf-linker
 mise run build
+#+end_src
+
+Cross-compiling needs the matching =${ARCH}-unknown-linux-musl= Rust target and
+LLVM. On macOS, install =bpf-linker= with =--no-default-features=.
+
+* Run it
+
+Loading eBPF needs privileges. The mise task builds first and then gets loud:
+
+#+begin_src shell
 mise run run
 #+end_src
 
-Use =mise tasks= to list all available tasks.
+Use =mise tasks= to see the rest. Normal =cargo check= and =cargo test= still
+work.
 
-* Kubernetes development
+* Throw it at kubernetes
 
-The application runs as a privileged DaemonSet because loading and attaching
-its eBPF programs requires access to each node's kernel. Ensure your cluster's
-pod-security policy permits privileged workloads in the =boring-logtail=
-namespace.
+The agent is a privileged DaemonSet because kernels tend not to let random
+processes load eBPF programs. Your cluster must allow privileged workloads in
+the =boring-logtail= namespace.
 
-Authenticate the local Docker daemon to the GitLab Container Registry with a
-token that has =write_registry=, then start the development loop:
+Development images live at =ghcr.io/alfredosa/boring-logtail=. Push one with:
 
 #+begin_src shell
-docker login registry.gitlab.com
-skaffold dev
+mise run push
 #+end_src
 
-The cluster pulls with the =gitlab-registry= Secret in the =boring-logtail=
-namespace. Provision it through GitOps as a SOPS-encrypted
-=kubernetes.io/dockerconfigjson= Secret using a deploy token with only
-=read_registry=; do not commit an unencrypted registry token.
+Pushing needs a local =docker login ghcr.io=. Once the GHCR package visibility
+is Public, pulling needs no login and kubernetes needs no registry Secret. Start
+the development loop with:
+
+#+begin_src shell
+skaffold dev
+#+end_src
 
 Skaffold builds the image, deploys =k8s/boring-logtail.yaml=, streams logs, and
 rebuilds after source changes. Use =skaffold delete= to remove the development
 resources.
 
-The userspace logger shows eBPF =info!= messages by default. Set =RUST_LOG= to
-override the filter. In a second terminal, write to stdout or stderr to exercise
-the tracepoint.
+The userspace logger shows eBPF =info!= messages by default. Set =RUST_LOG= if
+you want something else. Make a process write to stdout or stderr and watch it
+go.
 
-Cargo build scripts are used to automatically build the eBPF correctly and
-include it in the program.
-
-* Cross-compiling on macOS
-
-Cross compilation should work on both Intel and Apple Silicon Macs.
+* Cross-compile it
 
 #+begin_src shell
 cargo build --package boring-logtail --release \
@@ -62,25 +69,15 @@ cargo build --package boring-logtail --release \
   --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
 #+end_src
 
-The cross-compiled program
-=target/${ARCH}-unknown-linux-musl/release/boring-logtail= can be copied to a
-Linux server or VM and run there.
+The binary lands at =target/${ARCH}-unknown-linux-musl/release/boring-logtail=.
+It still needs Linux to do the interesting part.
 
 * License
 
-With the exception of eBPF code, boring-logtail is distributed under the terms
-of either the [[file:LICENSE-MIT][MIT license]] or the [[file:LICENSE-APACHE][Apache License]] (version 2.0), at your
-option.
+boring-logtail is free software. The code is licensed under the
+[[file:COPYING][GNU General Public License, version 3 or later]]. You can run it, read it,
+change it, share it, and sell it. Anyone passing it on must pass those freedoms
+on too. Nobody gets to distribute a proprietary fork. That is the deal.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
-
-** eBPF
-
-All eBPF code is distributed under either the terms of the
-[[file:LICENSE-GPL2][GNU General Public License, Version 2]] or the [[file:LICENSE-MIT][MIT license]], at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
+The documentation is licensed under the [[file:COPYING.DOC][GNU Free Documentation License,
+version 1.3 or later]], with no invariant sections.

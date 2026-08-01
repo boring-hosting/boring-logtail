@@ -17,8 +17,6 @@ metadata:
     app.kubernetes.io/component: collector
     app.kubernetes.io/part-of: boring-logtail
 automountServiceAccountToken: false
-imagePullSecrets:
-  - name: gitlab-registry
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -56,7 +54,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: boring-logtail
-          image: registry.gitlab.com/biomehub/boring-logtail
+          image: ghcr.io/alfredosa/boring-logtail:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG

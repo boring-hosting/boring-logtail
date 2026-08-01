@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 

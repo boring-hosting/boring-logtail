@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #![no_std]
 #![no_main]
 
@@ -225,4 +227,4 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
-static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+static LICENSE: [u8; 4] = *b"GPL\0";

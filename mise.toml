@@ -13,3 +13,10 @@ run = [
   "cargo build",
   "sudo -E lldb-server gdbserver 127.0.0.1:1234 target/debug/boring-logtail",
 ]
+
+[tasks.push]
+description = "Build and push commit and latest images to GHCR"
+run = [
+  "skaffold build --push=true",
+  "skaffold build --push=true --tag latest",
+]

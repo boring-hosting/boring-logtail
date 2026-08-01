@@ -1,4 +1,5 @@
 #+title: boring-logtail roadmap
+#+license: GFDL-1.3-or-later
 
 The capture source of truth is the byte sequence that the kernel reports as
 successfully written to a container output stream. The eBPF transport emits
@@ -34,6 +35,8 @@ and enriches them with Kubernetes identity.
 * Stream identity coverage
 
 - [X] Initially recognize numeric descriptors 1 and 2.
+- [ ] Exclude the collector's own writes reliably across PID namespaces and
+  prevent output feedback loops.
 - [ ] Observe =close=, =dup=, =dup2=, =dup3=, and =fcntl= descriptor duplication.
 - [ ] Track the underlying file/pipe identity of container stdout and stderr.
 - [ ] Capture writes through duplicated descriptors referring to those streams.

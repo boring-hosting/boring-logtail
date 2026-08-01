@@ -31,6 +31,10 @@ RUN cargo build --locked --package boring-logtail --release
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/alfredosa/boring-logtail" \
+      org.opencontainers.image.description="very fast and furious eBPF log scraper, with kubernetes aware enrichment" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

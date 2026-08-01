@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Turns raw kernel capture events into complete application log records.
 //!
 //! Keep the stages separate: their boundaries are different and must not be

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 [workspace]
 resolver = "2"
 members = [
@@ -8,7 +10,7 @@ members = [
 default-members = ["boring-logtail", "boring-logtail-common"]
 
 [workspace.package]
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 edition = "2024"
 
 [workspace.dependencies]

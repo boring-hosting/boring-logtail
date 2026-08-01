@@ -1,5 +1,6 @@
 #+title: Repository conventions migration
 #+date: 2026-08-01 08:12 UTC
+#+license: GFDL-1.3-or-later
 
 * Goal
 
@@ -13,6 +14,7 @@ without changing application behavior.
 - Convert the README from Markdown to Org mode.
 - Establish the deliberately-deferred-work index required by the workflow.
 - Update contributor-facing commands that are affected by the migration.
+- Codify and apply the project's deliberately non-corporate voice.
 
 Rust and eBPF implementation changes are out of scope.
 
@@ -23,6 +25,8 @@ Rust and eBPF implementation changes are out of scope.
 - Preserve the existing build, privileged run, and debug-server behaviors.
 - Keep roadmap wording and checkbox state intact during the Org conversion.
 - Preserve README wording, commands, and license links during its Org conversion.
+- Prefer terse, playful, technically direct copy over polished product language;
+  keep the author's wording when it carries the project's personality.
 - Start =TODO.org= empty apart from guidance because this migration does not
   intentionally defer work.
 
@@ -33,6 +37,7 @@ Rust and eBPF implementation changes are out of scope.
 - [X] S3 Add the required =TODO.org= deferred-work index.
 - [ ] S4 Validate mise task discovery, Org files, and the Rust workspace.
 - [X] S5 Convert =README.md= to =README.org= without semantic changes.
+- [X] S6 Codify the project voice and reshape =README.org= around it.
 
 * Validation
 
@@ -45,3 +50,6 @@ Rust and eBPF implementation changes are out of scope.
   fully passing.
 - =README.org=: headings, source blocks, inline code, and local license links
   were converted to native Org syntax; no stale =README.md= references remain.
+- Project voice: =AGENTS.md= now rejects corporate product language and anchors
+  copy on the author's description. =README.org= applies the rule while retaining
+  the build, run, kubernetes, cross-compilation, and licensing essentials.

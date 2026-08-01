@@ -3,13 +3,17 @@ kind: Config
 metadata:
   name: boring-logtail
 build:
+  tagPolicy:
+    gitCommit:
+      variant: AbbrevCommitSha
   artifacts:
-    - image: registry.gitlab.com/biomehub/boring-logtail
+    - image: ghcr.io/alfredosa/boring-logtail
       context: .
       docker:
         dockerfile: Dockerfile
   local:
     useBuildkit: true
+    push: true
 manifests:
   rawYaml:
     - k8s/boring-logtail.yaml
