@@ -1,0 +1,134 @@
+#+title: Bounded incoming-log sampling
+#+date: 2026-08-02 08:40 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and verified on 2026-08-02.
+
+* Goal
+
+Prevent a legitimately noisy workload from turning boring-logtail itself into a
+log cannon while preserving a representative, measurable stream of incoming
+writes.
+
+* Evidence
+
+The current collector printed every fd 1/2 write. On 2026-08-02, Kubernetes
+logs proved that the repeated =client.go= connection tracing came from the
+=kube-system/konnectivity-agent= DaemonSet. The cluster runs CRI-O 1.33, while
+the current identity decoder supports only containerd, so those writes were
+also correctly reported as unresolved rather than falsely attributed.
+
+* Design
+
+** Policy type
+
+Add an explicit policy:
+
+#+begin_src rust
+enum OutputPolicy {
+    Always,
+    Never,
+    WithSample(SamplePercent),
+}
+#+end_src
+
+=SamplePercent= is a validated private-field newtype over =u8=. Construction
+accepts only 0 through 100 inclusive. =WithSample(0)= is equivalent to =Never=
+and =WithSample(100)= is equivalent to =Always=, but both remain valid inputs so
+configuration has unsurprising boundary behavior.
+
+This is OpenTelemetry-like in shape—an explicit decision plus accounting—but
+does not claim to implement an OpenTelemetry log-sampling standard.
+
+** Decision point
+
+- Decide once per completed =WriteOperation=, after reconstruction and before
+  enrichment rendering or =info!= output.
+- Use a documented deterministic 64-bit mix of cgroup ID, PID, TID, operation
+  ID, and timestamp. Emit when =hash % 100 < percent=.
+- Never sample individual =WriteEvent= chunks independently; doing so would
+  manufacture incomplete operations.
+- Sampling performs no filesystem, socket, API, or random-device I/O.
+- This first slice reduces userspace output volume. It does not pretend to
+  reduce eBPF or ring-buffer work. A later userspace-fed eBPF policy map may
+  move an equivalent decision earlier after its lifecycle races are specified.
+
+** Configuration and safe default
+
+- Read =BORING_LOGTAIL_SAMPLE_PERCENT= at startup. Reject invalid, non-integer,
+  and greater-than-100 values as configuration errors.
+- The binary default is 100 for explicit local experimentation.
+- The Kubernetes DaemonSet sets the value to 1. A 1,000-write/second workload
+  should therefore produce roughly 10 rendered samples/second rather than
+  1,000, without hiding that the source is noisy.
+- Apply the policy uniformly to enriched, unresolved, and ambiguous writes.
+  Attribution failure must not secretly change the statistical decision.
+
+** Accounting
+
+- Count observed completed writes, emitted samples, and policy-dropped writes.
+- Include configured sample percent in the existing periodic diagnostic.
+- Sampling drops are deliberate and separate from ring-buffer loss,
+  reconstruction failure, and export backpressure.
+- Every emitted line includes =sample_percent=N= so a human does not mistake a
+  sample for the complete stream.
+
+* Invariants
+
+- Identical sampling inputs and percentage produce the same decision.
+- 0 emits none; 100 emits all.
+- Sampling never breaks write reconstruction or mutates captured bytes.
+- The log hot path performs arithmetic and memory access only.
+- Deliberate sampling and accidental loss remain distinguishable.
+
+* Non-goals
+
+- Trace-parent sampling, tail sampling, severity-aware policy, or adaptive rate
+  limiting.
+- Per-namespace, Pod, container, cgroup, or inode policy in this slice.
+- Moving the decision into eBPF before dynamic-map lifecycle semantics exist.
+- Fixing CRI-O identity decoding; that remains enrichment work.
+
+* Verification
+
+- Exhaustively test construction for 0 through 255.
+- Prove boundary behavior for 0 and 100 and deterministic repeatability for an
+  intermediate percentage.
+- Test configuration absence, valid values, malformed text, and 101.
+- Feed at least 10,000 distinct operations through =WithSample(1)= and assert a
+  deliberately broad distribution bound rather than an exact random count.
+- Pass formatting, strict Clippy, workspace tests, and Kubernetes manifest
+  validation.
+- In the live cluster, verify that konnectivity-agent remains identifiable while
+  collector output falls by roughly two orders of magnitude.
+
+* TODO
+
+- [X] S1 Add validated sampling policy and deterministic decision tests.
+- [X] S2 Apply the decision after reconstruction and expose explicit counters.
+- [X] S3 Configure a one-percent Kubernetes default and mark sampled output.
+- [X] S4 Pass local gates and verify bounded konnectivity-agent output live.
+
+* Validation
+
+- =cargo test --workspace=: passed; 35 tests include exhaustive =u8=
+  validation, 0/100 boundaries, deterministic repeatability, configuration
+  errors, and a 10,000-operation distribution check.
+- Strict Clippy for userspace and shared crates: passed with warnings denied.
+- Formatting and Kubernetes manifest validation passed.
+- Live DaemonSet: two of two collectors rolled out with zero restarts. In the
+  first minute, one node observed 242 completed writes, emitted 2, and dropped
+  240 by policy; the other observed 414, emitted 2, and dropped 412. Visible
+  records carried =sample_percent=1=.
+- The live diagnosis found an indirect feedback loop: =kubectl logs= traffic
+  crosses konnectivity, both agents run with =-v=8= and log packet traffic, and
+  boring-logtail captures that agent output. One-percent sampling makes the
+  reproduction ratio safely subcritical but does not fix the agent verbosity.
+
+* Approval
+
+Approved by the maintainer on 2026-08-02 with a one-percent DaemonSet default
+and a userspace decision over complete writes before considering an eBPF policy
+map.

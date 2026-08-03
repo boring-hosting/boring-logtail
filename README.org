@@ -8,6 +8,9 @@ userspace, and figures out which kubernetes workload made the noise.
 
 Very early. My goal is to replace Promtail. Get into Observability at root.
 
+New to the kernel-shaped rabbit hole? Start with the
+[[file:learn/README.org][friendly field guide]].
+
 * Build it
 
 You need stable Rust, nightly Rust with =rust-src=, and =bpf-linker=.

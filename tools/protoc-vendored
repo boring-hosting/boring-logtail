@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -eu
+: "${CARGO_HOME:?Cargo must provide CARGO_HOME}"
+
+for candidate in \
+    "$CARGO_HOME"/registry/src/*/protoc-bin-vendored-linux-x86_64-*/bin/protoc \
+    "$CARGO_HOME"/registry/src/*/protoc-bin-vendored-linux-aarch_64-*/bin/protoc
+do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "vendored protoc binary is missing from the Cargo registry" >&2
+exit 127

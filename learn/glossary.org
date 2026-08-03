@@ -1,0 +1,323 @@
+#+title: Words without gatekeeping
+#+license: GFDL-1.3-or-later
+
+Short definitions for the nouns this project throws around. “See” links lead to
+the version with machinery and caveats.
+
+* ABI
+
+An Application Binary Interface is the exact low-level agreement about calling,
+layout, registers, sizes, alignment, and meaning. Our kernel/userspace ABI is
+the =#[repr(C)] WriteEvent= layout plus its version and flags. See
+[[file:ebpf.org::*The ABI: a treaty between two worlds][the ABI treaty]].
+
+* Aya
+
+The Rust library family used to write, load, attach, and communicate with eBPF
+programs. =aya-ebpf= serves kernel-side code; =aya= serves userspace.
+
+* backpressure
+
+What happens when a consumer cannot keep up with a producer. The current ring
+buffer can lose observations; it does not slow the application that called
+=write=. A real output pipeline needs an explicit policy.
+
+* BPF
+
+Historically Berkeley Packet Filter. Modern eBPF grew far beyond packets; treat
+“eBPF” as the Linux execution and instrumentation system described in
+[[file:ebpf.org][eBPF without magic]], not as a useful expansion of the old acronym.
+
+* BTF
+
+BPF Type Format: compact type metadata used by eBPF tooling, debugging, and
+CO-RE relocations. It is roughly “types the kernel and tools can exchange,” not
+a complete source-level type system.
+
+* byte
+
+Eight bits on supported Linux targets. Logs are bytes before they are UTF-8,
+JSON, lines, or meaning. boring-logtail keeps payloads as bytes through capture
+and write reconstruction.
+
+* cgroup
+
+A kernel hierarchy that groups tasks for resource control, accounting, and
+identity. Cgroup IDs are useful anchors but are not themselves Pod names. See
+[[file:linux.org::*Cgroups: identity plus resource hierarchy][cgroups]].
+
+* cgroup v2
+
+The unified cgroup hierarchy. Its process membership line has the form
+=0::$PATH=. boring-logtail requires it for namespace-safe self-exclusion.
+
+* CgroupArray
+
+An eBPF map containing cgroup directory references supplied by userspace. An
+eBPF helper can ask whether the current task is under an entry.
+
+* chunk
+
+One bounded portion of a larger write. Our chunk payload is at most 256 bytes.
+Chunks share an operation identity and carry offsets so userspace can rebuild
+the write.
+
+* CO-RE
+
+Compile Once – Run Everywhere: an eBPF portability approach using BTF and
+relocations to adapt kernel data access. It is not a promise that arbitrary eBPF
+programs work on every kernel or architecture.
+
+* container runtime
+
+The software that creates and supervises containers on a node: namespaces,
+cgroups, mounts, processes, and output plumbing. Kubernetes talks to it through
+CRI rather than implementing containers itself.
+
+* copyleft
+
+Using copyright terms to ensure recipients keep the freedom to run, study,
+modify, and share the program. boring-logtail code is GPL-3.0-or-later.
+
+* CRI
+
+Container Runtime Interface: the Kubernetes API between the kubelet and a
+container runtime. Runtime container IDs and log handling live on this side of
+the future enrichment join.
+
+* DaemonSet
+
+A Kubernetes workload controller that aims to run one Pod on each eligible
+node. That shape suits a node-local kernel observer.
+
+* eBPF helper
+
+A kernel-provided operation an eBPF program may call. The verifier checks helper
+availability and arguments. Helpers are the program's controlled toolbox.
+
+* eBPF map
+
+A typed kernel object used for state or communication. “Map” is a family: hash
+maps, arrays, program arrays, ring buffers, and cgroup arrays behave differently.
+
+* enrichment
+
+Joining raw capture facts with useful context. Here that means turning a cgroup
+ID into node, namespace, Pod, and container identity through asynchronous
+node-local caches, without Kubernetes API calls or discovery I/O in the capture
+hot path.
+
+* fd / file descriptor
+
+A small per-process integer pointing through a descriptor table to an open file
+description. fd 1 and 2 conventionally start as stdout and stderr; redirection
+can make them point elsewhere. See [[file:linux.org::*File descriptors and open file descriptions][file descriptors]].
+
+* framing
+
+Deciding where application records begin and end in a byte stream. Newline,
+multiline, JSON, and protocol-aware framing are userspace jobs. A write syscall
+boundary is not automatically a log-record boundary.
+
+* GPL
+
+GNU General Public License. A strong copyleft software license: redistribution
+is allowed, including commercially, but recipients must receive the same
+freedoms and corresponding source under its terms.
+
+* hook
+
+The kernel event or path that causes an eBPF program to execute. boring-logtail
+uses syscall tracepoints as hooks.
+
+* integrity marker
+
+Metadata saying whether captured evidence is complete. =truncated= and
+=read_failed= are current markers. They turn uncertainty into a queryable fact.
+
+* kernel
+
+The privileged core that schedules tasks, owns devices and memory mappings, and
+implements syscalls. See [[file:linux.org::*Kernel space and userspace][kernel space and userspace]].
+
+* Kubernetes
+
+The system scheduling and reconciling container workloads across nodes. It
+provides desired state and metadata; it does not replace the Linux kernel or
+turn cgroup IDs directly into Pod names.
+
+* kprobe
+
+A dynamic probe attached to a kernel function or instruction. Powerful and
+closer to implementation details than the tracepoints used here.
+
+* log record
+
+One application-level event after framing. It may span several writes, or one
+write may contain several records. boring-logtail does not produce these yet.
+
+* map capacity
+
+The configured maximum entries or bytes for an eBPF map. Capacity is a real
+loss boundary, not merely a tuning number.
+
+* namespace
+
+A kernel mechanism giving groups of processes different views or names for
+resources. PID namespaces caused the original self-capture bug. See
+[[file:linux.org::*Namespaces: several honest views of one kernel][namespaces]].
+
+* =no_std=
+
+A Rust crate mode that does not link the standard library. Kernel-side eBPF
+code uses it because libc, threads, files, and ordinary allocation are not
+available inside an eBPF program.
+
+* opaque bytes
+
+Bytes whose encoding and record meaning have not been assumed. “Opaque” does
+not mean encrypted or unknowable; it means this layer refuses to reinterpret
+them prematurely.
+
+* open file description
+
+The kernel object containing state for an opened file, pipe, socket, or similar
+resource. Multiple descriptors can refer to it. This is closer to durable
+stream identity than the integer descriptor.
+
+* operation ID
+
+The value joining chunks from one syscall. It currently uses the syscall-entry
+timestamp. Its uniqueness guarantee still needs formal definition.
+
+* partial write
+
+A successful write whose returned byte count is smaller than requested. The
+caller may retry. Capture must honor the returned count rather than the request.
+
+* PID
+
+In boring-logtail events, the upper half of =bpf_get_current_pid_tgid()=: the
+thread-group ID commonly understood as process ID. The number can vary by PID
+namespace.
+
+* pipe
+
+A kernel byte channel with read and write ends. Container runtimes commonly
+connect process output to pipes they consume.
+
+* Pod
+
+Kubernetes's scheduling unit: one or more containers sharing selected namespaces
+and lifecycle. The kernel does not hand eBPF a Pod name; userspace must enrich.
+
+* procfs
+
+The virtual filesystem usually mounted at =/proc=. It exposes live process and
+kernel state. Files can disappear or change while being read.
+
+* program array
+
+An eBPF map whose values identify other eBPF programs. It powers tail calls.
+
+* ring buffer
+
+A bounded circular transport. eBPF reserves and submits =WriteEvent= records;
+userspace drains them. Full buffers mean observations can be lost. See
+[[file:ebpf.org::*Ring buffers: kernel-to-userspace conveyor belt][ring buffers]].
+
+* Rust
+
+The language used on both sides of this project. Shared source syntax does not
+erase the boundary: userspace gets =std= and Tokio; eBPF gets a constrained
+=no_std= target verified by Linux.
+
+* scraper
+
+The project's joyful shorthand. Technically boring-logtail captures writes at
+kernel hooks rather than polling log files, but “very fast and furious eBPF log
+scraper” is allowed to have a little fun.
+
+* stdout / stderr
+
+The conventional standard output and error streams, initially exposed as file
+descriptors 1 and 2. “Initially” matters: descriptors can be redirected or
+duplicated.
+
+* syscall
+
+A controlled request from userspace to the kernel. =write(2)= is the syscall we
+currently capture. See [[file:linux.org::*Syscalls: asking the kernel to do the sharp thing][syscalls]].
+
+* tail call
+
+A bounded eBPF jump through a program array. Success replaces the current
+program rather than creating a normal call stack. We use it to emit chunks.
+
+* TGID
+
+Thread-group ID: Linux's process-like identifier shared by threads in a group.
+It appears as =WriteEvent.pid=.
+
+* TID
+
+Thread ID: identifier for the particular task that issued the write. It appears
+as =WriteEvent.tid=.
+
+* Tokio
+
+The Rust asynchronous runtime used by userspace to await ring-buffer readiness
+and shutdown signals without blocking an OS thread per activity.
+
+* tracefs
+
+The virtual filesystem usually mounted at =/sys/kernel/tracing= that exposes
+kernel tracing controls and metadata.
+
+* tracepoint
+
+A named kernel instrumentation site with a defined event format. More stable
+than attaching to an arbitrary kernel instruction, but not free from ABI and
+architecture considerations.
+
+* truncation
+
+Deliberately capturing only a bounded prefix. Our current ceiling is 8192 bytes
+per write. A flag says the operation is incomplete.
+
+* userspace
+
+The less-privileged world where ordinary applications run. boring-logtail's
+loader, assembler, future enrichment, and exporters live here.
+
+* verifier
+
+The kernel analysis that rejects eBPF programs it cannot prove safe under its
+model. Safe is not the same as logically correct. See [[file:ebpf.org::*The verifier: prove it before you run it][the verifier]].
+
+* write
+
+Ambiguous in casual speech. It may mean a language call, a Linux =write=
+syscall, one accepted byte range, or a reconstructed =WriteOperation=. State
+which boundary you mean.
+
+* WriteAssembler
+
+The userspace state machine that groups =WriteEvent= chunks, validates their
+identity and offsets, and returns one =WriteOperation=.
+
+* WriteEvent
+
+The fixed kernel/userspace transport record for one chunk of one observed
+write. It contains facts and bytes, not a finished log record.
+
+* WriteOperation
+
+The userspace representation of one reconstructed write syscall: identity,
+result, integrity, and bytes. It is the clean input to later framing and
+enrichment.
+
+* writev
+
+A syscall that writes from several buffers (iovecs) in one operation. It is a
+known coverage gap; observing only =write= misses it.

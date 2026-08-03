@@ -1,0 +1,194 @@
+#+title: Node-scoped Kubernetes identity enrichment
+#+date: 2026-08-02 07:43 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved by the maintainer on 2026-08-02. Implementation is in progress.
+
+* Goal
+
+Add the first useful Kubernetes enrichment boundary: attach node, namespace,
+Pod, and container identity to a reconstructed =WriteOperation= without putting
+Kubernetes API or filesystem work in the capture hot path.
+
+* Why this slice
+
+Capture already gives userspace a kernel cgroup ID, PID, TID, descriptor, and
+opaque bytes. Kubernetes gives us Pod and container status, but it does not know
+the kernel cgroup ID. The first job is therefore a two-sided join:
+
+#+begin_example
+host cgroup-v2 tree                         kubelet log topology
+cgroup ID -> runtime container ID          container ID -> Pod identity
+                 \                         /
+                  +---- normalized ID ----+
+                              |
+WriteOperation.cgroup_id -> EnrichedWriteOperation | UnresolvedWriteOperation
+#+end_example
+
+Both sides are maintained asynchronously. Processing a write performs bounded
+in-memory lookups only.
+
+* Design
+
+** Identity contract
+
+Introduce Kubernetes-independent capture identity and Kubernetes-specific
+metadata as separate types.
+
+- =ContainerId= is a normalized pair of runtime and opaque ID. For example,
+  =containerd://abc= becomes runtime =containerd= and ID =abc=. Never compare
+  IDs by suffix or silently discard the runtime.
+- =KubernetesIdentity= contains node name, namespace, Pod name and UID,
+  container name, normalized container ID, and restart count. PID, TID, fd,
+  timestamps, bytes, and integrity flags remain capture facts on the original
+  =WriteOperation=.
+- The enrichment result is explicit: enriched, unresolved, or ambiguous.
+  Missing metadata is normal during startup and teardown, not a reason to drop
+  captured bytes.
+- This slice derives =stream= from fd 1/2 only as =stdout-candidate= or
+  =stderr-candidate=. It must not claim durable stream identity before descriptor
+  tracking exists.
+
+The identity types and join logic live behind a small userspace enrichment
+boundary. The eBPF and shared ABI crates remain Kubernetes-free.
+
+** Node-local Kubernetes metadata cache
+
+- Do not create a Kubernetes client, call the API server or kubelet API, open a
+  CRI socket, or mount a service-account token.
+- Read the collector node name from =BORING_LOGTAIL_NODE_NAME=, populated by
+  the kubelet through the Downward API.
+- Mount the node's =/var/log/containers= and =/var/log/pods= read-only. A
+  background scanner decodes the kubelet-managed container-log symlink and
+  target path into normalized container ID, namespace, Pod name and UID,
+  container name, and restart attempt.
+- Support only measured CRI log layouts. Validate every component and reject
+  malformed, partial, non-UTF-8, or ambiguous paths rather than guessing.
+- Publish immutable cache snapshots to the enrichment path. Filesystem scans
+  and write processing must not share a lock.
+- On removal or container-ID replacement, retain a tombstone for a configurable
+  bounded interval. The initial default is five minutes. Tombstones preserve
+  the last known identity and are distinguishable in diagnostics.
+- Conflicting live entries for one normalized container ID are ambiguous and
+  must not pick a winner.
+
+** Host cgroup resolver
+
+- Mount the host cgroup-v2 hierarchy read-only at a dedicated path. Do not reuse
+  the collector's namespace-relative self-exclusion mount as host truth.
+- A background resolver scans the hierarchy at startup and on a bounded refresh
+  interval. It builds =cgroup ID -> normalized container ID= snapshots. No
+  directory traversal or path parsing occurs while processing a write.
+- Obtain the kernel cgroup ID from cgroupfs using the Linux cgroup file-handle
+  identity exposed by =name_to_handle_at=. Keep this behind a resolver function
+  and verify on the live target that it matches =bpf_get_current_cgroup_id()=;
+  do not assume ordinary filesystem inode numbers are equivalent.
+- The initial path decoder supports only measured cgroup-v2 layouts for
+  containerd with systemd or cgroupfs-style placement. It recognizes a complete
+  container ID token and validates it before indexing. Unsupported runtimes and
+  layouts remain unresolved and produce rate-limited diagnostics.
+- A refresh atomically replaces the live snapshot. Recently disappeared
+  cgroup mappings receive the same bounded tombstone treatment as Pod metadata.
+- Traversal errors, duplicate mappings, and permission failures are observable;
+  they never stop raw capture or guess an identity.
+
+** Capture-path and startup behavior
+
+- The join is =WriteOperation.cgroup_id -> ContainerId -> KubernetesIdentity=.
+- Capture may start while either cache is warming. Early writes remain
+  unresolved and visible; they are not buffered without a bound and are not
+  silently discarded.
+- Failure to mount or read node-local log topology or host cgroupfs degrades
+  enrichment, not capture, after a clear diagnostic.
+- The eBPF program performs no enrichment I/O. The per-write userspace path
+  performs no filesystem, socket, or network I/O. All unavoidable discovery I/O
+  is asynchronous and publishes immutable in-memory snapshots.
+- Emit counters for enriched, unresolved-cgroup, unresolved-container,
+  ambiguous, tombstone-hit, invalid-container-ID, scan, and resolver
+  refresh failure. Until a metrics exporter exists, structured periodic
+  diagnostics are acceptable, but the counter ownership must already be clear.
+
+** Kubernetes deployment
+
+- Keep service-account token automount disabled and add no RBAC.
+- Inject =spec.nodeName= through the Downward API.
+- Add a read-only hostPath mount for the host cgroup-v2 hierarchy at the path
+  expected by the resolver.
+- Add read-only hostPath mounts for =/var/log/containers= and =/var/log/pods=.
+- Do not add API access, Secrets, workload mutation, cluster-wide writes, or a
+  container-runtime socket.
+
+* Invariants
+
+- A write is never dropped because Kubernetes metadata is absent or stale.
+- The per-write enrichment path performs in-memory lookups only.
+- The collector makes no network calls for enrichment.
+- The original capture facts and opaque bytes survive enrichment unchanged.
+- An identity is exact, explicitly unresolved, or explicitly ambiguous; it is
+  never guessed from a short container-ID prefix.
+- Cache memory, tombstone lifetime, retry delay, and diagnostic volume are
+  bounded.
+- eBPF capture and the shared kernel/userspace ABI remain Kubernetes-independent.
+
+* Non-goals
+
+- Record framing, JSON decoding, multiline joining, or an exporter schema.
+- Workload-owner resolution such as Deployment, StatefulSet, or Job.
+- Labels, annotations, application-name heuristics, or namespace watches.
+- API/CRI access or support for every runtime and cgroup/log layout.
+- Retroactively enriching every write observed before cache warm-up.
+- Durable stdout/stderr identity beyond the current fd 1/2 candidates.
+- Solving capture loss, operation expiry, =writev=, or descriptor duplication.
+
+* Verification
+
+- Unit-test container-ID normalization, status extraction for regular/init/
+  ephemeral containers, duplicate handling, tombstone expiry, and every join
+  outcome.
+- Unit-test cgroup path decoding with accepted containerd fixtures and rejected
+  partial, malformed, and unsupported layouts.
+- Test scan replacement, path rejection, and tombstone expiry against temporary
+  kubelet-log fixtures; no test may require a developer's live cluster.
+- Run =cargo fmt --all -- --check=, relevant Clippy targets, and
+  =cargo test --workspace=.
+- Deploy through Skaffold and prove that a signal Pod's observed cgroup ID joins
+  to its exact node, namespace, Pod UID/name, container name/ID, and restart
+  count.
+- During live verification, delete the signal Pod and confirm a late write can
+  hit a tombstone, then confirm expiry makes the mapping unresolved.
+- Confirm absent local metadata mounts and an unreadable resolver path leave raw
+  capture running.
+
+* TODO
+
+- [X] K1 Define Kubernetes identity types and the enrichment result contract.
+- [X] K2 Build a node-local kubelet metadata cache with bounded tombstones.
+- [X] K3 Resolve host cgroup IDs to runtime container IDs outside the capture hot path.
+- [X] K4 Join =WriteOperation= capture facts with cached Kubernetes identity.
+- [X] K5 Remove network dependencies and mount node-local metadata read-only.
+- [-] K6 Update the field guide and pass unit, integration, and live-cluster verification.
+
+* Validation
+
+- =cargo test --workspace=: passed; 30 tests cover capture, cgroup file-handle
+  identity, kubelet log topology, tombstones, explicit unresolved results, and
+  exact identity joins.
+- Strict Clippy for the userspace and shared crates: passed with warnings denied.
+- =cargo fmt --all -- --check= and =git diff --check=: passed.
+- Kubernetes client-side manifest validation: passed for the Namespace,
+  ServiceAccount, and DaemonSet.
+- Dependency and source audit: the collector has no =kube=, =k8s-openapi=,
+  HTTP, TLS, or other network-client dependency; it opens no network sockets.
+- Live inspection: both nodes run =cri-o://1.33.13=. The deliberately
+  containerd-only decoder left captured writes unresolved, so exact signal-Pod
+  attribution remains pending and CRI-O support is now evidence-backed work.
+
+* Approval
+
+Approved by the maintainer on 2026-08-02, with the explicit outcome that an
+incoming write must clearly identify its Kubernetes source or clearly state why
+it is unresolved. Containerd on cgroup v2 is the deliberately narrow first
+runtime target. Metadata arriving after a write does not retroactively rewrite
+that write.

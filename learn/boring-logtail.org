@@ -1,0 +1,305 @@
+#+title: How boring-logtail hears a write
+#+license: GFDL-1.3-or-later
+
+This page describes the program that exists, not the finished creature from the
+roadmap. When code and this page disagree, that is a bug in one of them.
+
+* The whole trip
+
+#+begin_example
+application thread
+  write(fd, buffer, count)
+       |
+       | sys_enter_write
+       v
+  remember WriteStart by PID+TID
+       |
+       | Linux performs the write
+       | sys_exit_write(result)
+       v
+  create WriteJob
+       |
+       | tail calls, one bounded copy each
+       v
+  WriteEvent + WriteEvent + ...
+       |
+       | BPF ring buffer
+       v
+  decode_event
+       |
+       v
+  WriteAssembler
+       |
+       v
+  WriteOperation { identity, result, integrity, bytes }
+       |
+       v
+  temporary human-readable log line
+#+end_example
+
+The kernel side reports syscall facts and opaque bytes. Userspace reconstructs
+those facts. Kubernetes enrichment belongs after reconstruction.
+
+The accepted capture boundary is back at application =write= and =writev= on
+stdout/stderr. A registered CRI-file tap was tested and rejected: it attributed
+writes to the runtime, required descriptor discovery, and an inotify mistake
+created a three-core rescan feedback loop. See the rejected
+[[file:../spec/20260802-0928-userspace-registered-cri-log-tap.org][CRI log tap experiment]] and the accepted
+[[file:../spec/20260802-1300-application-write-kubernetes-watch.org][layered identity cache spec]].
+
+Identity is layered off the hot path. The cgroup resolver maps the kernel
+cgroup ID to a complete runtime container ID. A bounded local CRI v1
+reconciliation joins containers to Pod sandboxes. One node-filtered Kubernetes
+Pod watch is fallback and supplement. Both publish immutable snapshots; an
+incoming event performs memory lookups only. Exact disagreement is ambiguity,
+and failed sources mark retained data stale.
+
+A shared inotify wrapper drives both the old metadata cache and the new CRI-file
+discovery loop. The latter watches =/var/log/containers= plus every resolved
+container directory below =/var/log/pods=. Timeouts do not rescan the filesystem:
+only startup and lifecycle events perform discovery I/O.
+
+Here, lifecycle means directory entries only: create, delete, move, and
+attribute changes. =IN_OPEN= and =IN_CLOSE_WRITE= are data-path signals. Watching
+them caused a feedback loop where runtime writes and discovery's own opens
+immediately requested another full descriptor scan. That reached about three
+CPU cores on two quiet nodes. Never put payload-adjacent inotify events on this
+control path.
+
+* 0. Refuse to hear ourselves
+
+*Plain version.* Before turning on the microphone, put the microphone's own
+room on the ignore list.
+
+*Technical truth.* [[file:../boring-logtail/src/cgroup.rs][CollectorCgroup]] reads the cgroup-v2
+membership from =/proc/self/cgroup=, validates the path, and opens the matching
+directory below =/sys/fs/cgroup=. Userspace places that directory FD into slot
+zero of the =COLLECTOR_CGROUP= cgroup array.
+
+The eBPF entry program calls =current_task_under_cgroup(0)=. A matching task or
+descendant is ignored. A helper error also means “do not capture this write.”
+This is fail-closed because a broken self-filter can amplify one output line
+forever.
+
+*Why cgroup, not PID?* PID values change across namespaces. The original code
+inserted container PID 1 while the tracepoint observed a host PID. Cgroup
+membership is evaluated by the kernel against an open cgroup object, so the
+namespace translation problem disappears.
+
+* 1. Catch syscall entry
+
+[[file:../boring-logtail-ebpf/src/main.rs][boring_logtail_enter]] runs at
+=syscalls/sys_enter_write=.
+
+It reads:
+
+- numeric file descriptor
+- userspace buffer address
+- requested byte count
+- current cgroup ID
+- PID and TID
+- monotonic timestamp
+
+It first admits only numeric fd 1 or 2. Then it inserts a =WriteStart= into
+=WRITE_STARTS= under the combined PID/TID key.
+
+*Why remember instead of emit?* Entry only says what the application requested.
+We need syscall exit to know whether Linux accepted all, some, zero, or none of
+the bytes.
+
+*Current sharp edge.* =WRITE_STARTS= has a fixed capacity. Insert failure drops
+this observation. We do not yet expose a loss counter.
+
+* 2. Pair syscall exit
+
+[[file:../boring-logtail-ebpf/src/main.rs][boring_logtail_exit]] runs at
+=syscalls/sys_exit_write=.
+
+It reads the signed result, looks up the matching entry state, and removes that
+state on every matched exit. It creates a =WriteJob= with chunk number zero,
+stores it in =WRITE_JOBS=, then tail-calls the chunk worker.
+
+An exit without entry state is ignored. That can happen when entry filtering or
+state insertion rejected the operation.
+
+* 3. Copy bounded chunks
+
+The chunk worker asks [[file:../boring-logtail-common/src/lib.rs][next_write_chunk]] what piece comes
+next. Current limits are:
+
+#+begin_example
+WRITE_CHUNK_SIZE      = 256 bytes
+MAX_CHUNKS_PER_WRITE = 32
+MAX_BYTES_PER_WRITE  = 8192 bytes
+#+end_example
+
+For each chunk it reserves one ring-buffer record, fills the metadata, attempts
+=bpf_probe_read_user_buf()=, submits the event, increments the job, and
+tail-calls itself again if needed.
+
+The event says whether it is first, last, truncated, result-known, or affected
+by a read failure. A failed or zero-byte syscall still produces one empty event
+with the signed result. A write over 8192 bytes produces captured evidence with
+a truncation marker.
+
+*Important race.* The pointer came from syscall entry, but bytes are copied
+after syscall exit. Another thread could mutate that userspace memory. The
+current design reports what it managed to read, not a cryptographic snapshot of
+the exact bytes Linux copied internally.
+
+* 4. Cross the ring buffer
+
+=EVENTS= is a 256 KiB BPF ring buffer. Each record has the fixed =WriteEvent=
+layout defined in =boring-logtail-common=.
+
+The userspace capture loop waits asynchronously for readability and drains all
+available records. =decode_event= rejects the wrong byte size and performs an
+unaligned read into the shared C-layout type.
+
+*Current sharp edges.* Userspace does not yet reject an unsupported
+=abi_version=. Ring-buffer reservation failure has no counter. Those are explicit
+roadmap items, not invisible promises.
+
+* 5. Rebuild one write
+
+[[file:../boring-logtail/src/pipeline.rs][WriteAssembler]] keys incomplete work by:
+
+#+begin_example
+(cgroup_id, pid, tid, operation_id)
+#+end_example
+
+It waits for a last or truncated chunk, then verifies:
+
+- first-chunk marker exists
+- all chunks belong to the same key
+- stable metadata agrees
+- byte offsets are contiguous
+- nothing follows the terminal chunk
+
+Success produces a =WriteOperation= containing timestamp, identity, syscall,
+descriptor, requested length, actual result, integrity flags, and reconstructed
+bytes.
+
+*Why not call it a log yet?* One write can hold half a log line, several lines,
+binary data, or a fragment of JSON. =WriteOperation= is one syscall, not one
+application record.
+
+*Current sharp edges.* Incomplete operations do not yet expire. Duplicate or
+missing chunks become an error only when a terminal chunk lets assembly run.
+=operation_id= currently reuses the entry timestamp; its collision guarantee is
+not yet formally defined.
+
+* 6. Make temporary output
+
+The current edge renders one human-readable line:
+
+#+begin_example
+incoming_log source="k8s=payments/checkout-abc/checkout pod_uid=... node=worker-1 ..." \
+  stream=stdout-candidate cgroup=137265 pid=1825669 tid=1825669 bytes=83 \
+  truncated=false read_failed=false \
+  payload="{\"kind\":\"checkout\",\"order_id\":\"BLT-42\",...}\n"
+#+end_example
+
+Invalid UTF-8 is rendered with replacement characters for the terminal, while
+the =WriteOperation.bytes= vector stays unchanged.
+
+This output is deliberately temporary. Printing every node write is noisy and
+creates observer effects. The cgroup filter prevents recursion, but real export
+needs framing, filtering, backpressure policy, and telemetry.
+
+* What “valuable data” means today
+
+The live DaemonSet has already reconstructed:
+
+- structured Flux reconciliation JSON
+- GitLab Runner diagnostics
+- ExternalDNS status
+- controller-runtime warnings
+- a deliberate =BLT-42= checkout signal
+
+For each write we retain kernel cgroup identity, process/thread identity,
+descriptor, byte length, integrity status, and payload. The enrichment join now
+adds exact node, namespace, Pod, and container identity when both asynchronous
+caches know it, and states an explicit reason when they do not.
+
+* The Kubernetes enrichment boundary
+
+Enrichment consumes =WriteOperation= rather than reaching backward into eBPF:
+
+#+begin_example
+WriteOperation
+      |
+      +--> resolve cgroup ID -> runtime container ID
+      |
+      +--> join node-local Pod cache
+      |
+      v
+namespace, pod, container, attempt, node + original capture facts
+#+end_example
+
+The userspace collector maintains two asynchronous snapshots. A host cgroup-v2
+scan maps the kernel cgroup ID to an exact containerd container ID. A scan of
+the kubelet-managed =/var/log/containers= symlinks and =/var/log/pods= targets
+maps that container ID to node, namespace, Pod UID/name, container name, and
+restart attempt. The write path only reads those in-memory snapshots; it never
+walks cgroupfs or the log directories.
+
+This enrichment makes no API-server, kubelet-API, or CRI calls. The kernel
+cannot know human Kubernetes names because those are control-plane concepts,
+not Linux identities. The background local scans are the unavoidable bridge;
+they are bounded and never run while processing an incoming write.
+
+The human-facing line starts with =incoming_log=. Its =source= is deliberately
+loud and exact:
+
+#+begin_example
+incoming_log source="k8s=payments/checkout-abc/checkout pod_uid=... node=worker-1 ..." ...
+incoming_log source="k8s=unresolved reason=cgroup-not-indexed" ...
+#+end_example
+
+The first form distinguishes the incoming write by namespace, Pod, and
+container. The second form keeps the bytes but refuses to fake attribution.
+=stdout-candidate= and =stderr-candidate= mean only “observed on fd 1 or 2”; fd
+tracking is still needed before those become durable stream identities.
+
+The Kubernetes deployment renders a deterministic one-percent sample of
+completed writes. Sampling happens after chunk reconstruction, so it never
+creates a partial operation. Each visible line carries =sample_percent=1=, and
+the periodic =pipeline_counts= line separates observed, emitted, and
+=dropped_by_policy= writes. Those deliberate drops are not kernel or ring-buffer
+loss. Local runs default to 100 percent unless
+=BORING_LOGTAIL_SAMPLE_PERCENT= is set.
+
+Sampling also protects against observer loops outside the collector's own
+cgroup. On the live cluster, following collector output through =kubectl logs=
+crosses konnectivity agents configured with =-v=8=. They log the transported
+packets; the collector sees those new writes; another rendered record causes
+more transport. Self-cgroup exclusion cannot stop that cross-cgroup cycle. A
+one-percent decision makes the loop subcritical, while source filtering or
+lower agent verbosity is the real cure.
+
+Deleted Pods and disappeared cgroups stay in bounded five-minute tombstone
+caches so late writes can drain with their last exact identity. The initial
+path decoder intentionally supports measured containerd cgroup-v2 layouts
+only. Other runtimes remain visibly unresolved.
+
+* Things we intentionally do not claim
+
+- We do not yet capture =writev= or every route bytes can take.
+- Numeric fd 1/2 is not durable stdout/stderr identity.
+- We do not yet frame lines, multiline records, or JSON documents.
+- We do not yet quantify every loss boundary.
+- We do not map unsupported runtime or cgroup layouts to Kubernetes identity.
+- We do not promise every architecture or compatibility syscall ABI.
+
+The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
+
+* Source tour
+
+- [[file:../boring-logtail-common/src/lib.rs][Shared kernel/userspace ABI and chunk math]]
+- [[file:../boring-logtail-ebpf/src/main.rs][Kernel-side capture programs]]
+- [[file:../boring-logtail/src/cgroup.rs][Collector cgroup discovery]]
+- [[file:../boring-logtail/src/pipeline.rs][Write reconstruction]]
+- [[file:../boring-logtail/src/main.rs][Userspace startup and event loop]]
+- [[file:../k8s/boring-logtail.yaml][Kubernetes DaemonSet]]
+- [[file:../spec/20260801-0854-capture-boundary-hardening.org][Self-capture hardening spec]]

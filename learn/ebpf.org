@@ -1,0 +1,267 @@
+#+title: eBPF without magic
+#+license: GFDL-1.3-or-later
+
+eBPF is often sold as magic kernel JavaScript. That description is catchy,
+wrong in several useful ways, and likely to annoy both kernels and JavaScript.
+
+* What an eBPF program is
+
+*Plain version.* A small program is loaded into the kernel and runs only when a
+specific kernel event pulls its trigger.
+
+*Technical truth.* eBPF is an instruction set, execution environment, verifier,
+and collection of program/map types implemented by Linux. Userspace loads byte
+code with the =bpf= syscall. A program has a type and context that determine
+which helpers and data it may access. It is attached to a hook such as a
+tracepoint, socket path, cgroup, XDP ingress point, or kprobe.
+
+*Where the picture bends.* eBPF programs do not run as ordinary processes. They
+do not have libc, arbitrary syscalls, an allocator, or an unconstrained stack.
+Their world is deliberately smaller.
+
+*Why we care.* Three tracepoint programs currently handle write entry, write
+exit, and chunk emission in [[file:../boring-logtail-ebpf/src/main.rs][the eBPF binary]].
+
+* The verifier: prove it before you run it
+
+*Plain version.* The kernel reads the program first and refuses anything it
+cannot prove safe.
+
+*Technical truth.* The verifier symbolically explores program paths. It tracks
+register types and ranges, pointer provenance, initialization, stack access,
+helper arguments, map values, and termination. A load succeeds only if every
+reachable path satisfies the rules for that kernel and program type.
+
+The verifier cares about questions like:
+
+- Can this pointer be null?
+- Is this read inside the map value or context boundary?
+- Was every byte initialized before sending it to userspace?
+- Does this path terminate within the complexity budget?
+- Is this helper legal for a tracepoint program?
+
+*Where the picture bends.* “Verifier accepted it” means the program passed the
+kernel's safety model. It does not mean the program captures the right bytes,
+uses the right identity, or has no race. Our PID namespace feedback loop was
+perfectly verifier-safe.
+
+*Why we care.* Fixed-size arrays, bounded chunk counts, explicit map state, and
+tail calls are not aesthetic quirks. They make the work provable.
+
+* Hooks and tracepoint context
+
+*Plain version.* A hook says when the program runs and what packet of facts it
+receives.
+
+*Technical truth.* A tracepoint program receives a =TracePointContext=. The
+tracepoint's format defines byte offsets for fields. Our =sys_enter_write=
+program reads fd, userspace buffer pointer, and requested count. Our
+=sys_exit_write= program reads the signed syscall result.
+
+Entry and exit are two different events. We correlate them using the 64-bit
+PID/TID pair from =bpf_get_current_pid_tgid()=.
+
+*Where the picture bends.* Tracepoints are more stable than arbitrary kprobes,
+but argument layouts can still depend on architecture and compatibility ABI.
+The offsets in this project currently describe its supported 64-bit target.
+
+* Helpers: carefully issued kernel tools
+
+*Plain version.* Helpers are the small set of kernel functions an eBPF program
+is allowed to call.
+
+*Technical truth.* Helpers are selected by numeric IDs and checked by the
+verifier. Availability depends on program type and kernel version. We use:
+
+- =bpf_get_current_pid_tgid()= for process/thread identity.
+- =bpf_get_current_cgroup_id()= for cgroup identity.
+- =bpf_ktime_get_ns()= for monotonic kernel time.
+- =bpf_probe_read_user_buf()= to safely attempt a copy from userspace memory.
+- =bpf_current_task_under_cgroup()= through Aya's =CgroupArray= wrapper to
+  prevent self-capture.
+
+*Where the picture bends.* “Safe read” means a failed access becomes an error
+instead of crashing the kernel. The memory can still change between syscall
+entry, exit, and our copy. We expose read failure as integrity metadata.
+
+* Maps: shared state with rules
+
+*Plain version.* Maps are kernel-owned containers eBPF and userspace can use to
+exchange configuration, state, and data.
+
+*Technical truth.* Each map has a type, fixed key/value layout, capacity, and
+flags. Operations have type-specific semantics and failure modes. This project
+currently uses:
+
+| Map | Type | Job |
+|-----+------+-----|
+| =ALLOWED_FDS= | hash map | admit numeric descriptors 1 and 2 |
+| =COLLECTOR_CGROUP= | cgroup array | exclude the collector subtree |
+| =WRITE_STARTS= | hash map | remember entry arguments until syscall exit |
+| =WRITE_JOBS= | hash map | carry chunk emission state across tail calls |
+| =WRITE_CHUNK_WORKER= | program array | jump to the chunk worker |
+| =EVENTS= | ring buffer | move =WriteEvent= records to userspace |
+
+*Where the picture bends.* A map operation can fail because capacity is full,
+memory cannot be reserved, a key is absent, or the program races with another
+execution. A map is not automatically a lossless queue or transaction.
+
+*Why we care.* Every failure boundary needs a counter or integrity marker before
+this project can claim “no silent byte loss.”
+
+** Userspace-fed registered-file maps
+
+The CRI-file adapter adds a policy map with a different job from the existing
+descriptor filter:
+
+| Map | Type | Job |
+|-----+------+-----|
+| =REGISTERED_WRITE_TARGETS= | bounded non-LRU hash | admit TGID/fd keys and return an opaque userspace handle |
+| =CAPTURE_COUNTERS= | per-CPU array | count admitted work and explicit kernel loss boundaries |
+
+The discovery key contains =u32= device major, =u32= device minor, and a =u64=
+inode number. Userspace uses it to match kubelet log targets to open
+=/proc/TGID/fd= entries. Only =u32 TGID + u32 fd= enters the eBPF policy map.
+Its value is one non-zero =u64= handle. Paths, namespaces, Pod names, and
+container names stay in userspace.
+
+*Plain version.* Userspace writes the guest list; eBPF checks it at the door.
+
+*Technical truth.* A missing TGID/fd key is the normal fail-closed path and does not
+emit an event. The map holds at most 16,384 entries and does not use LRU
+eviction: silent replacement would make capture policy depend on access order.
+Capacity and mutation failures are reported by the userspace control loop.
+Admitted writes and kernel-side loss boundaries use per-CPU counters to avoid a
+single globally contended increment.
+
+*Where the picture bends.* A map update is not lifecycle synchronization by
+itself. Userspace must order its handle snapshot, map insertion, drain window,
+map removal, and tombstone removal so a ring-buffer event can still explain its
+opaque handle.
+
+*Why we care.* Map membership keeps path resolution, =stat=, =/proc= traversal,
+symlink traversal, and Kubernetes-shaped data out of the write hot path.
+
+* Why the first VFS fexit experiment was rejected
+
+*Plain version.* Compiling kernel-structure access is not the same as making it
+portable. We looked inside the object before trusting it.
+
+*Technical truth.* The development kernel exposes BTF for =vfs_write=, and Aya
+can attach fexit by function BTF ID. But the compiled Rust object accessed
+=file.f_inode= and related fields with literal offsets and emitted no CO-RE
+field relocations. =bpftool gen min_core_btf= reduced its relocation needs to
+an empty 33-byte header. Function attachment portability did not imply struct
+field portability.
+
+*Where the picture bends.* Generated development-kernel bindings would make
+literal offsets compile, but would not repair the missing relocations. The VFS
+adapter stays deferred until the object proves relocatable field access or an
+offset-free kernel interface exists.
+
+*Why we care.* Rejecting the clever-looking hook led back to the simpler stable
+tracepoint: userspace injects current runtime TGID/fd targets, and eBPF removes
+ordinary closed descriptors before their numbers can be reused.
+
+* Ring buffers: kernel-to-userspace conveyor belt
+
+*Plain version.* The kernel places fixed records on a circular conveyor belt;
+userspace removes them.
+
+*Technical truth.* =BPF_MAP_TYPE_RINGBUF= provides one shared buffer. The eBPF
+program reserves space, initializes the record, and submits it. Userspace polls
+and consumes records. Reservation can fail under pressure. Records are ordered
+by reservation across CPUs, but the higher-level ordering and loss semantics
+still need deliberate design.
+
+boring-logtail reserves exactly =size_of::<WriteEvent>()=. Payload capacity is
+fixed by =WRITE_CHUNK_SIZE=. Larger writes become several records.
+
+*Where the picture bends.* A ring buffer overwriting or rejecting data is not
+backpressure on the application write. The application continues; observation
+may lose information. The observer must report that honestly.
+
+* Tail calls: another program, same event
+
+*Plain version.* A tail call jumps from one eBPF program to another without
+returning.
+
+*Technical truth.* A =ProgramArray= maps an integer slot to a loaded eBPF
+program. A successful tail call replaces the current program. Linux bounds the
+tail-call chain. Our exit program creates a =WriteJob= and calls slot zero. The
+chunk worker emits one chunk, updates the job, and tail-calls itself until the
+write is complete or the project limit is reached.
+
+*Where the picture bends.* A tail call may fail because the slot is missing or
+the chain limit is exhausted. State must be cleaned up on both success and
+failure paths.
+
+*Why we care.* One obviously bounded chunk per invocation is easier for the
+verifier than a large dynamic copy loop. =MAX_CHUNKS_PER_WRITE= also imposes an
+observable truncation limit.
+
+* The ABI: a treaty between two worlds
+
+*Plain version.* Kernel and userspace must agree exactly on the shape of every
+message.
+
+*Technical truth.* [[file:../boring-logtail-common/src/lib.rs][boring-logtail-common]] defines
+=WriteEvent= with =#[repr(C)]=, fixed-width integer fields, and a fixed byte
+array. The ABI version is part of every event. Layout, alignment, endianness,
+field meaning, and flag meaning form the contract—not merely the Rust type
+name.
+
+Userspace reads ring-buffer bytes unaligned because the incoming slice does not
+promise Rust alignment. It validates the record size before copying it into a
+=WriteEvent=.
+
+*Where the picture bends.* =repr(C)= gives a predictable C-style layout for one
+target, not a network protocol. Changing a field can change size or padding.
+Cross-endian transport would need explicit encoding.
+
+* Bounded capture and honest truncation
+
+*Plain version.* We take a limited photograph of each write rather than letting
+one enormous write trap the kernel program forever.
+
+*Technical truth.* Each event holds 256 payload bytes. At most 32 chunks are
+emitted, so the current per-write ceiling is 8192 captured bytes. A larger
+successful write emits a terminal chunk carrying =FLAG_TRUNCATED=. Userspace
+returns a =WriteOperation= with =truncated=true= and the bytes it did receive.
+
+*Why we care.* Partial evidence with an integrity marker is valuable. Partial
+evidence pretending to be complete is poison.
+
+* GPL and the eBPF license declaration
+
+*Plain version.* The source license protects software freedom. The short =GPL=
+string inside the eBPF object also tells Linux which helper class the program
+claims eligibility to use.
+
+*Technical truth.* Some helpers and program types require a GPL-compatible eBPF
+license declaration. The ELF section named =license= contains =GPL\0=. This is
+distinct from—but consistent with—the repository's =GPL-3.0-or-later= source
+license in [[file:../COPYING][COPYING]].
+
+* CO-RE and this project's build
+
+*Plain version.* eBPF needs to match the kernel it enters. There are several ways
+to make that relationship less painful.
+
+*Technical truth.* Compile Once – Run Everywhere (CO-RE) commonly uses BTF type
+metadata and relocations to adapt field access to the running kernel. This
+project currently uses Aya's Rust toolchain and tracepoint contexts, builds the
+eBPF crate with nightly plus =build-std=, embeds the resulting object in the
+userspace binary, and does not currently present a broad CO-RE compatibility
+contract.
+
+*Why we care.* “Written in Rust with Aya” does not automatically mean portable
+across every architecture, syscall ABI, and kernel. Compatibility must be tested
+and stated.
+
+* Go deeper
+
+- [[file:linux.org][The Linux objects these programs observe]]
+- [[file:boring-logtail.org][How these pieces form one capture path]]
+- [[file:glossary.org][Quick glossary]]
+- [[file:lab.org][Experiments]]

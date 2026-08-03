@@ -1,0 +1,231 @@
+#+title: The Linux ground beneath boring-logtail
+#+license: GFDL-1.3-or-later
+
+boring-logtail does not read a log file. It watches a process ask Linux to write
+bytes. That sentence crosses nearly every boundary on this page.
+
+* Kernel space and userspace
+
+*Plain version.* Applications live in the apartment. The kernel owns the
+building: doors, pipes, memory, devices, and the rules for touching them.
+
+*Technical truth.* A CPU privilege boundary separates userspace from kernel
+space. Application code normally cannot read arbitrary kernel memory or drive a
+device directly. It requests kernel work through syscalls. The kernel validates
+the request, performs or rejects it, and returns a result.
+
+*Where the picture bends.* It is one machine, not two. Threads cross the
+boundary constantly. Shared memory, =mmap=, io_uring, vDSO calls, and device
+interfaces make the boundary more interesting than a reception desk.
+
+*Why we care.* Our userspace process loads eBPF programs and consumes events.
+Our eBPF programs execute inside the kernel when selected syscalls happen.
+
+* Processes, threads, PID and TID
+
+*Plain version.* A process is a running program with its own address space. A
+thread is one worker moving through that address space.
+
+*Technical truth.* Linux represents schedulable tasks with =task_struct=. A
+thread group shares resources commonly associated with a process. The thread
+group ID (TGID) is what users usually call the process ID; each task also has a
+thread ID. =bpf_get_current_pid_tgid()= returns both in one 64-bit value:
+
+#+begin_example
+high 32 bits: TGID (our WriteEvent.pid)
+low  32 bits: PID  (our WriteEvent.tid)
+#+end_example
+
+*Where the picture bends.* Linux naming is historical: kernel APIs may call the
+individual task identifier =pid= and the process-like identifier =tgid=.
+Namespaces can give the same task different visible numbers.
+
+*Why we care.* A write belongs to a specific task. We key chunks with cgroup,
+PID, TID, and operation ID so simultaneous writers do not get glued together.
+
+* Syscalls: asking the kernel to do the sharp thing
+
+*Plain version.* A syscall is a controlled door from an application into the
+kernel.
+
+*Technical truth.* The program places a syscall number and arguments according
+to its architecture's syscall ABI, then executes a special instruction. Linux
+dispatches the request. On return, a non-negative result usually represents
+success; negative values encode errors at the raw kernel boundary.
+
+boring-logtail currently traces =write(2)=:
+
+#+begin_src c
+ssize_t write(int fd, const void *buf, size_t count);
+#+end_src
+
+=fd= chooses an open file description, =buf= points into userspace memory, and
+=count= is the requested byte count. The return value is the number of bytes
+actually written, or an error.
+
+*Where the picture bends.* A function named =write= in source might be buffered
+by a language runtime before any syscall. Output can also reach a stream through
+=writev=, =sendfile=, =splice=, io_uring, or another route we do not yet cover.
+
+*Why we care.* Syscall entry tells us the pointer and request. Syscall exit tells
+us what really happened. Publishing at entry would confuse “asked for 4 KiB”
+with “Linux accepted 900 bytes.”
+
+* Partial writes and bytes that never happened
+
+*Plain version.* Asking Linux to write ten bytes does not promise ten bytes were
+written.
+
+*Technical truth.* A successful =write= may return a value smaller than =count=.
+The caller owns retry logic. A negative result means none of the requested bytes
+became part of that write operation. The userspace buffer may also change after
+entry, so capture timing matters.
+
+*Why we care.* We remember entry arguments, wait for exit, and cap capture at the
+non-negative return value. =WriteEvent.requested_len= and =WriteEvent.result=
+remain separate facts.
+
+* File descriptors and open file descriptions
+
+*Plain version.* A file descriptor is a small integer handle in one process.
+It is not the file, pipe, socket, or stream itself.
+
+*Technical truth.* A process's descriptor table maps numbers to open file
+descriptions in the kernel. Several descriptors—and several processes—can refer
+to the same underlying description. =dup= creates another descriptor for the
+same description. =fork= can share inherited descriptions. =close= removes one
+mapping. Redirection changes what a familiar number points at.
+
+Convention starts processes with:
+
+- =0=: standard input
+- =1=: standard output
+- =2=: standard error
+
+*Where the picture bends.* “fd 1 means stdout” is only a startup convention.
+After =dup2= or shell redirection, a write using numeric fd 1 may reach the
+container's stderr pipe, a file, a socket, or nowhere useful.
+
+*Why we care.* We currently admit writes whose numeric descriptor is 1 or 2.
+That is an intentionally incomplete first filter. Durable stream identity needs
+tracking of =dup=, =close=, inheritance, and the underlying pipe/file object.
+
+* Pipes and container logs
+
+*Plain version.* A pipe is a kernel byte tunnel. One side writes; another side
+reads.
+
+*Technical truth.* Container runtimes commonly connect a container process's
+stdout and stderr to pipes or pseudoterminals, consume the bytes, frame them in
+a runtime log format, and store or forward them. Kubernetes asks the runtime for
+those logs; it does not magically own application stdout.
+
+*Why we care.* We want the bytes before runtime formatting and file scraping,
+but “a write to fd 1 or 2” is only an approximation of “a write to the container
+output pipe.”
+
+* CRI log files: tap the runtime's structure
+
+*Plain version.* Instead of guessing whether an application's fd still means
+stdout, watch the file where the container runtime writes Kubernetes log
+records and teach eBPF exactly which files count.
+
+*Technical truth.* CRI runtimes consume container pipes and write records shaped
+as =TIMESTAMP STREAM TAG PAYLOAD= below =/var/log/pods=. A userspace lifecycle
+loop resolves those paths to a device/inode pair, finds matching numeric
+=/proc/TGID/fd= entries, and inserts =(TGID, fd) -> identity handle= into a
+bounded eBPF hash map. The stable =sys_enter_write= tracepoint derives the same
+TGID/fd pair without a filesystem lookup per record.
+
+The task visible at that hook is the runtime. Its PID, TID, and cgroup are not
+the workload's identity. The map value therefore carries an opaque userspace
+handle that joins the event back to the discovered Pod/container snapshot.
+
+*Where the picture bends.* Device plus inode identifies a live filesystem
+object better than inode alone, but it is a userspace discovery key, not the
+kernel hot-path key. Descriptor close, duplication, replacement, =close_range=,
+rotation, and inode reuse still exist.
+Userspace must publish registration state before inserting the map key, retain
+old identities while ring-buffer events drain, and eventually remove both map
+entries and tombstones. Watching only =/var/log/containers= symlinks is not
+enough to observe replacement of their targets below =/var/log/pods=.
+
+*Why we care.* This boundary gives exact CRI =stdout=/=stderr= and =F=/=P=
+structure, avoids API-server and runtime-socket calls, and removes discovery I/O
+from the per-record path. It works with the runtime rather than bypassing it.
+
+* Namespaces: several honest views of one kernel
+
+*Plain version.* A namespace changes what a process can see and what names it
+uses for shared kernel resources.
+
+*Technical truth.* Linux has PID, mount, network, user, cgroup, IPC, UTS, and
+time namespaces. A task can be PID 1 inside a container and PID 1825669 from the
+host's view. Tracepoints execute in the kernel and helpers may expose identifiers
+from a different namespace than =std::process::id()= inside the container.
+
+*Why we care.* Our original self-filter put container PID 1 into a map while the
+tracepoint saw the host PID. The collector captured its own output recursively.
+PID was the wrong identity boundary.
+
+* Cgroups: identity plus resource hierarchy
+
+*Plain version.* A cgroup is a kernel-managed branch containing processes. It
+can group “this container” independently of whatever PID numbers those processes
+see.
+
+*Technical truth.* Cgroup v2 provides one hierarchy. A task's membership appears
+in =/proc/self/cgroup= as =0::$PATH=. The cgroup filesystem is normally mounted
+at =/sys/fs/cgroup=. eBPF's =bpf_get_current_cgroup_id()= returns a stable
+64-bit kernel cgroup identifier for the current task. A =CgroupArray= stores an
+open cgroup directory, and =bpf_current_task_under_cgroup()= tests membership or
+descendancy in the kernel.
+
+*Where the picture bends.* A cgroup is not inherently a Kubernetes Pod or
+container. Runtime and systemd naming conventions must be decoded, IDs can be
+reused after deletion, and cgroup namespaces can make a container's own cgroup
+look like =/=.
+
+*Why we care.* We exclude the collector through its cgroup rather than a PID.
+That survives PID namespaces and also covers collector threads and children.
+Captured cgroup IDs will later anchor Kubernetes enrichment.
+
+The DaemonSet passes =/host/sys/fs/cgroup= explicitly because the node's
+hierarchy is mounted there. A native host run instead uses =/sys/fs/cgroup=.
+Treating the container mount path as the host default makes every lookup fail
+with “not a cgroup-v2 hierarchy” and leaves enrichment unresolved.
+
+* procfs and tracefs: kernel truth wearing files
+
+*Plain version.* Some Linux “files” are windows into live kernel state rather
+than bytes stored on disk.
+
+*Technical truth.* =procfs= at =/proc= exposes processes and kernel state.
+=/proc/self= follows the reading process. =tracefs= at =/sys/kernel/tracing=
+exposes tracing infrastructure, including tracepoint metadata. These are
+virtual filesystems with kernel-defined semantics.
+
+*Why we care.* Userspace reads =/proc/self/cgroup= to locate its exclusion
+cgroup. The privileged DaemonSet mounts tracefs so Aya can work with tracing
+facilities. Reading =/proc/<pid>/cmdline= is inherently racy because a process
+may exit or a PID may be reused.
+
+* Tracepoints
+
+*Plain version.* A tracepoint is a named socket the kernel intentionally leaves
+for observability tools to plug into.
+
+*Technical truth.* Tracepoints are relatively stable instrumentation sites with
+defined event formats. We attach to =syscalls/sys_enter_write= and
+=syscalls/sys_exit_write=. Their argument layout is still architecture ABI
+specific; our current offsets describe the 64-bit ABI used by the target build.
+
+*Why we care.* Tracepoints let us observe every matching syscall on a node
+without patching each application or language runtime.
+
+* Go deeper
+
+- [[file:ebpf.org][How eBPF executes safely inside this machinery]]
+- [[file:boring-logtail.org][The exact boring-logtail data path]]
+- [[file:glossary.org][Quick glossary]]
+- [[file:lab.org][Commands that expose these concepts]]

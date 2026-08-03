@@ -16,7 +16,29 @@ metadata:
     app.kubernetes.io/name: boring-logtail
     app.kubernetes.io/component: collector
     app.kubernetes.io/part-of: boring-logtail
-automountServiceAccountToken: false
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: boring-logtail-pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: boring-logtail-pod-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: boring-logtail-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: boring-logtail
+    namespace: boring-logtail
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -47,7 +69,7 @@ spec:
         app.kubernetes.io/part-of: boring-logtail
     spec:
       serviceAccountName: boring-logtail
-      automountServiceAccountToken: false
+      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 30
       tolerations:
         - operator: Exists
@@ -59,6 +81,18 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: BORING_LOGTAIL_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: BORING_LOGTAIL_HOST_CGROUP_ROOT
+              value: /host/sys/fs/cgroup
+            - name: BORING_LOGTAIL_CRI_RUNTIME
+              value: cri-o
+            - name: BORING_LOGTAIL_CRI_SOCKET
+              value: /var/run/crio/crio.sock
+            - name: BORING_LOGTAIL_SAMPLE_PERCENT
+              value: "100"
           resources:
             requests:
               cpu: 50m
@@ -76,8 +110,22 @@ spec:
             - name: tracefs
               mountPath: /sys/kernel/tracing
               readOnly: true
+            - name: host-cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            - name: cri-socket
+              mountPath: /var/run/crio/crio.sock
+              readOnly: true
       volumes:
         - name: tracefs
           hostPath:
             path: /sys/kernel/tracing
             type: Directory
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: cri-socket
+          hostPath:
+            path: /var/run/crio/crio.sock
+            type: Socket

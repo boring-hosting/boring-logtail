@@ -1,0 +1,166 @@
+#+title: Poke it and see
+#+license: GFDL-1.3-or-later
+
+These are small experiments, not ceremony. Read the label before running one:
+
+- *READ-ONLY* only observes local or cluster state.
+- *LOCAL* starts a process on your machine but does not change the cluster.
+- *CLUSTER WRITE* creates or changes Kubernetes resources.
+- *CLEANUP* deletes only the named temporary resource.
+
+Commands assume Linux, a shell, and repository root unless stated otherwise.
+
+* See your PID namespace
+
+*READ-ONLY.*
+
+#+begin_src shell
+printf 'shell says pid=%s\n' "$$"
+sed -n '/^NSpid:/p' /proc/self/status
+readlink /proc/self/ns/pid
+#+end_src
+
+=NSpid= can show identifiers across nested PID namespaces, subject to how
+procfs is mounted. Compare this inside and outside a container. The number a
+process sees is not automatically the number an eBPF tracepoint reports.
+
+* Find your cgroup-v2 membership
+
+*READ-ONLY.*
+
+#+begin_src shell
+sed -n '/^0::/p' /proc/self/cgroup
+stat -c 'inode=%i path=%n' /sys/fs/cgroup
+#+end_src
+
+In a private cgroup namespace, membership may appear as =0::/=. That slash means
+the namespace root, not necessarily the host hierarchy root. This is why
+=CollectorCgroup= combines procfs membership with the visible cgroup mount.
+
+* Watch fd 1 stop meaning what you thought
+
+*LOCAL.* Creates files under =/tmp= and leaves them there for inspection.
+
+#+begin_src shell
+sh -c 'printf "ordinary stdout\n"; printf "redirected through fd 1\n" > /tmp/boring-fd-one'
+sh -c 'printf "this write uses fd 1 after shell redirection\n" > /tmp/boring-fd-one'
+sed -n '1,20p' /tmp/boring-fd-one
+#+end_src
+
+The syscall can still use numeric fd 1 while its open file description now
+targets a regular file. Descriptor number is not durable stream identity.
+
+* See a syscall result
+
+*LOCAL.* Requires =strace=.
+
+#+begin_src shell
+strace -e trace=write sh -c 'printf "hello from write\n"' >/dev/null
+#+end_src
+
+Look for the fd, quoted bytes, requested count, and return value. =strace= and
+boring-logtail observe related kernel boundaries through different machinery.
+
+* Inspect tracepoint layouts
+
+*READ-ONLY.* Reading tracefs may require root or tracing-group permissions.
+
+#+begin_src shell
+sed -n '1,120p' /sys/kernel/tracing/events/syscalls/sys_enter_write/format
+sed -n '1,120p' /sys/kernel/tracing/events/syscalls/sys_exit_write/format
+#+end_src
+
+Compare field offsets with the reads in
+[[file:../boring-logtail-ebpf/src/main.rs][boring-logtail-ebpf/src/main.rs]]. This is the concrete ABI beneath
+=TracePointContext::read_at=.
+
+* Inspect the deployed collectors
+
+*READ-ONLY.* Requires the configured cluster context.
+
+#+begin_src shell
+kubectl -n boring-logtail get daemonset,pods -o wide
+kubectl -n boring-logtail logs -l app.kubernetes.io/name=boring-logtail \
+  --prefix=true --tail=40
+#+end_src
+
+Healthy means desired, ready, and available DaemonSet counts agree and Pods are
+not repeatedly restarting.
+
+* Send an unmistakable signal through the cluster
+
+*CLUSTER WRITE.* This creates one short-lived BusyBox Pod in the
+=boring-logtail= namespace. Review the command and current context first.
+
+#+begin_src shell
+kubectl config current-context
+kubectl -n boring-logtail run signal-flare \
+  --image=busybox:1.36 \
+  --restart=Never \
+  --labels=app=signal-flare \
+  --command -- sh -c \
+  'printf '\''{"kind":"learn-lab","signal":"BLT-LAB-42","message":"kernel says hello"}\n'\'''
+kubectl -n boring-logtail wait \
+  --for=jsonpath='{.status.phase}'=Succeeded \
+  pod/signal-flare --timeout=90s
+#+end_src
+
+*READ-ONLY.* Find the event:
+
+#+begin_src shell
+kubectl -n boring-logtail logs \
+  -l app.kubernetes.io/name=boring-logtail \
+  --prefix=true --tail=2000 | rg 'BLT-LAB-42'
+#+end_src
+
+You should see cgroup, PID, TID, fd, captured byte count, integrity flags, and
+the intact JSON payload. Only the collector on the signal Pod's node should see
+that write.
+
+*CLEANUP.* Deletes exactly the temporary Pod:
+
+#+begin_src shell
+kubectl -n boring-logtail delete pod signal-flare --wait=true
+#+end_src
+
+* Check that the collector is not eating its own tail
+
+*READ-ONLY.*
+
+#+begin_src shell
+kubectl -n boring-logtail logs \
+  -l app.kubernetes.io/name=boring-logtail \
+  --prefix=true --tail=5000 | \
+  rg 'payload="\\?\[INFO  boring_logtail\] write'
+#+end_src
+
+No match is the desired result. A nested collector =write= record inside
+=payload== means self-exclusion failed. Do not leave the collector running in
+that state; output amplification can be violent.
+
+* Run the local correctness gates
+
+*LOCAL.* Builds under =target/= and does not change the cluster.
+
+#+begin_src shell
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy \
+  --package boring-logtail \
+  --package boring-logtail-common \
+  --all-targets -- -D warnings
+cargo +nightly clippy \
+  --package boring-logtail-ebpf --lib -- -D warnings
+#+end_src
+
+The eBPF executable itself is built through Aya's nightly =build-std= path when
+the userspace package builds. Stable workspace-wide Clippy tries an unwinding
+=no_std= target and is not the correct eBPF lint invocation.
+
+* Follow the code after the experiment
+
+- The cgroup test: [[file:../boring-logtail/src/cgroup.rs][CollectorCgroup]]
+- The eBPF filter and hooks: [[file:../boring-logtail-ebpf/src/main.rs][kernel capture]]
+- The ring-buffer decoder: [[file:../boring-logtail/src/lib.rs][decode_event]]
+- The write reconstruction: [[file:../boring-logtail/src/pipeline.rs][WriteAssembler]]
+- The full tour: [[file:boring-logtail.org][how boring-logtail hears a write]]

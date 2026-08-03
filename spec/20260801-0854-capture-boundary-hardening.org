@@ -1,0 +1,122 @@
+#+title: Capture boundary hardening
+#+date: 2026-08-01 08:54 UTC
+#+license: GFDL-1.3-or-later
+
+* Goal
+
+Stop boring-logtail from capturing its own output across PID namespaces and
+leave the capture/reconstruction boundary small, explicit, and ready for later
+kubernetes enrichment.
+
+* Problem
+
+Userspace currently inserts =std::process::id()= into an eBPF =IGNORED_PIDS=
+map. Inside a container that PID belongs to the container PID namespace, while
+=bpf_get_current_pid_tgid()= observes the host PID. The keys do not match. The
+collector then prints a captured write, captures its own print, and recursively
+amplifies =payload:= until stopped.
+
+PID filtering also excludes only one task. It does not naturally cover threads,
+children, or future helper processes.
+
+* Design
+
+** Cgroup-based self-exclusion
+
+- Replace =IGNORED_PIDS= with a one-entry eBPF =CgroupArray=.
+- Resolve the collector's cgroup-v2 path from the =0::$PATH= entry in
+  =/proc/self/cgroup= and open the matching directory below =/sys/fs/cgroup=.
+- In a private cgroup namespace, =/= resolves to the namespace's mounted cgroup
+  root. In a host cgroup namespace, the explicit path resolves the container or
+  process cgroup. Never assume that =/sys/fs/cgroup= itself is safe to exclude.
+- Insert the open cgroup FD into slot zero before attaching capture programs.
+- At =sys_enter_write=, call =bpf_current_task_under_cgroup= through Aya's
+  =CgroupArray::is_current_task_under=. Ignore matching tasks and descendants.
+- Treat inability to resolve or configure the exclusion cgroup as a startup
+  error. Do not start a capture loop that can observe itself.
+- Treat an eBPF cgroup-membership helper error as no-capture for that write.
+
+This keeps the capture crate Linux/cgroup-aware but kubernetes-independent. The
+DaemonSet does not need =hostPID: true= merely to repair PID translation.
+
+** Focused code cleanup
+
+- Move cgroup-path parsing/resolution into a small userspace module with unit
+  tests for root, nested, malformed, legacy-only, and path-traversal inputs.
+- Make eBPF map and program lookup failures contextual errors rather than
+  =unwrap= panics.
+- Rename =ChunkChunker= to =WriteAssembler= and have it return a
+  =WriteOperation= that preserves capture metadata alongside opaque bytes.
+- Keep invalid UTF-8 as bytes and render it lossily only at the temporary output
+  edge; malformed input must not panic the event task.
+- Remove dead placeholder processor types and stale commented scaffolding.
+- Keep the startup phases explicit: load, configure filters, configure workers,
+  attach, then consume events.
+
+* Non-goals
+
+- Kubernetes API access, Pod caches, or cgroup-to-container enrichment.
+- General allow/deny policy for arbitrary workloads or cgroups.
+- =writev= or additional syscall coverage.
+- Record framing, multiline handling, or an output/export protocol.
+- A broad logging-crate migration unrelated to the feedback-loop fix.
+
+* Invariants
+
+- The collector and tasks below its cgroup never produce =WriteEvent= records.
+- Application payload remains opaque bytes until the userspace output edge.
+- Capture never starts unless self-exclusion is configured first.
+- A completed write retains cgroup, PID, TID, descriptor, syscall, timestamp,
+  result, truncation state, and reconstructed bytes.
+- No test depends on a particular host PID existing in =/proc=.
+
+* Verification
+
+- Unit-test cgroup-v2 membership path parsing and safe path resolution.
+- Unit-test write assembly metadata, chunk ordering, invalid UTF-8, and errors.
+- Run =cargo fmt --all -- --check=, =cargo clippy --workspace --all-targets=,
+  and =cargo test --workspace=.
+- Build the container through Skaffold.
+- Deploy with =skaffold dev=, generate output from a separate workload, and
+  verify captured application data appears without recursive =payload:= growth.
+
+* TODO
+
+- [X] C1 Replace PID filtering with the eBPF cgroup exclusion contract.
+- [X] C2 Add safe cgroup-v2 resolution and configure exclusion before attach.
+- [X] C3 Refactor write reconstruction into metadata-preserving operations.
+- [X] C4 Harden startup and event output; remove dead capture scaffolding.
+- [X] C5 Pass Rust formatting, linting, and workspace tests.
+- [X] C6 Verify the container and live cluster do not self-capture.
+
+* Validation
+
+- =cargo test --workspace=: passed; 19 tests passed across userspace, cgroup
+  discovery, shared ABI, and eBPF library targets.
+- =cargo clippy --package boring-logtail --package boring-logtail-common
+  --all-targets -- -D warnings=: passed.
+- =cargo +nightly clippy --package boring-logtail-ebpf --lib -- -D warnings=:
+  passed. Stable workspace-wide Clippy cannot compile the =no_std= eBPF binary
+  because it attempts an unwinding target; the actual eBPF binary is compiled
+  by the tested Aya build path with =build-std=.
+- =cargo fmt --all -- --check=: passed, with existing warnings that several
+  configured rustfmt options require nightly.
+- =skaffold run --tail=false=: built, pushed, and deployed
+  =ghcr.io/alfredosa/boring-logtail:8ef691b-dirty= at digest
+  =sha256:d182809f4435e12b17eff663fd634b3e99e0f127333ee57b703c6770997507bd=.
+- Live DaemonSet: two of two collectors remained ready with zero restarts.
+- Ambient capture: reconstructed real GitLab Runner, Flux, ExternalDNS, and
+  controller-runtime writes with cgroup/PID/TID/FD, byte length, integrity, and
+  intact payloads.
+- Signal capture: a temporary =signal-flare= pod emitted JSON containing
+  =order_id=BLT-42=. One collector reconstructed both 83-byte writes with
+  =truncated=false= and =read_failed=false=.
+- Self-capture audit: no collector log contained another collector =write=
+  record as its payload; recursive =payload: payload:= growth did not recur.
+- The temporary =signal-flare= pod was deleted after verification. The
+  boring-logtail DaemonSet remains deployed for continued observation.
+
+* Approval
+
+Approved by the maintainer on 2026-08-01 with the direction to proceed through
+capture of real, valuable data and keep naming fun, readable, and clean.

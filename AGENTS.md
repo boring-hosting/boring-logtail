@@ -43,6 +43,11 @@ This is a joyful hacker project, not corporate product collateral.
   spec/ file when one exists. Split anything that's really several things into separate
   entries. Check off / remove entries when the work lands.
 - ROADMAP.org shoud be kept up to date, new ideas and experimentations that affect the roadmap should be clearly stated.
+- `learn/` is the living field guide for Linux, eBPF, and project concepts. Any
+  change that introduces a concept, materially changes a boundary, or proves an
+  explanation wrong must update the relevant `learn/` page in the same spec TODO
+  and visible task-plan item. Keep explanations plain first, technically exact
+  underneath, and honest about where analogies stop working.
 
 ## Free Software
 

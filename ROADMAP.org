@@ -35,7 +35,7 @@ and enriches them with Kubernetes identity.
 * Stream identity coverage
 
 - [X] Initially recognize numeric descriptors 1 and 2.
-- [ ] Exclude the collector's own writes reliably across PID namespaces and
+- [X] Exclude the collector's own writes reliably across PID namespaces and
   prevent output feedback loops.
 - [ ] Observe =close=, =dup=, =dup2=, =dup3=, and =fcntl= descriptor duplication.
 - [ ] Track the underlying file/pipe identity of container stdout and stderr.
@@ -44,17 +44,22 @@ and enriches them with Kubernetes identity.
 - [ ] Support multiple processes sharing one container output stream.
 - [ ] Test close, replacement, redirection, inheritance, PID reuse, and container
   restart explicitly.
+- [ ] Prototype a VFS/file-write adapter filtered by userspace-injected
+  device/inode keys for node-local CRI logs.
+- [ ] Compare application-write capture with CRI-file capture for coverage,
+  framing, latency, overhead, rotation, and reuse as a generic Linux building block.
 
 * Reconstruction and Kubernetes identity
 
 - [ ] Join chunks by stable operation identity and report missing chunks.
 - [ ] Frame newline, multiline, JSON, and opaque-byte records in userspace.
 - [ ] Preserve raw bytes and integrity status even when decoding fails.
-- [ ] Resolve cgroup ID to runtime container ID.
-- [ ] Enrich through a node-scoped Pod cache with node, namespace, Pod name and
+- [ ] Resolve cgroup ID to runtime container ID across measured containerd and
+  CRI-O layouts.
+- [X] Enrich through a node-scoped metadata cache with node, namespace, Pod name and
   UID, container name and ID, attempt, stream, PID, and TID.
-- [ ] Retain metadata tombstones long enough to drain terminated containers.
-- [ ] Keep Kubernetes API and runtime lookups outside the capture hot path.
+- [X] Retain metadata tombstones long enough to drain terminated containers.
+- [X] Keep control-plane API, runtime, and filesystem lookups outside the capture hot path.
 
 * Release gates
 

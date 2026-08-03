@@ -1,0 +1,411 @@
+#+title: Userspace-registered CRI log tap
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Rejected by the maintainer on 2026-08-02 after live testing. Descriptor
+discovery moved capture to the wrong process boundary and an overly broad
+inotify mask caused a roughly 3000 millicore rescan feedback loop. T1--T3 remain
+as experimental evidence; T4--T8 are cancelled rather than repaired.
+
+* Problem
+
+The current syscall adapter captures application =write(2)= calls whose numeric
+descriptor is 1 or 2. That gives us the application bytes early, but it cannot
+prove that the descriptor still names the container output stream. It also
+observes application write boundaries rather than the CRI log structure written
+by the container runtime.
+
+Kubernetes already has a node-local log boundary. The runtime writes CRI records
+to files under =/var/log/pods= and kubelet exposes stable discovery names under
+=/var/log/containers=. A userspace control loop can discover those files when
+their lifecycle changes, resolve their device/inode identity once, and register
+that identity in an eBPF map. A kernel file-write adapter can then admit only
+writes to registered files and copy the written bytes directly to the existing
+ring-buffer transport.
+
+This does not bypass the runtime. It taps the point where the runtime commits its
+Kubernetes log structure. It requires no Kubernetes API calls, no CRI socket
+calls, and no filesystem operation per captured record.
+
+* Decision
+
+Build capture as adapters behind one userspace pipeline.
+
+- Keep the existing syscall adapter as the generic Linux/application-write
+  experiment.
+- Add a Linux registered-descriptor adapter for runtime writes to CRI log files.
+- Userspace owns registration policy: it resolves CRI files to device/inode,
+  resolves open runtime descriptors for those files, and writes fixed-size
+  =(TGID, fd) -> handle= entries into an eBPF map. eBPF owns the per-write
+  membership check, close-time invalidation, and byte transport.
+- The first prototype runs one adapter at a time. It does not silently emit the
+  same bytes from both sources.
+- Kubernetes and CRI naming remain userspace concerns. The shared capture ABI
+  describes kernel facts and a capture-source kind, not Pod objects.
+
+The implementation may later justify separate Linux-capture, CRI-discovery, and
+Kubernetes-enrichment crates. We will keep the boundaries explicit now without
+freezing that decomposition yet.
+
+* Invariants
+
+- No Kubernetes API-server or other network calls.
+- No container-runtime socket calls.
+- No =open=, =read=, =stat=, =readlink=, directory traversal, or other filesystem
+  operation in response to an admitted log record.
+- Lifecycle discovery may use startup enumeration, inotify, =readlink=, and
+  =statx=/=stat= off the capture hot path. Without that control-plane I/O,
+  userspace cannot safely learn new and rotated file identities.
+- An unregistered write target fails closed in eBPF and emits no payload event.
+- File identity includes at least device and inode. Inode alone is not globally
+  unique.
+- Registration has bounded capacity and explicit insert, replacement, removal,
+  overflow, and stale-entry telemetry.
+- Payload remains opaque bytes in the kernel. CRI parsing and validation happen
+  in userspace.
+- Every emitted record identifies its adapter so consumers can distinguish
+  application writes from runtime CRI-file writes.
+- The collector's own output remains excluded. Source selection must not create
+  a log-observer feedback loop.
+
+* Proposed data flow
+
+#+begin_example
+/var/log/containers lifecycle event
+  -> userspace resolves /var/log/pods target and device/inode
+  -> userspace resolves runtime /proc/TGID/fd entries for that device/inode
+  -> userspace updates REGISTERED_WRITE_TARGETS eBPF map
+
+container process writes stdout/stderr
+  -> runtime reads pipe and creates a CRI record
+  -> runtime writes the CRI record to its log file
+  -> write tracepoint checks (current TGID, fd) map membership
+  -> versioned capture chunks enter the ring buffer
+  -> userspace reconstructs the write
+  -> CRI parser yields timestamp, stdout|stderr, F|P, and payload
+  -> registered identity joins node/namespace/Pod/container metadata
+#+end_example
+
+There is lifecycle I/O on file creation and rotation. There is no discovery I/O
+on the arrow from the VFS adapter through parsing and enrichment.
+
+* Kernel attachment experiment
+
+The prototype must measure the available attachment boundary instead of
+assuming one kernel mechanism:
+
+1. Evaluate a typed BTF/fexit attachment to the kernel file-write path when the
+   supported Aya/kernel combination exposes the required =struct file=, user
+   buffer, and return-value facts. Entry attachment alone is insufficient: it
+   knows the requested count but not how many bytes the filesystem accepted.
+2. Otherwise evaluate a narrowly versioned kprobe adapter and document its
+   compatibility cost.
+3. Reject an attachment that cannot identify both the file and the bytes
+   actually accepted by the write path. Entry-only requested length must not be
+   reported as committed length.
+
+The experiment must cover the path actually used by CRI-O on the live nodes.
+Support for =write_iter=, =writev=, or io_uring is evidence-driven and must not
+be implied by a =write= fixture passing.
+
+** Local feasibility evidence, 2026-08-02
+
+- The workspace uses =aya 0.14.0= and =aya-ebpf 0.2.1=; both expose fentry and
+  fexit program support, and =FExitContext= exposes function arguments plus the
+  function return value.
+- The local Linux 7.1.5 BTF publishes =vfs_write(struct file *, const char *,
+  size_t, loff_t *)= as an attachable function and also publishes
+  =vfs_iter_write= and =vfs_writev=.
+- This proves that a typed =vfs_write= fexit prototype is plausible on the
+  development host. It does not prove the live nodes expose the same BTF or that
+  CRI-O reaches this function rather than an iterator or io_uring path.
+- Access to tracefs function listings was unavailable to the unprivileged local
+  process. Load/attach verification and live CRI-O path measurement remain T4
+  gates rather than assumptions.
+
+** VFS feasibility result, 2026-08-02
+
+The Rust prototype compiled, but object inspection rejected it:
+
+- =llvm-objdump= showed =file.f_inode=, =inode.i_sb=, and =super_block.s_dev=
+  compiled as literal offset-zero loads from hand-minimized structs.
+- The object contained =.BTF= and =.BTF.ext= sections, but =bpftool gen
+  min_core_btf= produced only a 33-byte empty BTF header. There were no field
+  relocations that could translate those offsets on another kernel.
+- =aya-tool= can generate kernel bindings, but the Rust compiler/Aya stack in
+  this workspace did not emit the required field CO-RE relocations for this
+  access. Committing a 2.5 MiB development-kernel layout would merely hard-code
+  more offsets.
+
+Therefore the prototype must not dereference =struct file=. It uses the stable
+syscall tracepoint ABI and userspace-fed descriptor targets instead. The VFS
+adapter remains a later experiment only when object inspection proves actual
+field relocations or another offset-free kernel interface exists.
+
+* Registered descriptor attachment
+
+Userspace performs lifecycle-only descriptor resolution:
+
+1. discover each CRI file's canonical device major, device minor, and inode;
+2. enumerate numeric =/proc/TGID/fd= entries and compare their target metadata;
+3. publish =(TGID, fd) -> handle= into =REGISTERED_WRITE_TARGETS=;
+4. refresh on relevant inotify open/create/rotation events;
+5. let =sys_enter_close= remove a matching target before the descriptor number
+   can be ordinarily reused.
+
+The hot =sys_enter_write= path reads TGID and fd, performs one hash lookup, and
+rejects absent keys. It performs no filesystem I/O and dereferences no unstable
+kernel structs. The matched handle is copied into the adapter-neutral event.
+
+The first prototype explicitly measures =dup=/=dup2=/=dup3=, =fcntl= duplication,
+=close_range=, process exit, and descriptor reuse. Ordinary =close= invalidation
+does not prove those other lifecycle paths safe.
+
+* Userspace registration model
+
+Each registered value carries a small opaque identity handle allocated by
+userspace. Userspace separately owns the handle-to-CRI-identity snapshot. This
+keeps namespace, Pod, container, path, and string data out of eBPF maps and out
+of the kernel/userspace capture ABI.
+
+Rotation is a replace operation:
+
+1. discover the new target;
+2. register its device/inode before considering it live;
+3. retain the old identity for a bounded drain window;
+4. remove the old map entry;
+5. expose races and missed-first-write evidence in counters/tests.
+
+Device/inode reuse is treated as a lifecycle hazard, not proof of eternal file
+identity. Where the selected hook exposes stronger generation or mount identity,
+the prototype should record and compare it before expanding the key.
+
+** Discovery key and registered-target value
+
+The first kernel map contract is deliberately small and fixed-width:
+
+#+begin_src rust
+#[repr(C)]
+struct RegisteredFileKey {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+}
+
+#[repr(C)]
+#[repr(C)]
+struct RegisteredWriteTargetKey {
+    tgid: u32,
+    fd: u32,
+}
+
+#[repr(C)]
+struct RegisteredWriteTargetValue {
+    handle: u64,
+}
+#+end_src
+
+- =device_major=/=device_minor= are canonical components derived from
+  userspace =st_dev= and kernel =i_sb->s_dev= respectively; =inode= is derived
+  from userspace =st_ino= and kernel =i_ino=. Comparing components avoids
+  treating userspace and kernel =dev_t= encodings as an undocumented ABI.
+- Device/inode remains in userspace as the discovery join key. The kernel map
+  is a non-LRU hash map named =REGISTERED_WRITE_TARGETS= with 16,384
+  entries. A full map rejects registration explicitly; it never silently
+  evicts a live source.
+- =handle= is non-zero, monotonically allocated within one collector process,
+  and never reused during that process lifetime. Zero means “no registered
+  identity” in the transport ABI.
+- Paths and Kubernetes strings never enter this map. A userspace snapshot maps
+  =handle= to the immutable discovery facts used for parsing and enrichment.
+- The prototype does not persist handles across agent restarts. Startup
+  enumeration creates a fresh map and fresh handle snapshot before attachment.
+
+The 16,384-entry capacity is a prototype bound, not a node-size claim. T7 must
+compare its occupancy with actual live and draining CRI files. Raising it
+without measuring locked memory is not a substitute for capacity telemetry.
+
+** Registration lifecycle
+
+Userspace owns these states:
+
+| State | Meaning | Kernel map membership |
+|-------+---------+-----------------------|
+| =Discovered= | CRI path parsed; identity not yet resolved | absent |
+| =Registered= | descriptor target and handle snapshot published | present |
+| =Draining= | path rotated/deleted; late ring events may remain | present for bounded grace |
+| =Removed= | grace expired and map deletion completed | absent; handle tombstone retained |
+| =Rejected= | malformed, ambiguous, unsupported, or capacity failed | absent |
+
+Publication order is part of the contract:
+
+1. build the immutable userspace handle snapshot;
+2. insert =(TGID, fd) -> handle= into the eBPF map;
+3. publish =Registered= to diagnostics.
+
+Removal reverses that ownership boundary:
+
+1. mark the handle =Draining= and retain its snapshot;
+2. after the bounded grace, remove the map key;
+3. retain a handle tombstone long enough to classify already-buffered events;
+4. finally remove the userspace handle snapshot.
+
+The discovery source watches both the stable =/var/log/containers= names and
+the resolved =/var/log/pods= directories. Watching only the symlink directory
+cannot reliably observe replacement of a =0.log= target during rotation.
+
+The watch is strictly for directory-entry lifecycle: create, delete, move, and
+attribute changes. It must never subscribe to =IN_OPEN=, =IN_CLOSE_WRITE=, or
+=IN_MODIFY=. A live-node test proved those data-path events turn every runtime
+log write (and the scanner's own opens) into another full =/proc/*/fd= scan. In
+the 2026-08-02 failure this feedback loop consumed roughly 3000 millicores. The
+DaemonSet was emergency-disabled before continuing T4.
+
+* Adapter-neutral transport ABI v2
+
+The prototype introduces =WRITE_EVENT_VERSION = 2= for both adapters. The eBPF
+object and userspace decoder ship together, so the prototype does not need a
+mixed-version ring buffer: version 1 and unknown versions are rejected before
+assembly.
+
+Version 2 keeps the fixed payload/chunk contract and defines these semantic
+fields:
+
+| Field | Type | Meaning |
+|-------+------+---------|
+| =abi_version= | =u16= | exactly 2 |
+| =flags= | =u16= | integrity and optional-field markers |
+| =capture_source= | =u16= | =APPLICATION_SYSCALL= or =REGISTERED_FILE= |
+| =operation_kind= | =u16= | =WRITE=, later =WRITEV=/iterator kinds |
+| =timestamp_ns= | =u64= | monotonic observation time |
+| =cgroup_id= | =u64= | cgroup of the task performing this kernel write |
+| =operation_id= | =u64= | chunk correlation key within the running agent |
+| =source_id= | =u64= | registered handle; zero for application writes |
+| =result= | =i64= | committed byte count or negative errno when known |
+| =pid=/=tid= | =u32= | task performing the observed write |
+| =fd= | =u32= | descriptor only when =FLAG_FD_KNOWN= is set |
+| =requested_len= | =u32= | saturated requested byte count |
+| =data_offset= | =u32= | byte offset of this chunk |
+| =captured_len= | =u32= | initialized bytes in =data= |
+| =data= | =[u8; 256]= | opaque bytes |
+
+The numeric constants are =APPLICATION_SYSCALL = 1=,
+=REGISTERED_FILE = 2=, =WRITE = 1=, and =WRITEV = 2=. The fixed C-layout size
+is 328 bytes with 8-byte alignment on the supported 64-bit little-endian target.
+Changing the layout requires another version; enum values are never renumbered.
+
+Existing first, last, truncated, result-known, and read-failed flags keep their
+meaning and bit positions. Version 2 adds =FLAG_FD_KNOWN = 1 << 5=. Both the
+application and registered-descriptor adapters set it because the syscall
+tracepoint observes the calling descriptor number.
+
+For =REGISTERED_FILE=, =cgroup_id=, =pid=, and =tid= describe the container
+runtime task writing the CRI file. They must never be presented as workload
+identity. Kubernetes identity comes from =source_id -> registered snapshot=.
+For =APPLICATION_SYSCALL=, =source_id= is zero and the existing workload-cgroup
+enrichment remains applicable.
+
+One adapter is selected before attachment. A version-2 =WriteOperation= retains
+=capture_source=, =operation_kind=, and =source_id= through reconstruction so
+parsing and enrichment never infer the adapter from missing fields.
+
+Chunk assembly keys by =(capture_source, cgroup_id, pid, tid, operation_id)=.
+The prototype keeps monotonic syscall-entry time as =operation_id=. Its required
+guarantee is one active operation per TID: all tail-called chunks complete
+before that task can begin another observed write, and ring-buffer reservation
+order preserves those chunks. It is not advertised as a globally unique event
+identifier. Tests must cover consecutive operations with the same metadata and
+must remove terminal assembly state before accepting the next operation.
+
+* Telemetry contract
+
+Kernel counters live in a per-CPU array so independent CPUs do not contend on a
+single increment. Userspace sums and reports them periodically. Stable counter
+slots are:
+
+| Counter | Boundary |
+|---------+----------|
+| =file_write_admitted= | registered key matched |
+| =event_ring_reserve_failed= | a chunk could not enter =EVENTS= |
+| =payload_read_failed= | user-buffer copy failed |
+| =write_job_insert_failed= | bounded chunk state could not be created |
+| =write_job_missing= | continuation state disappeared |
+| =tail_call_failed= | configured chunk worker did not run |
+| =write_truncated= | committed bytes exceeded the capture ceiling |
+
+Unregistered global file writes are intentionally not counted one by one: that
+would turn a fail-closed filter into unnecessary global write-path accounting.
+The absence of a map key is the ordinary fast rejection path.
+
+Userspace registration counters are:
+
+- discovery events and reconciliation passes;
+- registrations inserted, already-current, replaced, removed, and draining;
+- malformed/ambiguous paths and identity-resolution failures;
+- map-capacity rejections and map-operation failures;
+- rotations observed and first-write-race evidence;
+- events for unknown, draining, and tombstoned handles;
+- CRI records parsed as full, partial, or malformed.
+
+Counters are diagnostic facts, not logs emitted per event. Periodic snapshots
+must not perform discovery I/O.
+
+* CRI record contract
+
+The userspace parser recognizes the CRI text form:
+
+#+begin_example
+TIMESTAMP STREAM TAG PAYLOAD
+#+end_example
+
+- =STREAM= is exactly =stdout= or =stderr=.
+- =TAG= is =F= for a full record or =P= for a partial fragment.
+- The timestamp and delimiters are validated without requiring UTF-8 payload.
+- Raw bytes and integrity state survive malformed records.
+- Partial fragments are represented explicitly; multiline policy remains a
+  later userspace framing concern.
+
+This is the first point where =stream= may be stated as runtime-derived rather
+than =stdout-candidate= or =stderr-candidate=.
+
+* Measurement gate
+
+The prototype is not the new default until a fixture and a live CRI-O node show:
+
+- registered CRI writes are captured and unrelated file writes are rejected;
+- stdout, stderr, full, partial, malformed, rotation, deletion, and inode-reuse
+  scenarios have explicit results;
+- no filesystem or network call occurs per captured record;
+- map overflow and ring-buffer loss are observable;
+- duplicate, missing-first-write, and stale-registration rates are measured;
+- CPU, bytes copied, latency, and event volume are compared with the existing
+  application-write adapter under the same workload.
+
+* Non-goals
+
+- Replacing or bypassing kubelet or the container runtime.
+- Calling the Kubernetes API server or CRI socket for identity.
+- Parsing CRI structure inside eBPF.
+- Supporting every runtime, filesystem, syscall, and kernel in the first patch.
+- Splitting the workspace into final crates before the adapter interfaces have
+  survived the prototype.
+- Removing the generic fd-based capture adapter before comparison data exists.
+
+* TODO
+
+- [X] T1 Approve this architecture and choose the prototype boundary.
+- [X] T2 Specify the versioned adapter-neutral event fields, registered-file key,
+  capacity, lifecycle states, and loss counters; update the Linux/eBPF guide.
+- [X] T3 Build userspace CRI-file discovery, descriptor resolution, and an
+  independently tested registration state machine, reusing shared inotify.
+- [-] T4 Implement and verifier-test the registered-file kernel adapter against
+  the measured CRI-O write path, with fail-closed filtering and loss telemetry.
+- [-] T5 Add opaque-byte CRI parsing and join registered handles to existing
+  Kubernetes identity snapshots; update the field guide.
+- [-] T6 Add deterministic fixtures for full/partial stdout/stderr, malformed
+  records, unrelated files, rotation, deletion, overflow, and reuse races.
+- [-] T7 Compare both adapters locally and on a live CRI-O node; record coverage,
+  loss, latency, CPU, and hot-path I/O evidence before selecting a default.
+- [-] T8 Update README, roadmap, deferred-work index, manifests, and architecture
+  notes with the measured result and the retained limitations.

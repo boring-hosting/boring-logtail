@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod cgroup_resolver;
+pub mod cri_log;
+pub mod cri_metadata;
+mod directory_watch;
+pub mod enrichment;
+pub mod k8s_watch;
+pub mod node_metadata;
 pub mod pipeline;
+pub mod sampling;
 
-use std::{fmt, fs, io};
+use std::fmt;
 
 use boring_logtail_common::WriteEvent;
 
@@ -24,62 +32,53 @@ impl fmt::Display for InvalidEventSize {
 
 impl std::error::Error for InvalidEventSize {}
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum InvalidEvent {
+    Size(InvalidEventSize),
+    UnsupportedVersion { expected: u16, actual: u16 },
+}
+
+impl fmt::Display for InvalidEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Size(error) => error.fmt(formatter),
+            Self::UnsupportedVersion { expected, actual } => write!(
+                formatter,
+                "unsupported log event ABI version {actual}, expected {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InvalidEvent {}
+
 /// Decode one fixed-size record received from the kernel ring buffer.
-pub fn decode_event(bytes: &[u8]) -> Result<WriteEvent, InvalidEventSize> {
+pub fn decode_event(bytes: &[u8]) -> Result<WriteEvent, InvalidEvent> {
     let expected = size_of::<WriteEvent>();
     if bytes.len() != expected {
-        return Err(InvalidEventSize {
+        return Err(InvalidEvent::Size(InvalidEventSize {
             expected,
             actual: bytes.len(),
-        });
+        }));
     }
 
     // Every bit pattern is valid for WriteEvent's integer and byte-array fields.
     // read_unaligned avoids requiring the ring-buffer byte slice to be aligned.
-    Ok(unsafe { bytes.as_ptr().cast::<WriteEvent>().read_unaligned() })
-}
-
-pub fn render_event(event: &WriteEvent) -> String {
-    let proces_name = match get_process_name(event.pid) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("unable to get process_name");
-            String::new()
-        }
-    };
-
-    format!(
-        "pid={} tid={} cgroup={} fd={} syscall={} operation={} offset={} first={} last={} result={:?} truncated={} text={:?}",
-        proces_name,
-        event.tid,
-        event.cgroup_id,
-        event.fd,
-        event.syscall,
-        event.operation_id,
-        event.data_offset,
-        event.is_first_chunk(),
-        event.is_last_chunk(),
-        event.result(),
-        event.is_truncated(),
-        String::from_utf8_lossy(event.payload())
-    )
-}
-
-fn get_process_name(pid: u32) -> Result<String, io::Error> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let cmdline = fs::read_to_string(path)?;
-
-    // Linux cmdline arguments are null-separated ('\0').
-    // Replace them with spaces for human readability.
-    let readable = cmdline.replace('\0', " ").trim().to_string();
-
-    Ok(readable)
+    let event = unsafe { bytes.as_ptr().cast::<WriteEvent>().read_unaligned() };
+    if event.abi_version != boring_logtail_common::WRITE_EVENT_VERSION {
+        return Err(InvalidEvent::UnsupportedVersion {
+            expected: boring_logtail_common::WRITE_EVENT_VERSION,
+            actual: event.abi_version,
+        });
+    }
+    Ok(event)
 }
 
 #[cfg(test)]
 mod tests {
     use boring_logtail_common::{
-        FLAG_FIRST_CHUNK, FLAG_LAST_CHUNK, SYSCALL_WRITE, WRITE_CHUNK_SIZE, WRITE_EVENT_VERSION,
+        CAPTURE_SOURCE_APPLICATION_SYSCALL, FLAG_FD_KNOWN, FLAG_FIRST_CHUNK, FLAG_LAST_CHUNK,
+        OPERATION_WRITE, WRITE_CHUNK_SIZE, WRITE_EVENT_VERSION,
     };
 
     use super::*;
@@ -97,11 +96,13 @@ mod tests {
     fn decodes_an_unaligned_ring_buffer_record() {
         let mut event = WriteEvent {
             abi_version: WRITE_EVENT_VERSION,
-            flags: FLAG_FIRST_CHUNK | FLAG_LAST_CHUNK,
-            syscall: SYSCALL_WRITE,
+            flags: FLAG_FD_KNOWN | FLAG_FIRST_CHUNK | FLAG_LAST_CHUNK,
+            capture_source: CAPTURE_SOURCE_APPLICATION_SYSCALL,
+            operation_kind: OPERATION_WRITE,
             timestamp_ns: 1,
             cgroup_id: 456,
             operation_id: 789,
+            source_id: 0,
             result: 0,
             pid: 123,
             tid: 124,
@@ -111,7 +112,7 @@ mod tests {
             captured_len: 3,
             data: [0; WRITE_CHUNK_SIZE],
         };
-        event.data[..3].copy_from_slice(b"hi\n");
+        event.data[..3_usize].copy_from_slice(b"hi\n");
         let mut storage = vec![0xaa];
         storage.extend_from_slice(event_bytes(&event));
 
@@ -123,36 +124,43 @@ mod tests {
 
     #[test]
     fn rejects_records_with_the_wrong_size() {
-        let error = decode_event(&[0; 12]).unwrap_err();
+        let error = decode_event(&[0u8; 12]).unwrap_err();
 
-        assert_eq!(error.actual, 12);
-        assert_eq!(error.expected, size_of::<WriteEvent>());
+        assert_eq!(
+            error,
+            InvalidEvent::Size(InvalidEventSize {
+                expected: size_of::<WriteEvent>(),
+                actual: 12,
+            })
+        );
     }
 
     #[test]
-    fn renders_invalid_utf8_without_changing_the_payload() {
+    fn rejects_records_from_an_unknown_abi_version() {
         let mut event = WriteEvent {
-            abi_version: WRITE_EVENT_VERSION,
-            flags: FLAG_FIRST_CHUNK | FLAG_LAST_CHUNK,
-            syscall: SYSCALL_WRITE,
+            abi_version: WRITE_EVENT_VERSION + 1,
+            flags: FLAG_FD_KNOWN | FLAG_FIRST_CHUNK | FLAG_LAST_CHUNK,
+            capture_source: CAPTURE_SOURCE_APPLICATION_SYSCALL,
+            operation_kind: OPERATION_WRITE,
             timestamp_ns: 1,
-            cgroup_id: 456,
-            operation_id: 789,
+            cgroup_id: 2,
+            operation_id: 3,
+            source_id: 0,
             result: 0,
-            pid: 123,
-            tid: 124,
+            pid: 4,
+            tid: 5,
             fd: 1,
-            requested_len: 2,
+            requested_len: 0,
             data_offset: 0,
-            captured_len: 2,
+            captured_len: 0,
             data: [0; WRITE_CHUNK_SIZE],
         };
-        event.data[..2].copy_from_slice(&[0xff, b'a']);
 
-        assert_eq!(event.payload(), &[0xff, b'a']);
-        assert_eq!(
-            render_event(&event),
-            "pid=123 tid=124 cgroup=456 fd=1 syscall=1 operation=789 offset=0 first=true last=true result=None truncated=false text=\"�a\""
-        );
+        assert!(matches!(
+            decode_event(event_bytes(&event)),
+            Err(InvalidEvent::UnsupportedVersion { .. })
+        ));
+        event.abi_version = WRITE_EVENT_VERSION;
+        assert!(decode_event(event_bytes(&event)).is_ok());
     }
 }

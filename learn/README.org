@@ -1,0 +1,70 @@
+#+title: Map of the rabbit hole
+#+license: GFDL-1.3-or-later
+
+Linux is a large machine with excellent names like /file descriptor/ and
+/tracepoint/. eBPF adds another machine inside that machine. boring-logtail
+stands at the boundary, listens to writes, and tries not to lie about what it
+heard.
+
+This directory explains that stack in plain words first and precise words
+second. It is not a substitute for kernel documentation. It is the map you read
+before opening the kernel documentation and wondering where the floor went.
+
+* Pick a tunnel
+
+1. [[file:linux.org][The Linux ground beneath us]]
+   Processes, syscalls, file descriptors, namespaces, cgroups, and the virtual
+   filesystems that expose kernel state.
+2. [[file:ebpf.org][eBPF without magic]]
+   Tiny verified programs, hooks, helpers, maps, ring buffers, and tail calls.
+3. [[file:boring-logtail.org][How boring-logtail hears a write]]
+   The current path through this repository, including exactly where data can
+   be lost or misunderstood.
+4. [[file:glossary.org][Words without gatekeeping]]
+   The quick alphabetical lookup when one suspicious noun blocks the paragraph.
+5. [[file:lab.org][Poke it and see]]
+   Small experiments that make the nouns visible on a real Linux machine.
+
+* The reading pattern
+
+Most concepts use four small moves:
+
+- *Plain version* — the useful mental picture.
+- *Technical truth* — names and mechanics precise enough to debug with.
+- *Where the picture bends* — the part the analogy hid.
+- *Why we care* — where the concept touches boring-logtail.
+
+Read only the plain version when you need momentum. Read the technical truth
+before designing against it.
+
+* What exists today
+
+#+begin_example
+application write(2)
+        |
+        v
+Linux syscall entry + exit tracepoints
+        |
+        v
+eBPF WriteEvent chunks --ring buffer--> userspace WriteAssembler
+                                            |
+                                            v
+                                      WriteOperation
+                                            |
+                                            v
+                                  temporary human output
+#+end_example
+
+The capture and write-reconstruction pieces exist. Durable stream identity,
+record framing, kubernetes identity, and export are still being built. The
+[[file:../ROADMAP.org][roadmap]] is the source of truth for that frontier.
+
+* Keep this alive
+
+When a change introduces a concept, changes a boundary, or proves an old
+explanation wrong, update the relevant page here in the same change. A stale
+learning guide is worse than no guide: it gives confidence to the wrong model.
+
+Every file in this directory is free documentation under the
+[[file:../COPYING.DOC][GNU Free Documentation License, version 1.3 or later]], with no invariant
+sections.

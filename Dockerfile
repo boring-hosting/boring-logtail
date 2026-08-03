@@ -20,6 +20,8 @@ RUN apt-get update \
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml ./.cargo/config.toml
+COPY tools/protoc-vendored ./tools/protoc-vendored
 COPY boring-logtail/Cargo.toml boring-logtail/build.rs ./boring-logtail/
 COPY boring-logtail-common/Cargo.toml ./boring-logtail-common/
 COPY boring-logtail-ebpf/Cargo.toml boring-logtail-ebpf/build.rs ./boring-logtail-ebpf/

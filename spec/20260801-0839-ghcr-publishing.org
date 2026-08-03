@@ -1,0 +1,70 @@
+#+title: Publish the container image to GHCR
+#+date: 2026-08-01 08:39 UTC
+#+license: GFDL-1.3-or-later
+
+* Goal
+
+Publish boring-logtail as =ghcr.io/alfredosa/boring-logtail= and let kubernetes
+pull the public image anonymously, with no registry Secret.
+
+* Scope
+
+- Replace GitLab Container Registry references with GHCR.
+- Associate the OCI image with =github.com/alfredosa/boring-logtail=.
+- Remove the obsolete =gitlab-registry= image pull Secret reference.
+- Add a repeatable mise publishing task and terse operator instructions.
+- Authenticate the local Docker client, build, and perform the first push.
+- Make the newly created GHCR package public and verify anonymous pulling.
+
+GitHub Actions release automation and image signing are out of scope.
+
+* Decisions
+
+- Use =ghcr.io/alfredosa/boring-logtail= as the canonical image name.
+- Add the OCI source label so GitHub associates the package with this repository.
+- Publish both an immutable Git commit tag and =latest=; deployments use the
+  immutable tag when releasing and Skaffold may substitute development tags.
+- Keep authentication local. Never place a PAT in the repository, shell history,
+  kubernetes manifests, or documentation examples as a literal value.
+- Use a classic GitHub PAT with =write:packages= for the first local push.
+- Treat package visibility as a deliberate one-way operation: GHCR packages are
+  private initially, and GitHub warns that Public cannot later become Private.
+
+* First-push sequence
+
+1. Create a classic PAT with =write:packages= only.
+2. Pipe it to =docker login ghcr.io -u alfredosa --password-stdin=.
+3. Build and push the commit and =latest= tags.
+4. In the package settings, change visibility to Public.
+5. Log out or use a clean Docker config and verify an anonymous pull.
+
+* TODO
+
+- [X] G1 Replace registry references, add OCI metadata, and remove the pull Secret.
+- [X] G2 Add mise publish tasks and update =README.org=.
+- [X] G3 Validate Skaffold and kubernetes configuration locally.
+- [X] G4 Authenticate to GHCR and push the first image.
+- [X] G5 Make the package public and verify an anonymous pull.
+
+* Approval
+
+Approved by the maintainer on 2026-08-01. The maintainer confirmed local GHCR
+authentication is already complete.
+
+* Validation
+
+- =mise tasks --json=: passed; =push= runs Skaffold for the commit and =latest=
+  tags.
+- =skaffold diagnose --yaml-only=: passed; the resolved artifact is
+  =ghcr.io/alfredosa/boring-logtail= with local pushing enabled.
+- =kubectl create --dry-run=client --validate=false=: passed for all three
+  resources; the DaemonSet has no =imagePullSecrets=.
+- Stale registry audit: passed; GitLab registry identifiers remain only in this
+  spec's description of what was removed.
+- =mise run push=: passed. Published =8731a58-dirty= and =latest= at digest
+  =sha256:693e74bd9d40d86ab4411f04e7e545ee766d936ba39a214a600760ec19aa78ae=.
+- Anonymous manifest lookup: correctly identified the remaining visibility step;
+  GHCR returned =unauthorized= while the newly created package is private.
+- Anonymous manifest lookup after the maintainer changed visibility: passed with
+  an isolated empty Docker configuration. The =latest= OCI manifest and its
+  layers are publicly readable without credentials.

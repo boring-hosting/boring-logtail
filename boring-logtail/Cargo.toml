@@ -13,19 +13,29 @@ boring-logtail-common = { path = "../boring-logtail-common", features = ["user"]
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 env_logger = { workspace = true }
+futures = "0.3"
 libc = { workspace = true }
 log = { workspace = true }
+k8s-cri = "0.11.0"
+k8s-openapi = { version = "0.28", features = ["latest"] }
+kube = { version = "4.2", features = ["runtime"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = "0.14"
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
     "rt-multi-thread",
     "net",
     "signal",
+    "sync",
+    "time",
 ] }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
+protoc-bin-vendored = "3.2.0"
 # TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
 # it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
 # script to build this, but we want to teach cargo about the dependency so that cache invalidation

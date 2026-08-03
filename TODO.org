@@ -5,13 +5,39 @@ This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
 =spec/=.
 
-* TODO Make process-name rendering tests independent of host =/proc= state
+* TODO Add measured CRI-O cgroup and log-layout support
 
-The test currently assumes PID 123 exists, so =cargo test --workspace= can fail
-on otherwise valid hosts. See [[file:spec/20260801-0812-repository-conventions.org][repository conventions migration]].
+Why: both live nodes run CRI-O 1.33, and the first enrichment join deliberately
+rejects that currently unsupported layout instead of guessing. See
+=spec/20260802-0743-kubernetes-identity-enrichment.org=.
 
-* TODO Exclude boring-logtail itself across PID namespaces
+* TODO Revisit crate boundaries after enrichment responsibilities settle
 
-The container inserts namespace PID 1 into =IGNORED_PIDS=, while the eBPF
-tracepoint observes the host PID; printing captured data can therefore feed back
-into capture recursively. Define the fix in a dedicated capture-filter spec.
+Why: Linux capture, cgroup/runtime discovery, and Kubernetes-shaped identity
+may deserve separate crates, but splitting them before their interfaces have
+survived real use would freeze guesses. See
+=spec/20260802-0743-kubernetes-identity-enrichment.org=.
+
+* TODO Prototype userspace-fed inode filters for CRI log writes
+
+Why: a VFS/file-write adapter could capture already-framed Kubernetes logs with
+zero additional filesystem I/O per record while userspace controls fixed-size
+device/inode map entries.
+
+* TODO Revisit a VFS CRI-file adapter when Rust emits proven CO-RE field relocations
+
+Why: the 2026-08-02 fexit experiment compiled kernel-struct field access as
+literal development-layout offsets; object inspection found no CO-RE field
+relocations. See =spec/20260802-0928-userspace-registered-cri-log-tap.org=.
+
+* TODO Measure lifecycle races for dynamically registered log files
+
+Why: creation, first write, rotation, deletion, agent restart, and inode reuse
+can race userspace map updates; the prototype needs evidence before replacing
+the generic application-write path.
+
+* TODO Remove konnectivity packet tracing from ordinary cluster operation
+
+Why: both node agents run with =-v=8=; following boring-logtail through
+=kubectl logs= creates a cross-cgroup observer loop because konnectivity logs
+the traffic used to transport collector output.

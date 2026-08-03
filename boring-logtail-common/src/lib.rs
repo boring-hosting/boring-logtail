@@ -5,18 +5,21 @@
 #[cfg(test)]
 extern crate std;
 
-pub const WRITE_EVENT_VERSION: u16 = 1;
+pub const WRITE_EVENT_VERSION: u16 = 2;
 pub const WRITE_CHUNK_SIZE: usize = 256;
 pub const MAX_CHUNKS_PER_WRITE: usize = 32;
 pub const MAX_BYTES_PER_WRITE: usize = WRITE_CHUNK_SIZE * MAX_CHUNKS_PER_WRITE;
-pub const SYSCALL_WRITE: u32 = 1;
-pub const SYSCALL_WRITEV: u32 = 2;
+pub const MAX_IOVECS_PER_WRITEV: usize = 16;
+pub const CAPTURE_SOURCE_APPLICATION_SYSCALL: u16 = 1;
+pub const OPERATION_WRITE: u16 = 1;
+pub const OPERATION_WRITEV: u16 = 2;
 
 pub const FLAG_RESULT_KNOWN: u16 = 1 << 0;
 pub const FLAG_FIRST_CHUNK: u16 = 1 << 1;
 pub const FLAG_LAST_CHUNK: u16 = 1 << 2;
 pub const FLAG_TRUNCATED: u16 = 1 << 3;
 pub const FLAG_READ_FAILED: u16 = 1 << 4;
+pub const FLAG_FD_KNOWN: u16 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteChunk {
@@ -72,12 +75,15 @@ pub fn next_write_chunk(result: i64, chunk_number: u32) -> Option<WriteChunk> {
 pub struct WriteEvent {
     pub abi_version: u16,
     pub flags: u16,
-    pub syscall: u32,
+    pub capture_source: u16,
+    pub operation_kind: u16,
 
     pub timestamp_ns: u64,
     pub cgroup_id: u64,
     /// Joins chunks belonging to the same syscall.
     pub operation_id: u64,
+    /// Opaque userspace registration handle; zero for application syscalls.
+    pub source_id: u64,
     /// Raw syscall result: bytes written when non-negative, otherwise `-errno`.
     pub result: i64,
 
@@ -104,6 +110,10 @@ impl WriteEvent {
         self.has_flag(FLAG_RESULT_KNOWN).then_some(self.result)
     }
 
+    pub fn fd(&self) -> Option<u32> {
+        self.has_flag(FLAG_FD_KNOWN).then_some(self.fd)
+    }
+
     pub fn is_truncated(&self) -> bool {
         self.has_flag(FLAG_TRUNCATED)
     }
@@ -128,10 +138,12 @@ mod tests {
         WriteEvent {
             abi_version: WRITE_EVENT_VERSION,
             flags: FLAG_FIRST_CHUNK | FLAG_LAST_CHUNK,
-            syscall: SYSCALL_WRITE,
+            capture_source: CAPTURE_SOURCE_APPLICATION_SYSCALL,
+            operation_kind: OPERATION_WRITE,
             timestamp_ns: 123,
             cgroup_id: 456,
             operation_id: 789,
+            source_id: 0,
             result: 0,
             pid: 42,
             tid: 43,
@@ -146,7 +158,7 @@ mod tests {
     #[test]
     fn event_has_a_stable_c_layout() {
         assert_eq!(align_of::<WriteEvent>(), 8);
-        assert_eq!(size_of::<WriteEvent>(), 320);
+        assert_eq!(size_of::<WriteEvent>(), 328);
     }
 
     #[test]

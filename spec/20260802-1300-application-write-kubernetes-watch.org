@@ -1,0 +1,160 @@
+#+title: Application writes with layered CRI and Kubernetes identity caches
+#+date: 2026-08-02 13:00 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved by the maintainer on 2026-08-02. Implementation is in progress.
+
+* Goal
+
+Return capture to application =write(2)= and =writev(2)=. Resolve identity from
+the local CRI first and use a node-scoped Kubernetes Pod watch as fallback and
+supplement. Capture and per-event enrichment perform in-memory work only.
+
+* Decision
+
+- Capture bytes at the container application syscall boundary. FD 1 is stdout;
+  FD 2 is stderr. Do not capture CRI-O's file writes.
+- Implement committed-result-aware =writev= alongside the existing =write=
+  adapter. Preserve iovec order and apply the existing payload/chunk bounds.
+- Keep Kubernetes entirely out of the eBPF ABI. Events carry kernel cgroup ID,
+  TGID/TID, fd, operation kind, result, and opaque bytes.
+- Run a bounded local CRI reconciliation task. It joins containers to Pod
+  sandboxes and publishes immutable identity maps keyed by complete runtime
+  container ID. Standard CRI has no portable lifecycle watch, so this is
+  periodic reconciliation rather than a claim of push notification.
+- Run one node-scoped Kubernetes watch task as fallback and supplement. It
+  lists Pods assigned to =spec.nodeName= once, then watches from the returned
+  resource version.
+- Merge both sources deterministically. CRI is primary for live local container
+  presence and sandbox identity. Kubernetes fills exact matching status and
+  desired metadata such as labels. Conflicts are ambiguous, never guessed.
+- A separate asynchronous cgroup resolver joins kernel cgroup ID to complete
+  runtime container ID. Its node-local discovery I/O never runs in response to
+  an event.
+- Remove registered CRI-file discovery, =/proc/*/fd= scanning, its eBPF map, and
+  its host log mounts from the production path.
+
+* CRI contract
+
+- Detect only configured, supported Unix sockets; initially CRI-O and
+  containerd. Never probe arbitrary sockets or silently select two runtimes.
+- Use the versioned CRI RuntimeService over its Unix socket. Join
+  =ListContainers.container_id -> pod_sandbox_id -> ListPodSandbox.metadata=.
+- Reconcile on a bounded interval with jitter and exponential failure backoff.
+  Runtime-specific event streams are a later optimization, not required for
+  correctness.
+- Treat the runtime socket as a privileged capability. Mount it read-only where
+  the runtime permits, use no mutation RPCs, and document that Unix socket
+  access may still confer powers beyond the RPCs boring-logtail chooses to call.
+- Bound response count, cache size, reconciliation frequency, tombstones, and
+  diagnostics. CRI failure falls through to the Kubernetes snapshot.
+- Publish counters for reconciliation success/failure, latency, returned
+  containers/sandboxes, cache occupancy, ambiguity, and cache age.
+
+* API-server fallback contract
+
+- Use the normal in-cluster client, service-account token, and cluster CA.
+- RBAC is read-only and minimal: =get=, =list=, and =watch= Pods only. No writes,
+  no Secrets, no Nodes, and no cluster-wide Pod watch.
+- Restrict both list and watch with =spec.nodeName=<this node>=. Each DaemonSet
+  Pod therefore sees only Pods scheduled to its node.
+- Maintain one long-lived watch per collector, not polling and not one request
+  per log event.
+- Resume from the last resource version. On expiration (=410 Gone=), relist with
+  bounded exponential backoff and jitter. Bound response size, retry rate,
+  cache size, tombstones, and diagnostics.
+- API outage degrades enrichment only. Capture continues and emits an explicit
+  unresolved reason. No event waits for the API.
+- Publish counters for list/watch success, reconnects, resource-version expiry,
+  decode rejection, cache occupancy, cache age, and unresolved joins.
+
+* Hot-path invariants
+
+- eBPF performs no network or filesystem I/O.
+- Ring-buffer consumption performs no network or filesystem I/O.
+- Identity lookup is an immutable in-memory snapshot read.
+- Missing, stale, or ambiguous identity never drops captured bytes.
+- The collector excludes its own cgroup before payload submission.
+- Sampling occurs after reconstruction using stable capture facts and never
+  changes CRI reconciliation or API-watch traffic.
+
+* Rollout safety
+
+- The emergency node selector was removed with maintainer approval after the
+  counter-free capture rewrite passed tests, verifier loading, and a host smoke
+  run. Output sampling was raised to 100% with maintainer approval for the
+  initial functional cluster observation; reduce it before any load test.
+- Add an explicit discovery/work rate counter before live deployment.
+- Observe the first live rollout with a hard CPU abort threshold before calling
+  the cluster path validated.
+- Never use =kubectl logs -f= during validation on the affected Kamaji/
+  konnectivity environment. Use finite reads and kernel/userspace counters.
+
+* Non-goals
+
+- Capturing runtime CRI log-file writes.
+- Reading log payloads from disk or scanning =/proc/*/fd=.
+- Calling kubelet or runtime-specific non-CRI APIs.
+- Resolving workload owners or annotations in this slice. Pod labels are
+  included with an explicit size/count bound.
+- Retrofitting metadata onto already-exported events.
+
+* Verification
+
+- Unit-test =writev= reconstruction across empty, partial, failed, oversized,
+  and malformed iovec cases.
+- Unit-test CRI container/sandbox joins, reconciliation replacement, runtime
+  absence, malformed responses, ambiguity, and stale-cache fallback.
+- Unit-test Pod list/watch application, replacement, deletion, ambiguity,
+  resource-version expiry, tombstones, and stale-cache reporting.
+- Prove the event path cannot invoke the CRI client, Kubernetes client, or
+  filesystem resolver through module boundaries and tests.
+- Run formatting, workspace tests, strict Clippy, and local eBPF verifier load.
+- Measure idle and synthetic-write CPU before any cluster rollout.
+- Roll out to one node; prove exact Pod/container enrichment and bounded CRI/API
+  request counts, then widen only after the abort window passes.
+
+* TODO
+
+- [X] A1 Remove the registered CRI-file production path and restore application =write= capture.
+- [X] A2 Implement committed-result-aware, bounded =writev= capture and reconstruction.
+- [X] A3 Implement bounded CRI-O/containerd reconciliation into immutable container identity snapshots.
+- [X] A4 Implement the node-scoped Pod list/watch fallback and deterministic CRI/Kubernetes merge.
+- [X] A5 Join cgroup/container identity to merged snapshots with explicit stale, ambiguous, and unresolved outcomes.
+- [X] A6 Add runtime socket mounts, minimal Pod RBAC, bounded configuration, and remove CRI-log descriptor discovery mounts.
+- [-] A7 Pass local correctness, verifier, CPU, and no-hot-path-I/O validation.
+- [ ] A8 Perform a guarded one-node rollout and update the field guide, README, roadmap, and deferred-work index.
+
+* Approval
+
+Approved by the maintainer on 2026-08-02.
+
+* Validation log
+
+- Workspace tests pass with 46 tests across userspace, shared ABI, and eBPF
+  crates. Strict userspace Clippy passes with warnings denied.
+- The application-write adapter is counter-free again. =write= and =writev=
+  have separate entry state, exit programs, job maps, and tail workers; only
+  admission maps, the event ring, and a small event emitter are shared.
+- Both workers load in the local kernel verifier. A host smoke run captures
+  scalar and vectored terminal output with sampling and clean shutdown.
+- The 2026-08-02 cluster run resolved live CRI-O identities through cgroup ID
+  to namespace, Pod, container, UID, node, restart count, and runtime ID.
+  Snapshot diagnostics reported successful CRI reconciliations with no
+  failures or ambiguous/container-missing joins. Host kubelet/iptables canary
+  writes remained explicitly =cgroup-not-indexed=, as expected outside a
+  runtime-container cgroup. CPU observation is still required before A7 closes.
+- Ordinary host builds and a clean Docker build pass without a system
+  =protoc=. Cargo supplies the compiler used by the transitive =k8s-cri= build
+  through the checked-in wrapper; the runtime image gains no compiler.
+- Client-side construction accepts the Namespace, ServiceAccount, minimal Pod
+  ClusterRole/Binding, and DaemonSet. The maintainer removed its emergency
+  selector on 2026-08-02 for cluster validation.
+- The 2026-08-02 local privileged verifier gate rejected
+  =boring_logtail_send_write_chunk= before analysis: =last insn is not an exit
+  or jmp=. Object inspection proves LLVM placed a backward-only cold
+  counter/error block at the physical end of both generalized workers. A7
+  remains open. Do not deploy this object. Restore the previously proven scalar
+  worker and isolate =writev= state/emission before repeating the gate.
