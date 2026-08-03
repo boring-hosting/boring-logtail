@@ -87,10 +87,6 @@ spec:
                   fieldPath: spec.nodeName
             - name: BORING_LOGTAIL_HOST_CGROUP_ROOT
               value: /host/sys/fs/cgroup
-            - name: BORING_LOGTAIL_CRI_RUNTIME
-              value: cri-o
-            - name: BORING_LOGTAIL_CRI_SOCKET
-              value: /var/run/crio/crio.sock
             - name: BORING_LOGTAIL_SAMPLE_PERCENT
               value: "100"
           resources:
@@ -113,9 +109,6 @@ spec:
             - name: host-cgroup
               mountPath: /host/sys/fs/cgroup
               readOnly: true
-            - name: cri-socket
-              mountPath: /var/run/crio/crio.sock
-              readOnly: true
       volumes:
         - name: tracefs
           hostPath:
@@ -125,7 +118,3 @@ spec:
           hostPath:
             path: /sys/fs/cgroup
             type: Directory
-        - name: cri-socket
-          hostPath:
-            path: /var/run/crio/crio.sock
-            type: Socket

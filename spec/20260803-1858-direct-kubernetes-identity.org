@@ -1,0 +1,160 @@
+#+title: Direct Kubernetes identity enrichment
+#+date: 2026-08-03 18:58 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-03. Awaiting maintainer approval.
+
+* Goal
+
+Identify the Kubernetes container that produced a captured write with the
+smallest honest path:
+
+#+begin_example
+WriteOperation.cgroup_id
+  -> asynchronously maintained cgroup ID to runtime container ID snapshot
+  -> asynchronously maintained node-scoped Pod snapshot keyed by exact container ID
+  -> namespace, Pod name and UID, container name, container ID, and node
+#+end_example
+
+The event path performs only in-memory lookups. Missing identity is explicit and
+never drops captured bytes.
+
+* Decision
+
+- Use the node-scoped Kubernetes Pod watch as the sole source of Kubernetes
+  identity. Container status already carries the exact runtime-qualified
+  container ID needed to join with the cgroup resolver.
+- Remove CRI RuntimeService reconciliation, its container/sandbox join, and the
+  CRI/Kubernetes merge. The added fallback does not justify a privileged runtime
+  socket, a second identity authority, duplicated models, or merge policy.
+- Keep the last Pod snapshot when the watch reports an error and mark it stale.
+  Containers first observed while Kubernetes metadata is unavailable remain
+  explicitly unresolved until the watch recovers.
+- Keep only identity facts used by enrichment: node, namespace, Pod name and
+  UID, container name, and exact runtime container ID.
+- Remove restart/attempt and identity-tombstone fields. CRI creation attempt and
+  Kubernetes restart count have different contracts, neither participates in
+  the identity join, and the active production path never produced identity
+  tombstones.
+- Remove aggregate enrichment counters and their periodic diagnostics. The
+  explicit per-event enrichment result remains the source of truth; counters
+  can return later behind a deliberate metrics boundary if they become useful.
+- Preserve the existing exact, unresolved, stale, and ambiguous enrichment
+  outcomes. Do not guess from partial IDs or collapse ambiguity into a winner.
+
+This decision supersedes the CRI cache and merge portions of
+=spec/20260802-1300-application-write-kubernetes-watch.org=. That document
+remains historical evidence for the application =write=/=writev= capture
+decision and its validation results.
+
+* Scope
+
+- Delete =boring-logtail/src/cri_metadata.rs= and its module export.
+- Make =spawn_kubernetes_cache= publish the =PodSnapshot= consumed directly by
+  =Enricher=; remove =CriSnapshot=, =CriIdentity=, merge helpers, and their tests.
+- Remove CRI startup, configuration, reconciliation diagnostics, environment
+  variables, and runtime-socket mount from the binary and DaemonSet.
+- Remove CRI-only dependencies and build plumbing: =k8s-cri=, =hyper-util=,
+  =tonic=, =tower=, =protoc-bin-vendored=, the =PROTOC= Cargo configuration,
+  the wrapper under =tools/=, and corresponding Dockerfile copies.
+- Finish the already-started removal of unused restart/attempt and
+  identity-tombstone presentation state without reverting unrelated maintainer
+  edits.
+- Finish the already-started removal of =EnrichmentCounters= and remove their
+  now-dead periodic diagnostic wiring from the binary. Sampling policy and its
+  separate accounting are unchanged.
+- Update the field guide, README, roadmap, deferred-work index, and superseded
+  spec status so they describe the shipped direct-watch path.
+
+The maintainer's existing uncommitted deletions of the rejected registered-file
+prototype and legacy kubelet-log scanner are accepted as concurrent cleanup.
+Implementation must not restore those files or overwrite unrelated working-tree
+changes.
+
+* Invariants
+
+- Captured bytes survive missing, stale, or ambiguous Kubernetes metadata.
+- The ring-buffer/event path performs no filesystem, network, Kubernetes, or
+  runtime-socket I/O.
+- Joins use the complete runtime-qualified container ID; no suffix or short-ID
+  matching is introduced.
+- Kubernetes list/watch remains restricted to =spec.nodeName= for the collector
+  node with read-only Pod RBAC.
+- Failure of the Kubernetes watch degrades enrichment, not capture.
+- The collector no longer opens or mounts a container-runtime socket.
+- eBPF programs and the shared kernel/userspace ABI do not change in this work.
+
+* Non-goals
+
+- Making metadata available for containers created during a Kubernetes
+  control-plane outage.
+- Adding another metadata fallback, owner resolution, labels, annotations, or
+  application-name heuristics.
+- Reworking cgroup discovery, its bounded retention behavior, capture sampling,
+  syscall coverage, or the current output/export boundary.
+- Splitting the workspace into more crates.
+- Repairing the separately recorded eBPF verifier blocker in A7.
+
+* Verification
+
+- Unit-test Pod status extraction for regular, init, and ephemeral containers,
+  exact container-ID indexing, malformed IDs, duplicate ambiguity, deletion,
+  and stale snapshot behavior.
+- Unit-test enrichment for exact, stale, unresolved-cgroup,
+  unresolved-container, ambiguous-cgroup, and ambiguous-container outcomes.
+- Search the shipped source, manifests, and current documentation for remaining
+  CRI RuntimeService, runtime-socket, restart/attempt, and identity-tombstone
+  production references. Historical rejected-experiment descriptions may keep
+  the term CRI where technically necessary.
+- Run =cargo fmt --all -- --check=.
+- Run =cargo test --workspace=.
+- Run strict Clippy for the userspace and shared crates with warnings denied.
+- Regenerate the lockfile through the manifest edits, confirm the removed direct
+  dependencies and protobuf toolchain are gone, then build the userspace package
+  with =--locked=.
+- Build the container and inspect the DaemonSet to confirm no protoc wrapper or
+  runtime socket remains.
+- Do not claim verifier or live-cluster validation from these checks; those are
+  separate gates.
+
+* TODO
+
+- [X] D1 Remove the CRI cache, merge path, and runtime configuration; wire the
+  node-scoped Pod snapshot directly into enrichment.
+- [X] D2 Remove CRI-only dependencies, protobuf tooling, Docker plumbing, and
+  the DaemonSet runtime-socket capability.
+- [X] D3 Finish the identity-model and enrichment-counter cleanup, then add
+  focused tests for the direct cgroup-to-Pod join.
+- [X] D4 Update =learn/=, README, roadmap, deferred-work index, and superseded
+  architecture notes to match the direct-watch path.
+- [X] D5 Pass formatting, tests, strict userspace Clippy, locked build,
+  container build, and rendered-manifest inspection.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 36 tests across userspace, the binary,
+  shared ABI, and eBPF crates.
+- Strict Clippy for =boring-logtail= and =boring-logtail-common= with all targets
+  and warnings denied: passed.
+- =cargo fmt --all -- --check=, =git diff --check=, and locked Cargo metadata:
+  passed. Stable rustfmt printed the repository's existing warnings for nightly
+  formatting options.
+- =cargo build --locked --package boring-logtail=: passed. The local eBPF link
+  still prints a non-fatal warning that it cannot open the nightly LLVM shared
+  library.
+- Clean =docker build --tag boring-logtail:cleanup-test .=: passed without the
+  protoc wrapper; the resulting local image is 36,822,995 bytes.
+- =kubectl apply --dry-run=client --validate=false -f
+  k8s/boring-logtail.yaml=: accepted the Namespace, ServiceAccount, Pod reader
+  RBAC, and DaemonSet. Inspection found no runtime socket, CRI environment, or
+  protobuf toolchain references in shipped source or manifests.
+- A fresh privileged verifier load was attempted with the newly built debug
+  binary, but passwordless sudo is unavailable. The historical verifier result
+  in =spec/20260802-1300-application-write-kubernetes-watch.org= therefore
+  remains unresolved; this metadata cleanup does not claim to close A7.
+
+* Approval
+
+Approved by the maintainer on 2026-08-03.

@@ -34,6 +34,12 @@ application thread
   WriteOperation { identity, result, integrity, bytes }
        |
        v
+  cgroup snapshot + node-scoped Pod snapshot
+       |
+       v
+  Kubernetes identity or an explicit unresolved reason
+       |
+       v
   temporary human-readable log line
 #+end_example
 
@@ -45,26 +51,13 @@ stdout/stderr. A registered CRI-file tap was tested and rejected: it attributed
 writes to the runtime, required descriptor discovery, and an inotify mistake
 created a three-core rescan feedback loop. See the rejected
 [[file:../spec/20260802-0928-userspace-registered-cri-log-tap.org][CRI log tap experiment]] and the accepted
-[[file:../spec/20260802-1300-application-write-kubernetes-watch.org][layered identity cache spec]].
+[[file:../spec/20260803-1858-direct-kubernetes-identity.org][direct Kubernetes identity spec]].
 
 Identity is layered off the hot path. The cgroup resolver maps the kernel
-cgroup ID to a complete runtime container ID. A bounded local CRI v1
-reconciliation joins containers to Pod sandboxes. One node-filtered Kubernetes
-Pod watch is fallback and supplement. Both publish immutable snapshots; an
-incoming event performs memory lookups only. Exact disagreement is ambiguity,
-and failed sources mark retained data stale.
-
-A shared inotify wrapper drives both the old metadata cache and the new CRI-file
-discovery loop. The latter watches =/var/log/containers= plus every resolved
-container directory below =/var/log/pods=. Timeouts do not rescan the filesystem:
-only startup and lifecycle events perform discovery I/O.
-
-Here, lifecycle means directory entries only: create, delete, move, and
-attribute changes. =IN_OPEN= and =IN_CLOSE_WRITE= are data-path signals. Watching
-them caused a feedback loop where runtime writes and discovery's own opens
-immediately requested another full descriptor scan. That reached about three
-CPU cores on two quiet nodes. Never put payload-adjacent inotify events on this
-control path.
+cgroup ID to a complete runtime container ID. One Kubernetes watch indexes Pods
+assigned to this node by that exact container ID. Both publish snapshots; an
+incoming event performs two memory lookups only. There is no CRI client,
+runtime-socket mount, kubelet-log scan, or metadata I/O per event.
 
 * 0. Refuse to hear ourselves
 
@@ -153,12 +146,11 @@ the exact bytes Linux copied internally.
 layout defined in =boring-logtail-common=.
 
 The userspace capture loop waits asynchronously for readability and drains all
-available records. =decode_event= rejects the wrong byte size and performs an
-unaligned read into the shared C-layout type.
+available records. =decode_event= rejects the wrong byte size or ABI version and
+performs an unaligned read into the shared C-layout type.
 
-*Current sharp edges.* Userspace does not yet reject an unsupported
-=abi_version=. Ring-buffer reservation failure has no counter. Those are explicit
-roadmap items, not invisible promises.
+*Current sharp edge.* Ring-buffer reservation failure has no counter. That is an
+explicit roadmap item, not an invisible promise.
 
 * 5. Rebuild one write
 
@@ -218,9 +210,9 @@ The live DaemonSet has already reconstructed:
 - a deliberate =BLT-42= checkout signal
 
 For each write we retain kernel cgroup identity, process/thread identity,
-descriptor, byte length, integrity status, and payload. The enrichment join now
-adds exact node, namespace, Pod, and container identity when both asynchronous
-caches know it, and states an explicit reason when they do not.
+descriptor, byte length, integrity status, and payload. The enrichment join adds
+exact node, namespace, Pod, and container identity when both snapshots know it,
+and states an explicit reason when they do not.
 
 * The Kubernetes enrichment boundary
 
@@ -234,20 +226,19 @@ WriteOperation
       +--> join node-local Pod cache
       |
       v
-namespace, pod, container, attempt, node + original capture facts
+namespace, Pod, container, node + original capture facts
 #+end_example
 
 The userspace collector maintains two asynchronous snapshots. A host cgroup-v2
-scan maps the kernel cgroup ID to an exact containerd container ID. A scan of
-the kubelet-managed =/var/log/containers= symlinks and =/var/log/pods= targets
-maps that container ID to node, namespace, Pod UID/name, container name, and
-restart attempt. The write path only reads those in-memory snapshots; it never
-walks cgroupfs or the log directories.
+scan maps the kernel cgroup ID to an exact runtime-qualified container ID. A
+node-filtered Kubernetes Pod watch maps that container ID to node, namespace,
+Pod UID/name, and container name. The write path only reads those snapshots; it
+never walks cgroupfs or calls Kubernetes while processing a write.
 
-This enrichment makes no API-server, kubelet-API, or CRI calls. The kernel
-cannot know human Kubernetes names because those are control-plane concepts,
-not Linux identities. The background local scans are the unavoidable bridge;
-they are bounded and never run while processing an incoming write.
+The kernel cannot know human Kubernetes names because those are control-plane
+concepts, not Linux identities. The background cgroup scan and Pod watch are the
+bridge. If either snapshot lacks an exact match, the bytes remain visible with
+an unresolved reason instead of guessed metadata.
 
 The human-facing line starts with =incoming_log=. Its =source= is deliberately
 loud and exact:
@@ -262,30 +253,27 @@ container. The second form keeps the bytes but refuses to fake attribution.
 =stdout-candidate= and =stderr-candidate= mean only “observed on fd 1 or 2”; fd
 tracking is still needed before those become durable stream identities.
 
-The Kubernetes deployment renders a deterministic one-percent sample of
-completed writes. Sampling happens after chunk reconstruction, so it never
-creates a partial operation. Each visible line carries =sample_percent=1=, and
-the periodic =pipeline_counts= line separates observed, emitted, and
-=dropped_by_policy= writes. Those deliberate drops are not kernel or ring-buffer
-loss. Local runs default to 100 percent unless
-=BORING_LOGTAIL_SAMPLE_PERCENT= is set.
+The Kubernetes deployment currently renders every completed write. Sampling
+happens after chunk reconstruction, so it never creates a partial operation.
+Each visible line carries the configured =sample_percent=. Local runs also
+default to 100 percent unless =BORING_LOGTAIL_SAMPLE_PERCENT= is set.
 
-Sampling also protects against observer loops outside the collector's own
+Sampling can also limit observer loops outside the collector's own
 cgroup. On the live cluster, following collector output through =kubectl logs=
 crosses konnectivity agents configured with =-v=8=. They log the transported
 packets; the collector sees those new writes; another rendered record causes
 more transport. Self-cgroup exclusion cannot stop that cross-cgroup cycle. A
-one-percent decision makes the loop subcritical, while source filtering or
-lower agent verbosity is the real cure.
+low sampling percentage can make the loop subcritical, while source filtering
+or lower agent verbosity is the real cure.
 
-Deleted Pods and disappeared cgroups stay in bounded five-minute tombstone
-caches so late writes can drain with their last exact identity. The initial
-path decoder intentionally supports measured containerd cgroup-v2 layouts
-only. Other runtimes remain visibly unresolved.
+Disappeared cgroup mappings stay in a bounded five-minute retention cache.
+Deleted Pods currently leave the Pod snapshot immediately; a late write is then
+explicitly unresolved. The cgroup path decoder supports the measured containerd
+and CRI-O cgroup-v2 layouts.
 
 * Things we intentionally do not claim
 
-- We do not yet capture =writev= or every route bytes can take.
+- We capture =write= and bounded =writev=, not every route bytes can take.
 - Numeric fd 1/2 is not durable stdout/stderr identity.
 - We do not yet frame lines, multiline records, or JSON documents.
 - We do not yet quantify every loss boundary.
@@ -299,6 +287,9 @@ The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
 - [[file:../boring-logtail-common/src/lib.rs][Shared kernel/userspace ABI and chunk math]]
 - [[file:../boring-logtail-ebpf/src/main.rs][Kernel-side capture programs]]
 - [[file:../boring-logtail/src/cgroup.rs][Collector cgroup discovery]]
+- [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID snapshot]]
+- [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes Pod snapshot]]
+- [[file:../boring-logtail/src/enrichment.rs][Exact identity join]]
 - [[file:../boring-logtail/src/pipeline.rs][Write reconstruction]]
 - [[file:../boring-logtail/src/main.rs][Userspace startup and event loop]]
 - [[file:../k8s/boring-logtail.yaml][Kubernetes DaemonSet]]

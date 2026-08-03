@@ -8,15 +8,14 @@ use aya::{
 };
 use boring_logtail::{
     cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache},
-    cri_metadata::{CriEndpoint, CriSnapshot, DEFAULT_CRI_RECONCILE_INTERVAL, spawn_cri_cache},
     decode_event,
     enrichment::{Enricher, PodSnapshot, StreamCandidate},
-    k8s_watch::{spawn_kubernetes_cache, spawn_merged_cache},
+    k8s_watch::spawn_kubernetes_cache,
     pipeline::WriteAssembler,
     sampling::{OutputPolicy, SamplingCounters},
 };
 use log::{debug, info, warn};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 use tokio::{
     signal::{self, unix::SignalKind},
     sync::watch,
@@ -43,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let application = LogTailApplication::start().await?;
+
     info!("capture is live; waiting for a shutdown signal");
     shutdown_signal().await?;
     info!("shutting down");
@@ -65,7 +65,6 @@ impl LogTailApplication {
         raise_memlock_limit();
 
         let collector_cgroup = CollectorCgroup::discover()?;
-        let cri_snapshot = configure_cri_cache()?;
 
         let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
@@ -90,21 +89,14 @@ impl LogTailApplication {
             .unwrap_or_else(default_cgroup_root);
         let cgroups = spawn_cgroup_cache(cgroup_root);
         let pods = match std::env::var("BORING_LOGTAIL_NODE_NAME") {
-            Ok(node) if !node.is_empty() => {
-                let kubernetes = match spawn_kubernetes_cache(node.clone()).await {
-                    Ok(receiver) => receiver,
-                    Err(error) => {
-                        warn!("Kubernetes Pod watch disabled: {error:#}");
-                        let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
-                        receiver
-                    }
-                };
-                let cri = cri_snapshot.unwrap_or_else(|| {
-                    let (_, receiver) = watch::channel(Arc::new(CriSnapshot::default()));
+            Ok(node) if !node.is_empty() => match spawn_kubernetes_cache(node).await {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    warn!("Kubernetes Pod watch disabled: {error:#}");
+                    let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
                     receiver
-                });
-                spawn_merged_cache(node, cri, kubernetes)
-            }
+                }
+            },
             _ => {
                 warn!("node-local enrichment disabled: BORING_LOGTAIL_NODE_NAME is not set");
                 let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
@@ -119,11 +111,6 @@ impl LogTailApplication {
         info!(
             "incoming-log output sample is {} percent",
             output_policy.sample_percent().get()
-        );
-        spawn_pipeline_diagnostics(
-            enricher.counters(),
-            Arc::clone(&sampling_counters),
-            output_policy,
         );
         let event_task = spawn_capture_loop(&mut ebpf, enricher, output_policy, sampling_counters)?;
 
@@ -148,73 +135,6 @@ fn default_cgroup_root() -> PathBuf {
     } else {
         PathBuf::from(NATIVE_CGROUP_ROOT)
     }
-}
-
-fn configure_cri_cache() -> anyhow::Result<Option<watch::Receiver<Arc<CriSnapshot>>>> {
-    let Some(runtime) = std::env::var_os("BORING_LOGTAIL_CRI_RUNTIME") else {
-        info!("CRI metadata cache disabled: BORING_LOGTAIL_CRI_RUNTIME is not set");
-        return Ok(None);
-    };
-    let runtime = runtime
-        .to_str()
-        .context("BORING_LOGTAIL_CRI_RUNTIME is not UTF-8")?;
-    let socket = std::env::var_os("BORING_LOGTAIL_CRI_SOCKET")
-        .map(PathBuf::from)
-        .context("BORING_LOGTAIL_CRI_SOCKET is required when CRI metadata is enabled")?;
-    let endpoint = CriEndpoint::configured(runtime, socket)?;
-    info!(
-        "CRI metadata cache enabled runtime={} socket={}",
-        endpoint.runtime.scheme(),
-        endpoint.socket.display()
-    );
-    let (snapshot, counters) = spawn_cri_cache(endpoint, DEFAULT_CRI_RECONCILE_INTERVAL);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            info!(
-                "cri_cache_counts attempts={} successes={} failures={} containers={}",
-                counters.attempts.load(std::sync::atomic::Ordering::Relaxed),
-                counters
-                    .successes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                counters.failures.load(std::sync::atomic::Ordering::Relaxed),
-                counters
-                    .containers
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
-    });
-    Ok(Some(snapshot))
-}
-
-fn spawn_pipeline_diagnostics(
-    counters: Arc<boring_logtail::enrichment::EnrichmentCounters>,
-    sampling: Arc<SamplingCounters>,
-    policy: OutputPolicy,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let snapshot = counters.snapshot();
-            let samples = sampling.snapshot();
-            info!(
-                "pipeline_counts sample_percent={} observed={} emitted={} dropped_by_policy={} enriched={} unresolved_cgroup={} unresolved_container={} ambiguous={} tombstone_hit={}",
-                policy.sample_percent().get(),
-                samples.observed,
-                samples.emitted,
-                samples.dropped_by_policy,
-                snapshot.enriched,
-                snapshot.unresolved_cgroup,
-                snapshot.unresolved_container,
-                snapshot.ambiguous,
-                snapshot.tombstone_hit,
-            );
-        }
-    });
 }
 
 fn raise_memlock_limit() {

@@ -13,7 +13,7 @@ and enriches them with Kubernetes identity.
 - [X] Include ABI version, timestamp, cgroup ID, PID, TID, descriptor, syscall
   kind, operation ID, chunk offset, requested length, result, and flags.
 - [X] Make truncation and read failure representable.
-- [ ] Reject unsupported ABI versions in userspace.
+- [X] Reject unsupported ABI versions in userspace.
 - [ ] Add loss counters for ring-buffer reservation and userspace eviction.
 - [ ] Define an ordering guarantee and operation-ID uniqueness across chunks.
 
@@ -22,7 +22,7 @@ and enriches them with Kubernetes identity.
 - [X] Pair =sys_enter_write= with =sys_exit_write=; publish only the bytes that
   the syscall reports as written.
 - [ ] Capture and reconstruct writes larger than one chunk without silent loss.
-- [ ] Pair and capture =writev=, including writes spanning multiple iovecs.
+- [X] Pair and capture =writev=, including writes spanning multiple iovecs.
 - [ ] Measure =write=/=writev= coverage against representative Node, JVM, Go,
   Python, Rust, and native workloads.
 - [ ] Investigate and measure =pwrite=/=pwritev= to redirected output streams.
@@ -54,12 +54,12 @@ and enriches them with Kubernetes identity.
 - [ ] Join chunks by stable operation identity and report missing chunks.
 - [ ] Frame newline, multiline, JSON, and opaque-byte records in userspace.
 - [ ] Preserve raw bytes and integrity status even when decoding fails.
-- [ ] Resolve cgroup ID to runtime container ID across measured containerd and
+- [X] Resolve cgroup ID to runtime container ID across measured containerd and
   CRI-O layouts.
 - [X] Enrich through a node-scoped metadata cache with node, namespace, Pod name and
-  UID, container name and ID, attempt, stream, PID, and TID.
-- [X] Retain metadata tombstones long enough to drain terminated containers.
-- [X] Keep control-plane API, runtime, and filesystem lookups outside the capture hot path.
+  UID, container name and ID, stream, PID, and TID.
+- [ ] Retain deleted Pod identity long enough to classify late writes.
+- [X] Keep control-plane and filesystem lookups outside the capture hot path.
 
 * Release gates
 

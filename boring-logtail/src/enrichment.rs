@@ -3,15 +3,7 @@
 //! Joins reconstructed writes to node-local Kubernetes identity snapshots.
 
 use crate::pipeline::WriteOperation;
-use std::{
-    collections::HashMap,
-    fmt,
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 use tokio::sync::watch;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -79,8 +71,6 @@ pub struct KubernetesIdentity {
     pub pod_uid: String,
     pub container_name: String,
     pub container_id: ContainerId,
-    pub restart_count: u32,
-    pub tombstone: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -135,29 +125,22 @@ impl Enrichment {
     pub fn source(&self) -> String {
         match self {
             Self::Enriched(identity) => format!(
-                "k8s={}/{}/{} pod_uid={} node={} container_id={} restart={} metadata={}",
+                "k8s={}/{}/{} pod_uid={} node={} container_id={}",
                 identity.namespace,
                 identity.pod_name,
                 identity.container_name,
                 identity.pod_uid,
                 identity.node,
                 identity.container_id,
-                identity.restart_count,
-                if identity.tombstone {
-                    "tombstone"
-                } else {
-                    "live"
-                },
             ),
             Self::Stale(identity) => format!(
-                "k8s={}/{}/{} pod_uid={} node={} container_id={} restart={} metadata=stale",
+                "k8s={}/{}/{} pod_uid={} node={} container_id={} metadata=stale",
                 identity.namespace,
                 identity.pod_name,
                 identity.container_name,
                 identity.pod_uid,
                 identity.node,
                 identity.container_id,
-                identity.restart_count,
             ),
             Self::UnresolvedCgroup => "k8s=unresolved reason=cgroup-not-indexed".to_owned(),
             Self::UnresolvedContainer(id) => {
@@ -176,37 +159,6 @@ impl Enrichment {
 pub struct Enricher {
     cgroups: watch::Receiver<Arc<CgroupSnapshot>>,
     pods: watch::Receiver<Arc<PodSnapshot>>,
-    counters: Arc<EnrichmentCounters>,
-}
-
-#[derive(Debug, Default)]
-pub struct EnrichmentCounters {
-    enriched: AtomicU64,
-    unresolved_cgroup: AtomicU64,
-    unresolved_container: AtomicU64,
-    ambiguous: AtomicU64,
-    tombstone_hit: AtomicU64,
-}
-
-impl EnrichmentCounters {
-    pub fn snapshot(&self) -> EnrichmentCounterSnapshot {
-        EnrichmentCounterSnapshot {
-            enriched: self.enriched.load(Ordering::Relaxed),
-            unresolved_cgroup: self.unresolved_cgroup.load(Ordering::Relaxed),
-            unresolved_container: self.unresolved_container.load(Ordering::Relaxed),
-            ambiguous: self.ambiguous.load(Ordering::Relaxed),
-            tombstone_hit: self.tombstone_hit.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EnrichmentCounterSnapshot {
-    pub enriched: u64,
-    pub unresolved_cgroup: u64,
-    pub unresolved_container: u64,
-    pub ambiguous: u64,
-    pub tombstone_hit: u64,
 }
 
 impl Enricher {
@@ -214,48 +166,32 @@ impl Enricher {
         cgroups: watch::Receiver<Arc<CgroupSnapshot>>,
         pods: watch::Receiver<Arc<PodSnapshot>>,
     ) -> Self {
-        Self {
-            cgroups,
-            pods,
-            counters: Arc::default(),
-        }
-    }
-
-    pub fn counters(&self) -> Arc<EnrichmentCounters> {
-        Arc::clone(&self.counters)
+        Self { cgroups, pods }
     }
 
     pub fn enrich(&self, operation: &WriteOperation) -> Enrichment {
         let cgroups = self.cgroups.borrow();
         let Some(containers) = cgroups.containers.get(&operation.cgroup_id) else {
-            self.counters
-                .unresolved_cgroup
-                .fetch_add(1, Ordering::Relaxed);
             return Enrichment::UnresolvedCgroup;
         };
+
         let [container] = containers.as_slice() else {
-            self.counters.ambiguous.fetch_add(1, Ordering::Relaxed);
             return Enrichment::AmbiguousCgroup;
         };
+
         let pods = self.pods.borrow();
         let Some(identities) = pods.identities.get(container) else {
-            self.counters
-                .unresolved_container
-                .fetch_add(1, Ordering::Relaxed);
             return Enrichment::UnresolvedContainer(container.clone());
         };
+
         let [identity] = identities.as_slice() else {
-            self.counters.ambiguous.fetch_add(1, Ordering::Relaxed);
             return Enrichment::AmbiguousContainer(container.clone());
         };
+
         if pods.stale {
-            self.counters.tombstone_hit.fetch_add(1, Ordering::Relaxed);
             return Enrichment::Stale(identity.clone());
         }
-        self.counters.enriched.fetch_add(1, Ordering::Relaxed);
-        if identity.tombstone {
-            self.counters.tombstone_hit.fetch_add(1, Ordering::Relaxed);
-        }
+
         Enrichment::Enriched(identity.clone())
     }
 }
@@ -313,8 +249,6 @@ mod tests {
             pod_uid: "pod-uid".into(),
             container_name: "checkout".into(),
             container_id: container.clone(),
-            restart_count: 2,
-            tombstone: false,
         };
         let (cgroup_sender, cgroup_receiver) = watch::channel(Arc::new(CgroupSnapshot::default()));
         let (pod_sender, pod_receiver) = watch::channel(Arc::new(PodSnapshot::default()));
@@ -339,15 +273,39 @@ mod tests {
             enricher.enrich(&operation(456)),
             Enrichment::Enriched(identity)
         );
+    }
+
+    #[test]
+    fn reports_stale_and_ambiguous_snapshots() {
+        let container: ContainerId = format!("containerd://{ID}").parse().unwrap();
+        let identity = KubernetesIdentity {
+            node: "worker-1".into(),
+            namespace: "payments".into(),
+            pod_name: "checkout".into(),
+            pod_uid: "pod-uid".into(),
+            container_name: "checkout".into(),
+            container_id: container.clone(),
+        };
+        let (_, cgroups) = watch::channel(Arc::new(CgroupSnapshot {
+            containers: HashMap::from([(456, vec![container.clone()])]),
+        }));
+        let (pods_sender, pods) = watch::channel(Arc::new(PodSnapshot {
+            identities: HashMap::from([(container.clone(), vec![identity.clone()])]),
+            stale: true,
+        }));
+        let enricher = Enricher::new(cgroups, pods);
+
         assert_eq!(
-            enricher.counters().snapshot(),
-            EnrichmentCounterSnapshot {
-                enriched: 1,
-                unresolved_cgroup: 1,
-                unresolved_container: 1,
-                ambiguous: 0,
-                tombstone_hit: 0,
-            }
+            enricher.enrich(&operation(456)),
+            Enrichment::Stale(identity.clone())
+        );
+        pods_sender.send_replace(Arc::new(PodSnapshot {
+            identities: HashMap::from([(container.clone(), vec![identity.clone(), identity])]),
+            stale: false,
+        }));
+        assert_eq!(
+            enricher.enrich(&operation(456)),
+            Enrichment::AmbiguousContainer(container)
         );
     }
 }

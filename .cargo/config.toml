@@ -1,4 +1,0 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-
-[env]
-PROTOC = { value = "tools/protoc-vendored", relative = true, force = false }

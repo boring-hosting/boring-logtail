@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod cgroup_resolver;
-pub mod cri_log;
-pub mod cri_metadata;
-mod directory_watch;
 pub mod enrichment;
 pub mod k8s_watch;
-pub mod node_metadata;
 pub mod pipeline;
 pub mod sampling;
 

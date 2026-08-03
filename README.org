@@ -40,7 +40,9 @@ work.
 
 The agent is a privileged DaemonSet because kernels tend not to let random
 processes load eBPF programs. Your cluster must allow privileged workloads in
-the =boring-logtail= namespace.
+the =boring-logtail= namespace. Identity enrichment watches only Pods assigned
+to the collector's node and joins their exact container IDs to the cgroup
+snapshot. It does not mount or call the container-runtime socket.
 
 Development images live at =ghcr.io/alfredosa/boring-logtail=. Push one with:
 
@@ -56,13 +58,13 @@ the development loop with:
 skaffold dev
 #+end_src
 
-Skaffold builds the image, deploys =k8s/boring-logtail.yaml=, streams logs, and
-rebuilds after source changes. Use =skaffold delete= to remove the development
-resources.
+Skaffold builds the image, deploys =k8s/boring-logtail.yaml=, and rebuilds after
+source changes. Use =skaffold delete= to remove the development resources. On a
+cluster where log transport itself is noisy, avoid continuous log following:
+the transported collector output can create a cross-cgroup observer loop.
 
-The userspace logger shows eBPF =info!= messages by default. Set =RUST_LOG= if
-you want something else. Make a process write to stdout or stderr and watch it
-go.
+Set =RUST_LOG= if you want something other than the default userspace =info=
+output. Make a process write to stdout or stderr and watch it go.
 
 * Cross-compile it
 

@@ -4,7 +4,11 @@
 
 * Status
 
-Approved by the maintainer on 2026-08-02. Implementation is in progress.
+Approved by the maintainer on 2026-08-02. The CRI reconciliation and layered
+merge were superseded on 2026-08-03 by
+=spec/20260803-1858-direct-kubernetes-identity.org=. The application
+=write=/=writev= capture decision and chronological validation evidence remain
+in force.
 
 * Goal
 
@@ -156,5 +160,6 @@ Approved by the maintainer on 2026-08-02.
   =boring_logtail_send_write_chunk= before analysis: =last insn is not an exit
   or jmp=. Object inspection proves LLVM placed a backward-only cold
   counter/error block at the physical end of both generalized workers. A7
-  remains open. Do not deploy this object. Restore the previously proven scalar
-  worker and isolate =writev= state/emission before repeating the gate.
+  remains open. The artifact produced at that gate was not deployable. Restore
+  the previously proven scalar worker and isolate =writev= state/emission before
+  repeating the privileged gate.

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! One node-scoped Kubernetes Pod watch and exact-ID CRI merge.
+//! One node-scoped Kubernetes Pod watch keyed by exact container ID.
 
-use crate::{
-    cri_metadata::{CriIdentity, CriSnapshot},
-    enrichment::{ContainerId, KubernetesIdentity, PodSnapshot},
-};
+use crate::enrichment::{ContainerId, KubernetesIdentity, PodSnapshot};
 use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod};
 use kube::{Api, Client, ResourceExt as _, runtime::watcher};
@@ -66,8 +63,6 @@ fn insert_status(
             pod_uid: pod_uid.to_owned(),
             container_name: status.name,
             container_id,
-            restart_count: status.restart_count.max(0) as u32,
-            tombstone: false,
         });
 }
 
@@ -106,152 +101,69 @@ pub async fn spawn_kubernetes_cache(
     Ok(receiver)
 }
 
-pub fn merge_cri_and_kubernetes(
-    node: &str,
-    cri: &CriSnapshot,
-    kubernetes: &PodSnapshot,
-) -> PodSnapshot {
-    let mut merged = PodSnapshot {
-        stale: cri.stale && kubernetes.stale,
-        ..PodSnapshot::default()
-    };
-    for identities in cri.identities.values() {
-        for cri_identity in identities {
-            let container_id = ContainerId {
-                runtime: cri_identity.runtime.scheme().to_owned(),
-                id: cri_identity.container_id.clone(),
-            };
-            match kubernetes.identities.get(&container_id) {
-                Some(kubernetes_identities)
-                    if kubernetes_identities
-                        .iter()
-                        .any(|identity| identities_agree(cri_identity, identity)) =>
-                {
-                    merged
-                        .identities
-                        .entry(container_id)
-                        .or_default()
-                        .extend(kubernetes_identities.iter().cloned());
-                }
-                Some(kubernetes_identities) => {
-                    let entries = merged.identities.entry(container_id.clone()).or_default();
-                    entries.push(from_cri(node, container_id, cri_identity));
-                    entries.extend(kubernetes_identities.iter().cloned());
-                }
-                None => {
-                    merged
-                        .identities
-                        .entry(container_id.clone())
-                        .or_default()
-                        .push(from_cri(node, container_id, cri_identity));
-                }
-            }
-        }
-    }
-    for (container_id, identities) in &kubernetes.identities {
-        merged
-            .identities
-            .entry(container_id.clone())
-            .or_insert_with(|| identities.clone());
-    }
-    merged
-}
-
-pub fn spawn_merged_cache(
-    node: String,
-    mut cri: watch::Receiver<Arc<CriSnapshot>>,
-    mut kubernetes: watch::Receiver<Arc<PodSnapshot>>,
-) -> watch::Receiver<Arc<PodSnapshot>> {
-    let initial = merge_cri_and_kubernetes(&node, &cri.borrow(), &kubernetes.borrow());
-    let (sender, receiver) = watch::channel(Arc::new(initial));
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                changed = cri.changed() => if changed.is_err() { return; },
-                changed = kubernetes.changed() => if changed.is_err() { return; },
-            }
-            sender.send_replace(Arc::new(merge_cri_and_kubernetes(
-                &node,
-                &cri.borrow(),
-                &kubernetes.borrow(),
-            )));
-        }
-    });
-    receiver
-}
-
-fn identities_agree(cri: &CriIdentity, kubernetes: &KubernetesIdentity) -> bool {
-    cri.namespace == kubernetes.namespace
-        && cri.pod_name == kubernetes.pod_name
-        && cri.pod_uid == kubernetes.pod_uid
-        && cri.container_name == kubernetes.container_name
-}
-
-fn from_cri(node: &str, container_id: ContainerId, identity: &CriIdentity) -> KubernetesIdentity {
-    KubernetesIdentity {
-        node: node.to_owned(),
-        namespace: identity.namespace.clone(),
-        pod_name: identity.pod_name.clone(),
-        pod_uid: identity.pod_uid.clone(),
-        container_name: identity.container_name.clone(),
-        container_id,
-        restart_count: identity.attempt,
-        tombstone: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cri_metadata::CriRuntime;
+    use serde_json::json;
 
-    fn cri() -> CriIdentity {
-        CriIdentity {
-            runtime: CriRuntime::Crio,
-            container_id: "a".repeat(64),
-            namespace: "shop".into(),
-            pod_name: "web-0".into(),
-            pod_uid: "uid".into(),
-            container_name: "web".into(),
-            attempt: 1,
+    #[test]
+    fn indexes_every_container_kind_by_exact_id() {
+        let regular = "a".repeat(64);
+        let init = "b".repeat(64);
+        let ephemeral = "c".repeat(64);
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "web-0", "namespace": "shop", "uid": "pod-uid"},
+            "spec": {"containers": [{"name": "web", "image": "web"}]},
+            "status": {
+                "containerStatuses": [{
+                    "name": "web", "image": "web", "imageID": "image", "ready": true,
+                    "restartCount": 0, "containerID": format!("containerd://{regular}")
+                }],
+                "initContainerStatuses": [{
+                    "name": "setup", "image": "setup", "imageID": "image", "ready": true,
+                    "restartCount": 0, "containerID": format!("containerd://{init}")
+                }],
+                "ephemeralContainerStatuses": [{
+                    "name": "debug", "image": "debug", "imageID": "image", "ready": true,
+                    "restartCount": 0, "containerID": format!("containerd://{ephemeral}")
+                }]
+            }
+        }))
+        .unwrap();
+
+        let snapshot = snapshot_from_pods("worker-1", [pod]);
+
+        assert_eq!(snapshot.identities.len(), 3);
+        for (id, name) in [(regular, "web"), (init, "setup"), (ephemeral, "debug")] {
+            let id: ContainerId = format!("containerd://{id}").parse().unwrap();
+            let identity = &snapshot.identities[&id][0];
+            assert_eq!(identity.container_name, name);
+            assert_eq!(identity.pod_uid, "pod-uid");
+            assert_eq!(identity.node, "worker-1");
         }
     }
 
     #[test]
-    fn uses_cri_when_kubernetes_is_absent() {
-        let cri_identity = cri();
-        let cri = CriSnapshot {
-            identities: HashMap::from([(cri_identity.container_id.clone(), vec![cri_identity])]),
-            stale: false,
-        };
-        let merged = merge_cri_and_kubernetes("worker", &cri, &PodSnapshot::default());
-        let id = ContainerId {
-            runtime: "cri-o".into(),
-            id: "a".repeat(64),
-        };
-        assert_eq!(merged.identities[&id][0].node, "worker");
-    }
+    fn rejects_malformed_ids_and_preserves_ambiguity() {
+        let id = "d".repeat(64);
+        let pods = ["uid-1", "uid-2"].map(|uid| {
+            serde_json::from_value(json!({
+                "metadata": {"name": "web", "namespace": "shop", "uid": uid},
+                "spec": {"containers": [{"name": "web", "image": "web"}]},
+                "status": {"containerStatuses": [
+                    {"name": "broken", "image": "web", "imageID": "image", "ready": true,
+                     "restartCount": 0, "containerID": "containerd://short"},
+                    {"name": "web", "image": "web", "imageID": "image", "ready": true,
+                     "restartCount": 0, "containerID": format!("containerd://{id}")}
+                ]}
+            }))
+            .unwrap()
+        });
 
-    #[test]
-    fn preserves_conflict_as_ambiguity() {
-        let cri_identity = cri();
-        let id = ContainerId {
-            runtime: "cri-o".into(),
-            id: cri_identity.container_id.clone(),
-        };
-        let cri = CriSnapshot {
-            identities: HashMap::from([(id.id.clone(), vec![cri_identity])]),
-            stale: false,
-        };
-        let mut conflicting = from_cri("worker", id.clone(), &cri.identities[&id.id][0]);
-        conflicting.pod_uid = "different".into();
-        let kubernetes = PodSnapshot {
-            identities: HashMap::from([(id.clone(), vec![conflicting])]),
-            stale: false,
-        };
-        assert_eq!(
-            merge_cri_and_kubernetes("worker", &cri, &kubernetes).identities[&id].len(),
-            2
-        );
+        let snapshot = snapshot_from_pods("worker-1", pods);
+        let id: ContainerId = format!("containerd://{id}").parse().unwrap();
+
+        assert_eq!(snapshot.identities.len(), 1);
+        assert_eq!(snapshot.identities[&id].len(), 2);
     }
 }
