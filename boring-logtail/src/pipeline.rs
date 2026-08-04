@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
+use crate::enrichment::{KubernetesIdentity, StreamFileDescriptor};
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum JoinWriteError {
     NoChunks,
@@ -60,9 +62,10 @@ impl fmt::Display for JoinWriteError {
 
 impl Error for JoinWriteError {}
 
+// TODO: Maybe implement from WriteEvent.
 /// One reconstructed write syscall, still carrying the identity needed by
 /// later framing and enrichment stages.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WriteOperation {
     pub capture_source: u16,
     pub operation_kind: u16,
@@ -78,6 +81,14 @@ pub struct WriteOperation {
     pub truncated: bool,
     pub read_failed: bool,
     pub bytes: Vec<u8>,
+}
+
+// This is the result of joining a WriteOperation with a KubernetesIdentity snapshot. It is used to determine which stream (stdout/stderr) the write belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconstructedLog {
+    pub kubernetes_identity: KubernetesIdentity,
+    pub fd: StreamFileDescriptor,
+    pub op: WriteOperation,
 }
 
 fn assemble_write(chunks: &[WriteEvent]) -> Result<WriteOperation, JoinWriteError> {

@@ -73,6 +73,7 @@ pub struct KubernetesIdentity {
     pub container_id: ContainerId,
 }
 
+
 #[derive(Clone, Debug, Default)]
 pub struct PodSnapshot {
     pub identities: HashMap<ContainerId, Vec<KubernetesIdentity>>,
@@ -85,28 +86,32 @@ pub struct CgroupSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamCandidate {
+pub enum StreamFileDescriptor {
     Stdout,
     Stderr,
     Other(u32),
+    // How can this ever happen to be honest
+    Unknown,
 }
 
-impl From<u32> for StreamCandidate {
-    fn from(fd: u32) -> Self {
+impl From<Option<u32>> for StreamFileDescriptor {
+    fn from(fd: Option<u32>) -> Self {
         match fd {
-            1 => Self::Stdout,
-            2 => Self::Stderr,
-            other => Self::Other(other),
+            Some(1) => Self::Stdout,
+            Some(2) => Self::Stderr,
+            Some(other) => Self::Other(other),
+            None => Self::Unknown,
         }
     }
 }
 
-impl fmt::Display for StreamCandidate {
+impl fmt::Display for StreamFileDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stdout => f.write_str("stdout-candidate"),
             Self::Stderr => f.write_str("stderr-candidate"),
             Self::Other(fd) => write!(f, "fd-{fd}"),
+            Self::Unknown => f.write_str("unknown-candidate"),
         }
     }
 }
@@ -121,6 +126,7 @@ pub enum Enrichment {
     AmbiguousContainer(ContainerId),
 }
 
+// Implement display, wtf
 impl Enrichment {
     pub fn source(&self) -> String {
         match self {
@@ -157,28 +163,26 @@ impl Enrichment {
 }
 
 pub struct Enricher {
-    cgroups: watch::Receiver<Arc<CgroupSnapshot>>,
-    pods: watch::Receiver<Arc<PodSnapshot>>,
+    pub cgroups: watch::Receiver<Arc<CgroupSnapshot>>,
+    pub pods: watch::Receiver<Arc<PodSnapshot>>,
 }
 
 impl Enricher {
-    pub fn new(
-        cgroups: watch::Receiver<Arc<CgroupSnapshot>>,
-        pods: watch::Receiver<Arc<PodSnapshot>>,
-    ) -> Self {
-        Self { cgroups, pods }
-    }
-
     pub fn enrich(&self, operation: &WriteOperation) -> Enrichment {
         let cgroups = self.cgroups.borrow();
+
+        // Find the container(s) for the cgroup ID of the operation
         let Some(containers) = cgroups.containers.get(&operation.cgroup_id) else {
             return Enrichment::UnresolvedCgroup;
         };
 
+        // If there are multiple containers for the cgroup ID, we cannot determine which one is correct
+        // If there is exactly one container, we can look up the pod identity for that container
         let [container] = containers.as_slice() else {
             return Enrichment::AmbiguousCgroup;
         };
 
+        // Look up the pod identity for the container
         let pods = self.pods.borrow();
         let Some(identities) = pods.identities.get(container) else {
             return Enrichment::UnresolvedContainer(container.clone());
@@ -252,7 +256,10 @@ mod tests {
         };
         let (cgroup_sender, cgroup_receiver) = watch::channel(Arc::new(CgroupSnapshot::default()));
         let (pod_sender, pod_receiver) = watch::channel(Arc::new(PodSnapshot::default()));
-        let enricher = Enricher::new(cgroup_receiver, pod_receiver);
+        let enricher = Enricher {
+            cgroups: cgroup_receiver,
+            pods: pod_receiver,
+        };
 
         assert_eq!(
             enricher.enrich(&operation(456)),
@@ -293,7 +300,7 @@ mod tests {
             identities: HashMap::from([(container.clone(), vec![identity.clone()])]),
             stale: true,
         }));
-        let enricher = Enricher::new(cgroups, pods);
+        let enricher = Enricher { cgroups, pods };
 
         assert_eq!(
             enricher.enrich(&operation(456)),

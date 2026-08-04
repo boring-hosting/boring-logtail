@@ -6,7 +6,6 @@ use crate::pipeline::WriteOperation;
 use std::{
     fmt,
     str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,38 +117,6 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-#[derive(Debug, Default)]
-pub struct SamplingCounters {
-    observed: AtomicU64,
-    emitted: AtomicU64,
-    dropped_by_policy: AtomicU64,
-}
-
-impl SamplingCounters {
-    pub fn record(&self, emitted: bool) {
-        self.observed.fetch_add(1, Ordering::Relaxed);
-        if emitted {
-            self.emitted.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.dropped_by_policy.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub fn snapshot(&self) -> SamplingCounterSnapshot {
-        SamplingCounterSnapshot {
-            observed: self.observed.load(Ordering::Relaxed),
-            emitted: self.emitted.load(Ordering::Relaxed),
-            dropped_by_policy: self.dropped_by_policy.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SamplingCounterSnapshot {
-    pub observed: u64,
-    pub emitted: u64,
-    pub dropped_by_policy: u64,
-}
 
 #[cfg(test)]
 mod tests {

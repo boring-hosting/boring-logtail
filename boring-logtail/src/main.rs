@@ -7,12 +7,7 @@ use aya::{
     programs::TracePoint,
 };
 use boring_logtail::{
-    cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache},
-    decode_event,
-    enrichment::{Enricher, PodSnapshot, StreamCandidate},
-    k8s_watch::spawn_kubernetes_cache,
-    pipeline::WriteAssembler,
-    sampling::{OutputPolicy, SamplingCounters},
+    cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache}, decode_event, enrichment::{Enricher, Enrichment, PodSnapshot, StreamFileDescriptor}, k8s_watch::spawn_kubernetes_cache, pipeline::WriteAssembler, sampling::{OutputPolicy},
 };
 use log::{debug, info, warn};
 use std::{path::PathBuf, sync::Arc};
@@ -25,10 +20,6 @@ use tokio::{
 mod cgroup;
 
 use cgroup::CollectorCgroup;
-
-fn payload_for_humans(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
-    String::from_utf8_lossy(bytes)
-}
 
 struct LogTailApplication {
     // Keeping Ebpf alive keeps its programs, links, and maps alive.
@@ -103,16 +94,19 @@ impl LogTailApplication {
                 receiver
             }
         };
-        let enricher = Enricher::new(cgroups, pods);
+        let enricher = Enricher { 
+            cgroups, 
+            pods 
+        };
+        
         let sample_config = std::env::var("BORING_LOGTAIL_SAMPLE_PERCENT").ok();
         let output_policy = OutputPolicy::from_config(sample_config.as_deref())
             .context("configure BORING_LOGTAIL_SAMPLE_PERCENT")?;
-        let sampling_counters = Arc::new(SamplingCounters::default());
         info!(
             "incoming-log output sample is {} percent",
             output_policy.sample_percent().get()
         );
-        let event_task = spawn_capture_loop(&mut ebpf, enricher, output_policy, sampling_counters)?;
+        let event_task = spawn_capture_loop(&mut ebpf, enricher, output_policy)?;
 
         Ok(Self {
             _ebpf: ebpf,
@@ -137,6 +131,7 @@ fn default_cgroup_root() -> PathBuf {
     }
 }
 
+// I still don't really understand this.
 fn raise_memlock_limit() {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -202,7 +197,6 @@ fn spawn_capture_loop(
     ebpf: &mut Ebpf,
     enricher: Enricher,
     output_policy: OutputPolicy,
-    sampling_counters: Arc<SamplingCounters>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let event_map = ebpf
         .take_map("EVENTS")
@@ -224,29 +218,31 @@ fn spawn_capture_loop(
                                 let Some(operation) = operation else {
                                     continue;
                                 };
+
                                 let emit = output_policy.should_emit(&operation);
-                                sampling_counters.record(emit);
                                 if !emit {
                                     continue;
                                 }
-                                let source = enricher.enrich(&operation).source();
-                                let stream = operation.fd.map(StreamCandidate::from).map_or_else(
-                                    || "unknown".to_owned(),
-                                    |stream| stream.to_string(),
-                                );
-                                info!(
-                                    "incoming_log sample_percent={} source=\"{}\" stream={} cgroup={} pid={} tid={} bytes={} truncated={} read_failed={} payload={:?}",
-                                    output_policy.sample_percent().get(),
-                                    source,
-                                    stream,
-                                    operation.cgroup_id,
-                                    operation.pid,
-                                    operation.tid,
-                                    operation.bytes.len(),
-                                    operation.truncated,
-                                    operation.read_failed,
-                                    payload_for_humans(&operation.bytes),
-                                );
+
+                                let source = enricher.enrich(&operation);
+
+                                // Stream represents the source fd, StreamCandidate can wrap it
+                                let stream = StreamFileDescriptor::from(operation.fd);
+
+                                match source {
+                                    Enrichment::Stale(identity) => {
+                                        info!("kubernetes identity: {identity:?}");
+                                    }
+                                    Enrichment::Enriched(identity) => {
+                                        info!("kubernetes identity: {identity:?}");
+                                    }
+                                    _ => {
+                                        // TODO: I actually don't know what to do here. 
+                                        continue;
+                                    }
+                                }
+
+
                             }
                             Err(err) => {
                                 warn!("discarding write that cannot be reconstructed: {err}")
@@ -321,16 +317,4 @@ fn attach_exit_program(ebpf: &mut Ebpf) -> anyhow::Result<()> {
         .context("load boring_logtail_exit_writev")?;
     writev_exit.attach("syscalls", "sys_exit_writev")?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::payload_for_humans;
-
-    #[test]
-    fn makes_invalid_utf8_readable_without_touching_the_bytes() {
-        let bytes = [0xff, b'a'];
-        assert_eq!(payload_for_humans(&bytes), "�a");
-        assert_eq!(bytes, [0xff, b'a']);
-    }
 }
