@@ -1,0 +1,184 @@
+#+title: Workload-oriented log-store product contract
+#+date: 2026-08-09 19:05 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved for implementation on 2026-08-09. This replaces the operator-facing
+and retention portions of =20260809-1626-bounded-replay-log-store.org=.
+
+* Problem
+
+The first bounded-store implementation exposed internal queues, permit pools,
+framing limits, and subscriber mechanics as twelve operator settings. That is
+an implementation dump, not a usable product contract. It also called a
+container stream a source, while the product-facing source is a Kubernetes
+workload with identifiable Pod replicas.
+
+* Product vocabulary
+
+- A *workload* is one stable Kubernetes controller identity: API version,
+  kind, name, namespace, and UID. Deployment, StatefulSet, DaemonSet, Job, and
+  other exactly resolved controllers use their owner UID. A standalone Pod is
+  its own workload, keyed by Pod UID.
+- A *Pod replica* is one Pod UID belonging to that workload. Current and
+  historical replicas share workload retention, but every record preserves its
+  Pod UID and Pod name so replay and presentation can separate them honestly.
+- A container stream is an internal framing lane. It is not a public source and
+  does not receive an independent product retention promise.
+- One =LogRecord= belongs to exactly one workload and one Pod when Kubernetes
+  identity resolves. Unresolved capture remains explicit and cannot be guessed
+  into a workload.
+
+* Operator configuration
+
+The complete store configuration is:
+
+#+begin_src yaml
+store:
+  max_memory: 128MiB
+  max_workloads: 128
+  max_logs: 500
+  max_record_bytes: 64KiB
+#+end_src
+
+- =max_memory= is the hard envelope for memory owned or pinned by the database,
+  including retained records and all internal framing, ingress, replay, and
+  live-delivery state. It accepts human byte units; operators do not calculate
+  queue budgets.
+- =max_workloads= is the maximum number of workload identities with retained
+  history. It replaces =max_sources= and never means file descriptors,
+  containers, or streams.
+- =max_logs= is the maximum retained records per workload, shared across all
+  current and historical Pod replicas of that workload.
+- =max_record_bytes= is the largest single framed record. Larger records are
+  explicitly split without silent byte loss.
+
+All queue counts, pending-framer limits, replay admission, subscriber admission,
+and subscriber lag bounds are implementation constants or are derived from
+=max_memory=. They are not configuration fields. Invalid or impossibly small
+memory envelopes fail startup with one actionable error.
+
+The Kubernetes manifest starts with a 64-MiB request and 192-MiB process limit;
+the database envelope must leave measured room for eBPF, Tokio, allocator, and
+bounded Kubernetes-cache overhead. These values are validated by an RSS test,
+not assumed from the sum of logical store counters.
+
+* Retention semantics
+
+Each workload owns one sequence-ordered ring containing records from all of its
+Pod replicas. Records retain Pod identity, container identity, and internal
+stream provenance, allowing output such as:
+
+#+begin_example
+Deployment/game-server (UID d1)
+  Pod/game-server-abc (UID p1): records 1, 2, 5
+  Pod/game-server-def (UID p2): records 3, 4, 6
+#+end_example
+
+The workload ring retains at most =max_logs=. A new record evicts that
+workload's oldest record when the count is exceeded. Deleted Pods do not erase
+their retained records; deleting or recreating the controller does not merge
+different workload UIDs merely because names match.
+
+=max_memory= is also a hard ceiling. Therefore =max_logs= is a count ceiling,
+not a promise that every workload can always retain that many arbitrary
+maximum-sized records. Those two promises cannot both hold for arbitrary input:
+
+#+begin_example
+max_workloads * max_logs * max_record_bytes
+#+end_example
+
+can exceed =max_memory=. Under global memory pressure, globally oldest records
+are evicted, so a workload may temporarily retain fewer than =max_logs=. The
+store reports this reason separately. Subscriber reads never evict or drain
+retained history; only count or memory pressure does.
+
+* Subscription semantics
+
+Consumers subscribe to workload, Pod, or namespace identity, never to a file
+descriptor. A workload replay includes its retained historical Pod replicas in
+store sequence order while preserving Pod identity on every record.
+
+A subscriber has a small private delivery backlog containing shared references
+to retained/live records. Receiving a record removes only that delivery
+reference. It does not remove the database record. If the consumer cannot keep
+up, its internal backlog reaches a constant bound and that connection closes
+with =subscriber_lagged=; capture, retention, and other subscribers continue.
+The number and backlog size of subscribers remain bounded constants so an
+untrusted number of consumers cannot defeat =max_memory=.
+
+* Stream provenance and severity
+
+FD 1/2 classification remains internal capture provenance. It must not define
+the public source hierarchy and must not be exposed as though it were durable
+stream identity.
+
+=LogRecord= gains a severity field with at least =Unknown=, =Info=, =Warn=, and
+=Error=. Severity is set only from explicit evidence after framing, such as a
+recognized structured severity field or an approved textual format. FD 2 alone
+does not prove =Error=, and FD 1 does not prove =Info=. Unrecognized records are
+=Unknown= rather than confidently wrong. The first implementation may leave
+all records =Unknown= until a separate classifier contract is approved; the
+record model must still carry the field now.
+
+* Internal derivation
+
+One source of truth derives internal bounds from =max_memory=. The derivation:
+
+- reserves fixed headroom for metadata and actor commands;
+- gives retained history and one complete replay equal dominant shares;
+- bounds aggregate unfinished framing bytes;
+- bounds nonblocking ingress by records and bytes;
+- bounds all replay pins and all live-delivery references together, not by an
+  operator-calculated amount per subscriber; and
+- is unit-tested to prove the sum of every owned pool cannot exceed the database
+  envelope.
+
+Implementation constants are documented for maintainers and visible in
+diagnostics, but absent from the public YAML. Changing the derivation is an
+internal performance decision as long as the four public limits and loss
+semantics remain true.
+
+* Migration
+
+- Replace the twelve-field =StoreConfig= with the four-field product contract.
+- Reject removed fields with a concise migration error rather than silently
+  accepting ignored limits.
+- Re-key retention from container-stream leaves to workload UID rings while
+  preserving Pod/container/provenance metadata on each record.
+- Keep internal framing lanes keyed finely enough that bytes from different
+  containers or streams can never be joined into a fabricated line.
+- Replace exact internal-source subscription with workload/Pod/namespace
+  selectors.
+- Rename metrics and diagnostics from source counts to workload and Pod terms.
+- Update the manifest, field guide, roadmap, benchmarks, and retention/replay
+  model tests.
+
+* Acceptance
+
+- Public YAML has exactly the four store settings above.
+- No public type or diagnostic calls an FD/container stream a source.
+- One workload never retains more than =max_logs= records across all replicas.
+- Historical Pod replicas remain queryable and visibly distinct within their
+  workload until their records are evicted.
+- Subscriber consumption never changes retained-record counts.
+- Every internal pool is included in the =max_memory= derivation and tested.
+- The configured database envelope and process memory limit pass burst/RSS
+  validation on the deployment workload.
+- Severity is evidence-based and permits =Unknown=; no stdout/stderr guess is
+  presented as fact.
+
+* TODO
+
+- [X] W1 Approve workload, Pod-replica, stream-provenance, and severity terms.
+- [X] W2 Approve the four-field configuration and count-vs-memory precedence.
+- [X] W3 Implement workload-owned retention and historical Pod separation.
+- [X] W4 Derive and test all internal bounds from =max_memory=.
+- [X] W5 Migrate subscriptions, diagnostics, manifest, and documentation.
+- [ ] W6 Pass model, concurrency, benchmark, and RSS validation.
+
+* Approval
+
+Approved by the maintainer on 2026-08-09, with explicit instruction to remove
+the superseded configuration, source semantics, and implementation leftovers.

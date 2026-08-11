@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Deterministic, I/O-free sampling of complete reconstructed writes.
+//! Deterministic, I/O-free sampling of complete framed records.
 
-use crate::pipeline::WriteOperation;
-use std::{
-    fmt,
-    str::FromStr,
-};
+use crate::record::LogRecord;
+use std::{fmt, str::FromStr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SamplePercent(u8);
@@ -90,22 +87,23 @@ impl OutputPolicy {
         }
     }
 
-    pub fn should_emit(self, operation: &WriteOperation) -> bool {
+    pub fn should_emit(self, record: &LogRecord) -> bool {
         let percent = self.sample_percent().get();
         match percent {
             0 => false,
             100 => true,
-            percent => sampling_hash(operation) % 100 < u64::from(percent),
+            percent => sampling_hash(record) % 100 < u64::from(percent),
         }
     }
 }
 
-fn sampling_hash(operation: &WriteOperation) -> u64 {
-    let mut state = operation.cgroup_id;
-    state = mix64(state ^ operation.timestamp_ns.rotate_left(7));
-    state = mix64(state ^ operation.operation_id.rotate_left(17));
-    state = mix64(state ^ u64::from(operation.pid).rotate_left(29));
-    state = mix64(state ^ u64::from(operation.tid).rotate_left(41));
+fn sampling_hash(record: &LogRecord) -> u64 {
+    let mut state = record.sampling_seed;
+    state = mix64(state ^ record.first_timestamp_ns.rotate_left(7));
+    state = mix64(state ^ record.last_timestamp_ns.rotate_left(13));
+    state = mix64(state ^ record.first_operation_id.rotate_left(17));
+    state = mix64(state ^ record.last_operation_id.rotate_left(29));
+    state = mix64(state ^ (record.bytes().len() as u64).rotate_left(41));
     state
 }
 
@@ -117,28 +115,29 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boring_logtail_common::{CAPTURE_SOURCE_APPLICATION_SYSCALL, OPERATION_WRITE};
+    use crate::{
+        enrichment::Enrichment,
+        pipeline::StreamFileDescriptor,
+        record::{RecordIntegrity, Severity},
+    };
+    use std::sync::Arc;
 
-    fn operation(number: u64) -> WriteOperation {
-        WriteOperation {
-            capture_source: CAPTURE_SOURCE_APPLICATION_SYSCALL,
-            operation_kind: OPERATION_WRITE,
-            timestamp_ns: number.wrapping_mul(17),
-            cgroup_id: 456,
-            operation_id: number,
-            source_id: 0,
-            result: Some(3),
-            pid: 123,
-            tid: 124,
-            fd: Some(2),
-            requested_len: 3,
-            truncated: false,
-            read_failed: false,
-            bytes: b"hi\n".to_vec(),
+    fn record(number: u64) -> LogRecord {
+        LogRecord {
+            sampling_seed: 456,
+            stream: StreamFileDescriptor::Stderr,
+            enrichment: Enrichment::UnresolvedCgroup,
+            first_timestamp_ns: number.wrapping_mul(17),
+            last_timestamp_ns: number.wrapping_mul(17),
+            first_operation_id: number,
+            last_operation_id: number,
+            bytes: Arc::from(&b"hi\n"[..]),
+            integrity: RecordIntegrity::default(),
+            sample_percent: 100,
+            severity: Severity::Unknown,
         }
     }
 
@@ -151,21 +150,18 @@ mod tests {
 
     #[test]
     fn zero_never_emits_and_one_hundred_always_emits() {
-        let operation = operation(1);
-        assert!(!OutputPolicy::WithSample(SamplePercent::MIN).should_emit(&operation));
-        assert!(OutputPolicy::WithSample(SamplePercent::MAX).should_emit(&operation));
-        assert!(!OutputPolicy::Never.should_emit(&operation));
-        assert!(OutputPolicy::Always.should_emit(&operation));
+        let record = record(1);
+        assert!(!OutputPolicy::WithSample(SamplePercent::MIN).should_emit(&record));
+        assert!(OutputPolicy::WithSample(SamplePercent::MAX).should_emit(&record));
+        assert!(!OutputPolicy::Never.should_emit(&record));
+        assert!(OutputPolicy::Always.should_emit(&record));
     }
 
     #[test]
     fn intermediate_decisions_are_repeatable() {
         let policy = OutputPolicy::WithSample(SamplePercent::try_from(37).unwrap());
-        let operation = operation(42);
-        assert_eq!(
-            policy.should_emit(&operation),
-            policy.should_emit(&operation)
-        );
+        let record = record(42);
+        assert_eq!(policy.should_emit(&record), policy.should_emit(&record));
     }
 
     #[test]
@@ -192,7 +188,7 @@ mod tests {
     fn one_percent_has_a_sane_distribution() {
         let policy = OutputPolicy::WithSample(SamplePercent::try_from(1).unwrap());
         let emitted = (0..10_000)
-            .filter(|number| policy.should_emit(&operation(*number)))
+            .filter(|number| policy.should_emit(&record(*number)))
             .count();
         assert!((50..=150).contains(&emitted), "emitted {emitted}");
     }

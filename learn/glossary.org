@@ -117,7 +117,9 @@ can make them point elsewhere. See [[file:linux.org::*File descriptors and open 
 
 Deciding where application records begin and end in a byte stream. Newline,
 multiline, JSON, and protocol-aware framing are userspace jobs. A write syscall
-boundary is not automatically a log-record boundary.
+boundary is not automatically a log-record boundary. boring-logtail currently
+joins newline-delimited bytes across writes and marks size, capacity, capture-gap,
+and shutdown splits explicitly.
 
 * GPL
 
@@ -154,7 +156,8 @@ closer to implementation details than the tracepoints used here.
 * log record
 
 One application-level event after framing. It may span several writes, or one
-write may contain several records. boring-logtail does not produce these yet.
+write may contain several records. Its payload remains bytes; its severity is
+=Unknown= unless framing or later classification has explicit evidence.
 
 * map capacity
 
@@ -225,6 +228,20 @@ An eBPF map whose values identify other eBPF programs. It powers tail calls.
 A bounded circular transport. eBPF reserves and submits =WriteEvent= records;
 userspace drains them. Full buffers mean observations can be lost. See
 [[file:ebpf.org::*Ring buffers: kernel-to-userspace conveyor belt][ring buffers]].
+
+* replay watermark
+
+The last process-local store sequence included in one subscription's retained
+history. The store registers live delivery at the same atomic owner-task step,
+so replay contains sequences through =N= and live delivery starts after =N=.
+That prevents a handoff gap; it is not persistence or exactly-once reconnect.
+
+* retention ring
+
+A bounded per-workload-UID queue of the newest =LogRecord= values across current
+and historical Pod replicas. Records keep Pod identity. This is different from
+the eBPF ring buffer: the eBPF ring crosses the kernel/userspace boundary, while
+retention rings live only in userspace and deliberately evict old history.
 
 * Rust
 
@@ -321,3 +338,9 @@ enrichment.
 
 A syscall that writes from several buffers (iovecs) in one operation. It is a
 known coverage gap; observing only =write= misses it.
+* Workload
+
+A resolved Kubernetes controller UID, or the Pod UID for a standalone Pod. It
+is the unit of log retention. Its =max_logs= ceiling is aggregate across all of
+its Pod replicas. Container streams are private framing lanes, not product
+sources.

@@ -51,15 +51,35 @@ and enriches them with Kubernetes identity.
 
 * Reconstruction and Kubernetes identity
 
-- [ ] Join chunks by stable operation identity and report missing chunks.
-- [ ] Frame newline, multiline, JSON, and opaque-byte records in userspace.
-- [ ] Preserve raw bytes and integrity status even when decoding fails.
+- [X] Join chunks by operation identity and report captured gaps explicitly.
+- [X] Frame newline-delimited opaque-byte records in userspace.
+- [ ] Add semantic multiline and JSON framing only after their contracts are
+  measured and specified.
+- [X] Preserve raw bytes and integrity status even when decoding fails.
 - [X] Resolve cgroup ID to runtime container ID across measured containerd and
   CRI-O layouts.
 - [X] Enrich through a node-scoped metadata cache with node, namespace, Pod name and
   UID, container name and ID, stream, PID, and TID.
 - [ ] Retain deleted Pod identity long enough to classify late writes.
 - [X] Keep control-plane and filesystem lookups outside the capture hot path.
+- [X] Apply versioned namespace include filters after enrichment and scope Pod
+  watches to the included namespaces on the current node.
+- [ ] Push filters into eBPF only when positive evidence can reject a write
+  without turning Pod-cache lag into silent loss.
+- [ ] Design atomic transition semantics before adding dynamic filter reload.
+
+* Bounded replay and streaming
+
+- [X] Frame immutable byte-preserving =LogRecord= values before storage.
+- [X] Retain one bounded ring per workload UID, aggregating historical and
+  current Pod replicas while preserving Pod identity on every record.
+- [X] Resolve UID-based workload ownership without guessing from names or labels.
+- [X] Provide an atomic replay-watermark/live-receiver subscription handoff.
+- [X] Select replay by workload, Pod, or namespace identity.
+- [X] Isolate slow subscribers and account for every ingress, eviction, replay,
+  and subscriber-loss boundary.
+- [X] Benchmark ordinary allocation before considering a custom arena. See
+  =spec/20260809-1626-bounded-replay-log-store.org=.
 
 * Release gates
 
@@ -68,3 +88,11 @@ and enriches them with Kubernetes identity.
 - [ ] Sustained-throughput, burst, backpressure, agent-restart, and metadata-delay
   tests pass at documented limits.
 - [ ] Unsupported behavior is documented from measurements rather than assumed.
+* Workload log history
+
+The node-local store is workload-owned: controller UID (or standalone Pod UID),
+with historical Pods kept distinct. Operators set one memory envelope plus
+workload, per-workload log, and record-size ceilings. The record-size default is
+64 KiB. Framing lanes, queues, replay pins, and subscriber pools are internal.
+Subscriber reads release delivery references, never retained history. Severity
+is carried on records but stays =Unknown= without explicit evidence.

@@ -7,13 +7,22 @@ use aya::{
     programs::TracePoint,
 };
 use boring_logtail::{
-    cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache}, decode_event, enrichment::{Enricher, Enrichment, PodSnapshot, StreamFileDescriptor}, k8s_watch::spawn_kubernetes_cache, pipeline::WriteAssembler, sampling::{OutputPolicy},
+    cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache},
+    config::Config,
+    decode_event,
+    enrichment::{Enricher, PodSnapshot},
+    filter::{DropReason, FilterPlan},
+    k8s_watch::spawn_kubernetes_cache,
+    pipeline::{Pipeline, PipelineDecision},
+    record::LogRecord,
+    sampling::OutputPolicy,
+    store::{LogStore, TryAppendError},
 };
 use log::{debug, info, warn};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap as StdHashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     signal::{self, unix::SignalKind},
-    sync::watch,
+    sync::{oneshot, watch},
     task::JoinHandle,
 };
 
@@ -26,6 +35,15 @@ struct LogTailApplication {
     _ebpf: Ebpf,
     // The task owns the ring buffer because tokio::spawn requires 'static data.
     event_task: Option<JoinHandle<anyhow::Result<()>>>,
+    event_shutdown: Option<oneshot::Sender<()>>,
+    store: LogStore,
+}
+
+#[derive(Debug, Default)]
+struct RecordIntegrityTotals {
+    capacity_splits: u64,
+    capture_gaps: u64,
+    unterminated_flushes: u64,
 }
 
 #[tokio::main]
@@ -55,6 +73,25 @@ impl LogTailApplication {
     async fn start() -> anyhow::Result<Self> {
         raise_memlock_limit();
 
+        let config_path = std::env::var_os("BORING_LOGTAIL_CONFIG").map(PathBuf::from);
+        let config = Config::load(config_path.as_deref()).context("configure boring-logtail")?;
+        let filter_plan = FilterPlan::compile(&config);
+        let output_policy = OutputPolicy::WithSample(config.sampling.percent.try_into()?);
+        info!(
+            "configuration: sample_percent={} pod_watch={:?} max_workloads={} max_logs={} max_memory={} max_record_bytes={} derived_limits=\"{}\"",
+            config.sampling.percent,
+            filter_plan.pod_watch,
+            config.store.max_workloads,
+            config.store.max_logs,
+            config.store.max_memory,
+            config.store.max_record_bytes,
+            config
+                .store
+                .derived_limits_summary()
+                .map_err(anyhow::Error::msg)?,
+        );
+        let store = LogStore::spawn(config.store.clone());
+
         let collector_cgroup = CollectorCgroup::discover()?;
 
         let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -72,53 +109,57 @@ impl LogTailApplication {
 
         // Attach exit first so no entry can be recorded without its matching
         // exit handler already being available.
-        attach_exit_program(&mut ebpf)?;
-        attach_enter_program(&mut ebpf)?;
-        attach_enter_writev_program(&mut ebpf)?;
         let cgroup_root = std::env::var_os("BORING_LOGTAIL_HOST_CGROUP_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(default_cgroup_root);
         let cgroups = spawn_cgroup_cache(cgroup_root);
         let pods = match std::env::var("BORING_LOGTAIL_NODE_NAME") {
-            Ok(node) if !node.is_empty() => match spawn_kubernetes_cache(node).await {
-                Ok(receiver) => receiver,
-                Err(error) => {
-                    warn!("Kubernetes Pod watch disabled: {error:#}");
-                    let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
-                    receiver
+            Ok(node) if !node.is_empty() => {
+                match spawn_kubernetes_cache(node, filter_plan.pod_watch.clone()).await {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        warn!("Kubernetes Pod watch disabled: {error:#}");
+                        let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
+                        receiver
+                    }
                 }
-            },
+            }
             _ => {
                 warn!("node-local enrichment disabled: BORING_LOGTAIL_NODE_NAME is not set");
                 let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
                 receiver
             }
         };
-        let enricher = Enricher { 
-            cgroups, 
-            pods 
-        };
-        
-        let sample_config = std::env::var("BORING_LOGTAIL_SAMPLE_PERCENT").ok();
-        let output_policy = OutputPolicy::from_config(sample_config.as_deref())
-            .context("configure BORING_LOGTAIL_SAMPLE_PERCENT")?;
-        info!(
-            "incoming-log output sample is {} percent",
-            output_policy.sample_percent().get()
-        );
-        let event_task = spawn_capture_loop(&mut ebpf, enricher, output_policy)?;
+        attach_exit_program(&mut ebpf)?;
+        attach_enter_program(&mut ebpf)?;
+        attach_enter_writev_program(&mut ebpf)?;
+        let enricher = Enricher { cgroups, pods };
+        let (event_task, event_shutdown) = spawn_capture_loop(
+            &mut ebpf,
+            Pipeline::new(enricher, output_policy, filter_plan.writes, &config.store),
+            store.clone(),
+        )?;
 
         Ok(Self {
             _ebpf: ebpf,
             event_task: Some(event_task),
+            event_shutdown: Some(event_shutdown),
+            store,
         })
     }
 
     async fn shutdown(mut self) {
-        if let Some(event_task) = self.event_task.take() {
-            event_task.abort();
-            let _ = event_task.await;
+        if let Some(event_shutdown) = self.event_shutdown.take() {
+            let _ = event_shutdown.send(());
         }
+        if let Some(event_task) = self.event_task.take() {
+            match event_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("capture task stopped with an error: {error:#}"),
+                Err(error) => warn!("capture task failed: {error}"),
+            }
+        }
+        self.store.shutdown().await;
     }
 }
 
@@ -195,9 +236,9 @@ fn configure_chunk_worker(ebpf: &mut Ebpf) -> anyhow::Result<()> {
 
 fn spawn_capture_loop(
     ebpf: &mut Ebpf,
-    enricher: Enricher,
-    output_policy: OutputPolicy,
-) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+    mut pipeline: Pipeline,
+    store: LogStore,
+) -> anyhow::Result<(JoinHandle<anyhow::Result<()>>, oneshot::Sender<()>)> {
     let event_map = ebpf
         .take_map("EVENTS")
         .context("eBPF map EVENTS is missing")?;
@@ -205,56 +246,94 @@ fn spawn_capture_loop(
     let mut ring_buf =
         tokio::io::unix::AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 
-    let mut assembler = WriteAssembler::new();
-
-    Ok(tokio::spawn(async move {
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut drops = StdHashMap::<DropReason, u64>::new();
+        let mut ingress_drops = StdHashMap::<TryAppendError, u64>::new();
+        let mut integrity_totals = RecordIntegrityTotals::default();
+        let mut report = tokio::time::interval(Duration::from_secs(60));
         loop {
-            let mut guard = ring_buf.readable_mut().await?;
+            let mut guard = tokio::select! {
+                guard = ring_buf.readable_mut() => guard?,
+                _ = &mut shutdown_receiver => break,
+                _ = report.tick() => {
+                    let stats = store.stats();
+                    info!("pipeline_drops={drops:?} store_ingress_drops={ingress_drops:?} record_integrity={integrity_totals:?} store_stats={stats:?}");
+                    continue;
+                }
+            };
             while let Some(item) = guard.get_inner_mut().next() {
                 match decode_event(&item) {
-                    Ok(event) => {
-                        match assembler.accept(event) {
-                            Ok(operation) => {
-                                let Some(operation) = operation else {
-                                    continue;
-                                };
-
-                                let emit = output_policy.should_emit(&operation);
-                                if !emit {
-                                    continue;
-                                }
-
-                                let source = enricher.enrich(&operation);
-
-                                // Stream represents the source fd, StreamCandidate can wrap it
-                                let stream = StreamFileDescriptor::from(operation.fd);
-
-                                match source {
-                                    Enrichment::Stale(identity) => {
-                                        info!("kubernetes identity: {identity:?}");
-                                    }
-                                    Enrichment::Enriched(identity) => {
-                                        info!("kubernetes identity: {identity:?}");
-                                    }
-                                    _ => {
-                                        // TODO: I actually don't know what to do here. 
-                                        continue;
-                                    }
-                                }
-
-
-                            }
-                            Err(err) => {
-                                warn!("discarding write that cannot be reconstructed: {err}")
-                            }
-                        };
-                    }
+                    Ok(event) => match pipeline.accept(event) {
+                        Ok(PipelineDecision::Records { emitted, sampled }) => {
+                            *drops.entry(DropReason::Sampled).or_default() += sampled as u64;
+                            publish_records(
+                                emitted,
+                                &store,
+                                &mut ingress_drops,
+                                &mut integrity_totals,
+                            );
+                        }
+                        Ok(PipelineDecision::Pending) => {}
+                        Ok(PipelineDecision::Dropped(reason)) => {
+                            *drops.entry(reason).or_default() += 1;
+                        }
+                        Err(error) => {
+                            warn!("discarding write that cannot be reconstructed: {error}")
+                        }
+                    },
                     Err(error) => debug!("discarding malformed ring-buffer record: {error}"),
                 }
             }
             guard.clear_ready();
         }
-    }))
+        if let PipelineDecision::Records { emitted, sampled } = pipeline.flush() {
+            *drops.entry(DropReason::Sampled).or_default() += sampled as u64;
+            publish_records(emitted, &store, &mut ingress_drops, &mut integrity_totals);
+        }
+        if !drops.is_empty()
+            || !ingress_drops.is_empty()
+            || integrity_totals.capacity_splits > 0
+            || integrity_totals.capture_gaps > 0
+            || integrity_totals.unterminated_flushes > 0
+        {
+            info!(
+                "final pipeline_drops={drops:?} store_ingress_drops={ingress_drops:?} record_integrity={integrity_totals:?}"
+            );
+        }
+        Ok(())
+    });
+    Ok((task, shutdown))
+}
+
+fn publish_records(
+    records: Vec<LogRecord>,
+    store: &LogStore,
+    ingress_drops: &mut StdHashMap<TryAppendError, u64>,
+    integrity_totals: &mut RecordIntegrityTotals,
+) {
+    for record in records {
+        let integrity = record.integrity();
+        integrity_totals.capacity_splits += u64::from(integrity.capacity_split);
+        integrity_totals.capture_gaps += u64::from(integrity.capture_gap);
+        integrity_totals.unterminated_flushes += u64::from(integrity.unterminated);
+        emit_record(&record);
+        if let Err(reason) = store.try_append(record) {
+            *ingress_drops.entry(reason).or_default() += 1;
+        }
+    }
+}
+
+fn emit_record(record: &LogRecord) {
+    info!(
+        "incoming_log sample_percent={} identity=\"{}\" severity={:?} bytes={} integrity={:?} payload={:?}",
+        record.sample_percent(),
+        record.enrichment().description(),
+        record.severity(),
+        record.bytes().len(),
+        record.integrity(),
+        String::from_utf8_lossy(record.bytes()),
+    );
 }
 
 fn load_enter_program(ebpf: &mut Ebpf) -> anyhow::Result<()> {

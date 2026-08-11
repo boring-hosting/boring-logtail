@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod cgroup_resolver;
+pub mod config;
 pub mod enrichment;
+pub mod filter;
 pub mod k8s_watch;
 pub mod pipeline;
+pub mod record;
 pub mod sampling;
+pub mod store;
 
 use std::fmt;
 

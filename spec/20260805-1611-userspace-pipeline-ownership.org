@@ -1,0 +1,78 @@
+#+title: Userspace pipeline ownership cleanup
+#+date: 2026-08-05 16:11 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-05. Awaiting maintainer approval.
+
+* Goal
+
+Make =pipeline.rs= own the per-event userspace sequence it names: reconstruct a
+kernel write, apply output sampling, attach the current Kubernetes enrichment
+result, and classify its descriptor. Keep eBPF loading, background snapshot
+startup, ring-buffer transport, and temporary human output at the binary edge.
+
+* Problem
+
+=pipeline.rs= currently owns only =WriteAssembler=. The capture loop in
+=main.rs= knows the ordering and details of reconstruction, sampling,
+enrichment, and descriptor classification. An unused =ReconstructedLog= type
+then points in the opposite direction by importing enrichment details into the
+reconstruction module without actually coordinating those stages.
+
+The current capture loop also drops sampled writes when Kubernetes identity is
+unresolved or ambiguous and prints only identity for successful joins. That
+contradicts the approved invariant that metadata failure must not drop captured
+bytes and the documented temporary =incoming_log= output.
+
+* Design
+
+- Add a small =Pipeline= that owns =WriteAssembler=, =OutputPolicy=, and
+  =Enricher=.
+- Accept one decoded =WriteEvent= and return either no output while assembly is
+  incomplete or sampling rejects it, or one =ProcessedWrite= carrying the
+  original =WriteOperation=, enrichment result, stream classification, and the
+  configured sample percentage.
+- Keep =WriteAssembler= and =WriteOperation= as the syscall-reconstruction
+  boundary. Enrichment and sampling remain focused modules used by the
+  coordinator; they are not folded into one large file.
+- Move descriptor classification beside the coordinated pipeline output rather
+  than Kubernetes identity.
+- Keep decoding and human rendering outside =Pipeline=: decoding belongs to the
+  ring-buffer/ABI boundary, and rendering is the current output adapter.
+- Emit unresolved and ambiguous enrichment outcomes with their original bytes.
+
+* Non-goals
+
+- Log-line framing, parsing, multiline support, or an exporter.
+- Changing capture, sampling, Kubernetes lookup, or retry semantics.
+- Adding new crates or generic stage/trait machinery.
+- Fixing pipeline loss bounds already recorded in the roadmap.
+
+* Verification
+
+- Test coordinated reconstruction, sampling, stream classification, stale
+  metadata, and unresolved metadata byte preservation.
+- Run formatting, workspace tests, and strict userspace/shared Clippy.
+- Keep the field guide's source tour and event-path ownership accurate.
+
+* TODO
+
+- [X] P1 Centralize per-event stage coordination in =Pipeline=.
+- [X] P2 Reduce the binary capture loop to transport, error reporting, and
+  temporary output.
+- [X] P3 Update the field guide and pass focused validation.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 37 tests. The two new pipeline tests
+  cover unresolved-byte preservation, descriptor classification, sampling, and
+  stale Kubernetes enrichment.
+- =cargo clippy --package boring-logtail --package boring-logtail-common
+  --all-targets -- -D warnings=: passed. Before this cleanup, the same command
+  failed on the unused descriptor classification in =main.rs=.
+- =cargo fmt --all -- --check= and =git diff --check=: passed. Stable rustfmt
+  printed the repository's existing warnings for nightly-only options.
+- The eBPF build continued to print its existing non-fatal warning about the
+  nightly LLVM shared library. No kernel-side code or ABI changed.

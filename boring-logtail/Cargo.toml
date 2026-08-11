@@ -18,6 +18,8 @@ libc = { workspace = true }
 log = { workspace = true }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 kube = { version = "4.2", features = ["runtime"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 tokio = { workspace = true, features = [
     "macros",
     "rt",

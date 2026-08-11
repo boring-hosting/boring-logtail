@@ -34,10 +34,13 @@ application thread
   WriteOperation { identity, result, integrity, bytes }
        |
        v
-  cgroup snapshot + node-scoped Pod snapshot
+  cgroup snapshot + scoped, node-filtered Pod snapshot(s)
        |
        v
   Kubernetes identity or an explicit unresolved reason
+       |
+       v
+  authoritative namespace filter, then deterministic sampling
        |
        v
   temporary human-readable log line
@@ -95,6 +98,12 @@ It reads:
 
 It first admits only numeric fd 1 or 2. Then it inserts a =WriteStart= into
 =WRITE_STARTS= under the combined PID/TID key.
+
+Namespace filtering currently happens after enrichment in userspace. A watch
+limited to included namespaces cannot prove that a missing cgroup is excluded:
+the included Pod may simply be newer than its status cache entry. Kernel
+pushdown therefore remains deferred until exclusion can be established from
+positive evidence without dropping an included container's first writes.
 
 *Why remember instead of emit?* Entry only says what the application requested.
 We need syscall exit to know whether Linux accepted all, some, zero, or none of
@@ -181,23 +190,59 @@ missing chunks become an error only when a terminal chunk lets assembly run.
 =operation_id= currently reuses the entry timestamp; its collision guarantee is
 not yet formally defined.
 
-* 6. Make temporary output
+* 6. Frame, retain, and make temporary output
 
-The current edge renders one human-readable line:
+After reconstruction, =Pipeline= joins the current in-memory Kubernetes
+identity snapshots, applies the immutable namespace filter, chooses an internal
+framing lane, frames newline-delimited records, then samples complete records.
+One write can finish zero, one, or many =LogRecord= values. Sampling after
+framing cannot punch a hole into the middle of a line.
+
+The framer preserves opaque bytes across write boundaries. One record is capped
+at the configured =max_record_bytes=, 64 KiB by default. Container streams are
+internal framing lanes so bytes from different containers or descriptors are
+never joined. Aggregate pending bytes are derived from the store memory
+envelope; pressure emits an integrity-marked fragment instead of silently
+growing or discarding it. Kernel read failures become explicit capture gaps, so
+bytes from opposite sides of missing evidence are never stitched into a fake
+complete line.
+
+Accepted records enter a bounded channel without blocking eBPF ring-buffer
+drain. One Tokio task owns the in-memory store: one ring per workload UID, Pod
+and namespace indexes, process-local sequence allocation, and subscribers. A
+workload's =max_logs= count is shared by all current and historical Pod replicas;
+every record keeps Pod UID and name. The global =max_memory= envelope can evict
+globally oldest records before a workload reaches that count.
+
+The current edge also renders one human-readable line:
 
 #+begin_example
-incoming_log source="k8s=payments/checkout-abc/checkout pod_uid=... node=worker-1 ..." \
-  stream=stdout-candidate cgroup=137265 pid=1825669 tid=1825669 bytes=83 \
-  truncated=false read_failed=false \
+incoming_log source="k8s namespace=payments pod_uid=... container_id=... \
+  stream=stdout-candidate" bytes=83 integrity=RecordIntegrity {...} \
   payload="{\"kind\":\"checkout\",\"order_id\":\"BLT-42\",...}\n"
 #+end_example
 
 Invalid UTF-8 is rendered with replacement characters for the terminal, while
-the =WriteOperation.bytes= vector stays unchanged.
+the =LogRecord.bytes= value stays unchanged.
 
-This output is deliberately temporary. Printing every node write is noisy and
-creates observer effects. The cgroup filter prevents recursion, but real export
-needs framing, filtering, backpressure policy, and telemetry.
+This output is deliberately temporary. Printing every node record is noisy and
+creates observer effects. The cgroup filter prevents recursion; the future
+network adapter still needs authentication, authorization, and a wire contract.
+
+* The replay/live handoff
+
+A subscription selector names a workload UID, Pod UID, or namespace.
+The owner task chooses watermark =N=, snapshots matching retained records
+through =N=, then registers live delivery before processing another append.
+Replay followed by live delivery therefore has no duplicate or gap at that
+boundary.
+
+This is connected-session truth, not durable exactly once. Sequences reset on
+restart, there are no acknowledgements or reconnect cursors, and retained
+history can already have been evicted. Reading replay or live delivery removes
+only the subscriber's reference; it never drains retained history. Slow
+subscribers never stall capture, and overflow closes only that session with
+=SubscriberLagged=.
 
 * What “valuable data” means today
 
@@ -253,10 +298,16 @@ container. The second form keeps the bytes but refuses to fake attribution.
 =stdout-candidate= and =stderr-candidate= mean only “observed on fd 1 or 2”; fd
 tracking is still needed before those become durable stream identities.
 
-The Kubernetes deployment currently renders every completed write. Sampling
-happens after chunk reconstruction, so it never creates a partial operation.
+Configuration is a versioned YAML file. No file means =filters: []= and a
+100-percent sample. Kubernetes mounts the same safe default from a ConfigMap;
+an allowlist creates one namespaced Pod watch per namespace while preserving
+the =spec.nodeName= selector and one global Pod bound. Policy is immutable for
+the process lifetime.
+
+The Kubernetes deployment currently renders every admitted framed record. Sampling
+happens after framing, so it never creates a partial line.
 Each visible line carries the configured =sample_percent=. Local runs also
-default to 100 percent unless =BORING_LOGTAIL_SAMPLE_PERCENT= is set.
+default to 100 percent unless =BORING_LOGTAIL_CONFIG= names a YAML file.
 
 Sampling can also limit observer loops outside the collector's own
 cgroup. On the live cluster, following collector output through =kubectl logs=
@@ -275,7 +326,9 @@ and CRI-O cgroup-v2 layouts.
 
 - We capture =write= and bounded =writev=, not every route bytes can take.
 - Numeric fd 1/2 is not durable stdout/stderr identity.
-- We do not yet frame lines, multiline records, or JSON documents.
+- We frame newlines, but do not interpret semantic multiline or JSON documents.
+- Retained history is volatile and node-local; restart forgets it.
+- Replay/live is gap-free only for one connected session, not durable exactly once.
 - We do not yet quantify every loss boundary.
 - We do not map unsupported runtime or cgroup layouts to Kubernetes identity.
 - We do not promise every architecture or compatibility syscall ABI.
@@ -290,7 +343,20 @@ The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
 - [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID snapshot]]
 - [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes Pod snapshot]]
 - [[file:../boring-logtail/src/enrichment.rs][Exact identity join]]
-- [[file:../boring-logtail/src/pipeline.rs][Write reconstruction]]
-- [[file:../boring-logtail/src/main.rs][Userspace startup and event loop]]
+- [[file:../boring-logtail/src/pipeline.rs][Write reconstruction and per-event pipeline]]
+- [[file:../boring-logtail/src/record.rs][Newline framing and record integrity]]
+- [[file:../boring-logtail/src/store.rs][Bounded retention and replay/live handoff]]
+- [[file:../boring-logtail/src/main.rs][Userspace startup, ring-buffer transport, and temporary output]]
 - [[file:../k8s/boring-logtail.yaml][Kubernetes DaemonSet]]
 - [[file:../spec/20260801-0854-capture-boundary-hardening.org][Self-capture hardening spec]]
+** Store identity and bounds
+
+Retention belongs to a resolved Kubernetes workload UID, not an FD or container
+stream. A standalone Pod uses its Pod UID as its workload UID. One workload ring
+interleaves all Pod replicas in store order; Pod metadata remains on each record.
+Unresolved owner chains are rejected rather than guessed. Operators configure
+only =max_memory=, =max_workloads=, =max_logs=, and =max_record_bytes=; the last
+defaults to 64 KiB. Framing, ingress, replay, and subscriber bounds are derived
+internally. Slow subscriber reads release only delivery references—they never
+drain retained history. Severity remains =Unknown= until a classifier has
+evidence; stdout/stderr is not evidence.

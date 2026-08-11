@@ -17,3 +17,39 @@ survived real use would freeze guesses. See
 Why: both node agents run with =-v=8=; following boring-logtail through
 =kubectl logs= creates a cross-cgroup observer loop because konnectivity logs
 the traffic used to transport collector output.
+
+* TODO Design safe eBPF filter pushdown from positive exclusion evidence
+
+Why: absence from an included-namespace-only Pod cache may be cache lag, not an
+excluded workload; denying that cgroup would silently lose startup writes. See
+=spec/20260805-1655-declarative-capture-filters.org=.
+
+* TODO Give Kubernetes watcher tasks explicit application ownership
+
+Why: process exit currently tears down the detached tasks, but explicit handles
+would make graceful shutdown testable. See
+=spec/20260805-1655-declarative-capture-filters.org=.
+
+* TODO Separate scoped-filter exclusion from genuine identity-resolution loss
+
+Why: an included-namespace-only Pod cache intentionally makes excluded
+workloads look unresolved, while metadata lag can produce the same outcome; one
+counter cannot diagnose both. See
+=spec/20260805-1655-declarative-capture-filters.org=.
+
+* TODO Design the authenticated external streaming protocol
+
+Why: the bounded store defines an internal replay-watermark/live-receiver
+contract, but transport, selectors exposed to users, authorization, and wire
+backpressure need their own threat model. Store selectors are workload, Pod,
+and namespace identity; the external representation is still undecided. See
+=spec/20260809-1905-workload-store-product-contract.org=.
+
+* TODO Add durable replay cursors only with persistence and acknowledgements
+
+Why: process-local sequence numbers can make one connected replay/live handoff
+gap-free, but cannot provide exactly-once reconnects or survive agent restart.
+See =spec/20260809-1626-bounded-replay-log-store.org=.
+* DONE Replace source-oriented store controls with workload product contract
+  See =spec/20260809-1905-workload-store-product-contract.org= W3-W5. Final RSS
+  and full-workspace validation remains W6.

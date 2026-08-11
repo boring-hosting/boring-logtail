@@ -1,0 +1,264 @@
+#+title: Bounded in-memory log store and gap-free replay handoff
+#+date: 2026-08-09 16:26 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Superseded on 2026-08-09 by =20260809-1905-workload-store-product-contract.org=
+for public configuration, source vocabulary, selectors, and retention. Its
+framing and replay-watermark mechanics remain historical design context only.
+
+* Goal
+
+Keep a bounded, node-local history of accepted logs and expose one internal
+subscription operation that atomically returns retained history followed by
+new matching records. Capture and pipeline work must continue independently of
+store and subscriber speed.
+
+This is volatile process memory. Restarting boring-logtail forgets records,
+sequence numbers, and subscriptions.
+
+* Existing boundaries
+
+The current userspace path is:
+
+#+begin_example
+WriteEvent chunks
+  -> WriteAssembler
+  -> WriteOperation
+  -> enrich, filter, sample, classify
+  -> ProcessedWrite
+  -> temporary human output
+#+end_example
+
+=ProcessedWrite= is one completed syscall write, not necessarily one
+application log line. The store must consume a new immutable =LogRecord=
+boundary after explicit userspace framing; it must not rename syscall writes
+as logs. The pipeline remains the only publisher of accepted records.
+
+At the time of this design, Kubernetes identity had no workload owner. That gap
+motivated explicit owner discovery rather than name-based guesses; the
+superseding contract now uses the resolved workload UID.
+
+* Historical framing and replay design
+
+The product vocabulary, limits, retention key, and selectors in the original
+version of this section are superseded. The current contract is
+=20260809-1905-workload-store-product-contract.org=: a workload-UID ring,
+aggregate =max_logs= across current and historical Pod replicas, preserved Pod
+identity, workload/Pod/namespace selectors, and a 64-KiB default record limit.
+Container streams are internal framing lanes, not retention sources.
+
+** Log framing
+
+The framing mechanics remain useful historical context. =RecordFramer= is
+byte-preserving newline framing per internal container-stream lane:
+
+- concatenate accepted =ProcessedWrite.operation.bytes= in pipeline order for
+  one lane;
+- emit through and including each newline as one =LogRecord=;
+- keep an unterminated suffix for the next write;
+- cap one record and pending suffix at the configured limit; crossing the cap
+  emits a record fragment marked =max_size_split= and continues without losing
+  bytes;
+- bound aggregate pending bytes internally; pressure emits
+  the oldest suffix marked =capacity_split= rather than growing or dropping it;
+- carry first and last capture timestamps and explicit capture-integrity flags;
+- never require UTF-8, JSON, or multiline interpretation; severity remains
+  =Unknown= without explicit evidence; and
+- expose an explicit shutdown/lane-removal flush for an unterminated suffix,
+  marked =unterminated=. A crash may lose that pending suffix because this
+  design has no persistence.
+
+Sampling currently happens per write before this future framing boundary. That
+would manufacture incomplete lines whenever only part of a multi-write line is
+sampled. This design therefore moves sampling after framing:
+
+#+begin_example
+assemble -> enrich -> source filter -> classify -> frame -> sample -> publish
+#+end_example
+
+Sampling makes one decision per complete or explicitly split =LogRecord=.
+=OutputPolicy= must derive its deterministic decision from stable record facts
+rather than one =WriteOperation=. One input write can complete zero, one, or
+many records, so the pipeline output contract must support a bounded batch.
+Source filters remain before framing because they decide whether the source is
+admitted; content-aware filters remain future work after framing. Any upstream
+capture loss still appears in record integrity and must not be presented as a
+complete stream. Read-failed chunks split records at explicit =capture_gap=
+boundaries, including a visible zero-byte loss record when no payload could be
+copied.
+
+** Superseded retention identity
+
+The original leaf-source key is not the product retention key. Retention now
+belongs to the resolved workload UID, with Pod and container identity retained
+on each record. Unknown or cyclic owner chains remain explicit and do not fall
+back to names.
+
+** Stored record
+
+Each accepted =LogRecord= receives one process-local monotonically increasing
+=StoreSequence=. Stored payload bytes are immutable and shared between the
+store, replay snapshots, and live delivery. Sequence order, not kernel
+timestamp order, defines store and subscription order.
+
+* Ownership and transport
+
+One Tokio task exclusively owns all mutable store state:
+
+#+begin_example
+capture task -> Pipeline -> RecordFramer -> bounded ingress channel
+                                             |
+                                             v
+                                      LogStore owner task
+                                             |
+                              replay snapshot + bounded live receiver
+                                             |
+                                             v
+                                       streaming adapter
+#+end_example
+
+The owner handles =Append=, =Subscribe=, and shutdown commands. Dropping the
+live receiver is unsubscribe; its global subscriber-slot permit remains held
+until that receiver is actually dropped.
+No caller receives mutable store internals. The capture task uses non-blocking
+send so a full store-ingress channel cannot stop draining the eBPF ring buffer.
+Ingress overflow drops the record with a distinct counter and integrity/loss
+diagnostic; it is never reported as sampling or kernel-ring loss.
+
+The initial implementation uses the standard =HashMap=, =VecDeque=, and shared
+immutable byte ownership. It adds no generic storage trait and no custom
+allocator.
+
+* Superseded capacity and eviction contract
+
+The original pool-by-pool defaults are not operator configuration. Operators
+configure only =max_memory=, =max_workloads=, =max_logs=, and
+=max_record_bytes=; internal framing, ingress, replay, and subscriber bounds are
+derived from =max_memory=. =max_record_bytes= defaults to 64 KiB.
+
+On append, the workload's oldest record is evicted when aggregate =max_logs=
+across its Pod replicas is exceeded. Global memory pressure evicts globally
+oldest records. Replay references can pin shared records, but subscriber reads
+release only delivery references and never drain retained history.
+
+* Subscription contract
+
+A selector targets workload UID, Pod UID, or namespace. Broad replay is ordered
+by =StoreSequence=. Exact container-stream selection from the original design
+is superseded.
+
+The owner processes subscription atomically with appends:
+
+1. choose watermark =N=, the last assigned store sequence;
+2. collect all matching retained records with sequence =<= N=;
+3. reserve replay memory and register the live subscriber;
+4. return =ReplaySession { through: N, replay, live_receiver }=; and
+5. route only matching records with sequence => N= to that receiver.
+
+The adapter sends replay in sequence order before reading live delivery. This
+guarantees no gap and no duplicate at the replay/live boundary while the
+session remains connected. It does not claim durable exactly-once delivery:
+there are no acknowledgements, reconnect cursors, or persisted sequences.
+
+Subscribers never apply backpressure to capture or the store owner. If either
+the live record or byte limit is exceeded while replay or network sending is
+slow, close that subscription with an explicit =subscriber_lagged= terminal
+reason and counter. Silently dropping selected records while leaving the
+subscription open is forbidden.
+
+* Workload ownership
+
+The node-local Pod watch is the source for Pod owner references, but a direct
+owner is not always the workload a human asks for. Workload indexing must:
+
+- use owner UIDs, kinds, and API versions rather than labels or generated names;
+- resolve at least direct Pod owners and ReplicaSet -> Deployment chains;
+- preserve the last known owner with the same stale semantics as Pod identity;
+- bound all owner caches and API work outside the event path; and
+- expose unresolved and unsupported chains rather than guessing.
+
+The exact set of supported controller chains must be documented from fixtures.
+Workload subscriptions are not enabled until their chain is supported.
+The bounded Pod-UID history preserves a last resolved Deployment when its
+ReplicaSet temporarily disappears from the owner cache and marks that snapshot
+stale; deleting the Pod removes the history.
+
+* Observability
+
+Keep distinct totals for accepted records, workload-count eviction,
+global-budget eviction, workload-limit rejection, ingress overflow, replay
+admission rejection, subscriber lag, explicit unsubscribe, and shutdown flush.
+Report retained records, retained bytes, workload count, subscriber count, and
+pinned replay bytes as bounded gauges or periodic diagnostics.
+
+No payload bytes, credentials, or arbitrary selector values are written to
+diagnostics.
+
+* Allocator decision
+
+A self-cooked arena is not an architectural requirement. Variable payloads,
+workload eviction, and subscriber-held snapshots make reclamation the hard part,
+not allocation itself.
+
+Benchmark the standard-library baseline first. Prototype a generation/slab
+allocator only if allocation and reclamation consume at least 10% of store CPU
+at the validated workload. Adopt it only if it improves p99 append latency or
+sustained throughput by at least 15% without weakening byte bounds, increasing
+pinned memory, or introducing unsafe code without a separate review. Remove
+the prototype otherwise.
+
+The 2026-08-09 release-mode baseline ran all 27 combinations of 64-byte, 1-KiB,
+and 16-KiB payloads; 100, 1,000, and 4,096 sources; and 0, 1, and 64 live
+subscribers. Representative results:
+
+| Payload | Sources | Subscribers | records/s | p50 append | p99 append | allocations/10k | allocated/10k | cumulative VmHWM |
+|-
+| 64 B | 100 | 0 | 403,438 | 320 ns | 6,660 ns | 254,470 | 14.3 MB | 16,540 KiB |
+| 64 B | 4,096 | 64 | 193,727 | 1,130 ns | 9,140 ns | 339,870 | 26.9 MB | 44,780 KiB |
+| 1 KiB | 4,096 | 64 | 182,492 | 950 ns | 8,620 ns | 339,604 | 26.7 MB | 45,016 KiB |
+| 16 KiB | 4,096 | 0 | 431,358 | 1,010 ns | 5,910 ns | 354,271 | 26.5 MB | 103,144 KiB |
+| 16 KiB | 4,096 | 64 | 197,184 | 690 ns | 6,490 ns | 338,626 | 26.0 MB | 115,108 KiB |
+
+=stats_alloc= measured process-wide allocations during publication; payload
+allocation happened before the timed store handoff, matching the store's owned
+input boundary. =VmHWM= is cumulative across the matrix, not isolated per row.
+No CPU profiler is installed in this environment, so allocation/reclamation
+was not shown to consume the required 10% of store CPU. The approved decision
+is therefore to keep ordinary safe allocation and not build an arena.
+
+* Non-goals
+
+- Persistence, cross-node history, replication, or recovery after restart.
+- A public HTTP, gRPC, WebSocket, authentication, or authorization contract.
+- Durable exactly-once delivery, acknowledgements, or reconnect cursors.
+- Severity inference, regex, or semantic multiline parsing. Records carry
+  severity, but it remains =Unknown= absent explicit evidence.
+- Pretending fd 1/2 is durable stream identity before descriptor tracking lands.
+- Keeping a second ring per namespace, workload, or Pod.
+- Introducing an arena before measurements justify one.
+
+* Historical verification plan
+
+The old source-oriented product cases are superseded rather than pending work.
+Current acceptance and configuration validation live in
+=20260809-1905-workload-store-product-contract.org=. The measured allocator
+matrix above remains a historical result, not a set of current product defaults.
+
+* TODO
+
+- [X] L1 Approve framing, source identity, numeric bounds, eviction, and
+  replay/live semantics.
+- [X] L2 Add bounded newline framing and explicit =LogRecord= integrity.
+- [X] L3 Add UID-based workload ownership discovery and selector indexes.
+- [X] L4 Implement and model-test the single-owner bounded store.
+- [X] L5 Implement atomic replay/live subscriptions and lag handling.
+- [X] L6 Connect pipeline publication, shutdown, and distinct accounting.
+- [X] L7 Benchmark the baseline and make the measured allocator decision.
+- [X] L8 Update the field guide and roadmap, then pass local validation.
+
+* Approval
+
+Approved by the maintainer on 2026-08-09, including the numeric defaults,
+sampling-after-framing change, eviction policy, and replay semantics.

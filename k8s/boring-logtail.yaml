@@ -18,6 +18,29 @@ metadata:
     app.kubernetes.io/part-of: boring-logtail
 automountServiceAccountToken: true
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boring-logtail
+  namespace: boring-logtail
+  labels:
+    app.kubernetes.io/name: boring-logtail
+    app.kubernetes.io/part-of: boring-logtail
+data:
+  config.yaml: |
+    version: 1
+    sampling:
+      percent: 100
+    store:
+      max_memory: 128MiB
+      max_workloads: 128
+      max_logs: 500
+      max_record_bytes: 64KiB
+    filters:
+      - type: kubernetes-namespace
+        include:
+          - game-servers
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -25,6 +48,9 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -87,14 +113,14 @@ spec:
                   fieldPath: spec.nodeName
             - name: BORING_LOGTAIL_HOST_CGROUP_ROOT
               value: /host/sys/fs/cgroup
-            - name: BORING_LOGTAIL_SAMPLE_PERCENT
-              value: "100"
+            - name: BORING_LOGTAIL_CONFIG
+              value: /etc/boring-logtail/config.yaml
           resources:
             requests:
               cpu: 50m
               memory: 64Mi
             limits:
-              memory: 256Mi
+              memory: 192Mi
           securityContext:
             privileged: true
             runAsNonRoot: false
@@ -109,6 +135,9 @@ spec:
             - name: host-cgroup
               mountPath: /host/sys/fs/cgroup
               readOnly: true
+            - name: config
+              mountPath: /etc/boring-logtail
+              readOnly: true
       volumes:
         - name: tracefs
           hostPath:
@@ -118,3 +147,6 @@ spec:
           hostPath:
             path: /sys/fs/cgroup
             type: Directory
+        - name: config
+          configMap:
+            name: boring-logtail

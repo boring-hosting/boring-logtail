@@ -63,6 +63,32 @@ impl fmt::Display for ContainerId {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WorkloadIdentity {
+    pub api_version: String,
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum WorkloadResolution {
+    Resolved(WorkloadIdentity),
+    #[default]
+    NoController,
+    UnresolvedReplicaSet(WorkloadIdentity),
+    UnsupportedOwner(WorkloadIdentity),
+}
+
+impl WorkloadResolution {
+    pub fn resolved(&self) -> Option<&WorkloadIdentity> {
+        match self {
+            Self::Resolved(workload) => Some(workload),
+            Self::NoController | Self::UnresolvedReplicaSet(_) | Self::UnsupportedOwner(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KubernetesIdentity {
     pub node: String,
@@ -71,13 +97,15 @@ pub struct KubernetesIdentity {
     pub pod_uid: String,
     pub container_name: String,
     pub container_id: ContainerId,
+    pub workload: WorkloadResolution,
 }
-
 
 #[derive(Clone, Debug, Default)]
 pub struct PodSnapshot {
     pub identities: HashMap<ContainerId, Vec<KubernetesIdentity>>,
+    pub ready: bool,
     pub stale: bool,
+    pub over_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,38 +113,7 @@ pub struct CgroupSnapshot {
     pub containers: HashMap<u64, Vec<ContainerId>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamFileDescriptor {
-    Stdout,
-    Stderr,
-    Other(u32),
-    // How can this ever happen to be honest
-    Unknown,
-}
-
-impl From<Option<u32>> for StreamFileDescriptor {
-    fn from(fd: Option<u32>) -> Self {
-        match fd {
-            Some(1) => Self::Stdout,
-            Some(2) => Self::Stderr,
-            Some(other) => Self::Other(other),
-            None => Self::Unknown,
-        }
-    }
-}
-
-impl fmt::Display for StreamFileDescriptor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stdout => f.write_str("stdout-candidate"),
-            Self::Stderr => f.write_str("stderr-candidate"),
-            Self::Other(fd) => write!(f, "fd-{fd}"),
-            Self::Unknown => f.write_str("unknown-candidate"),
-        }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Enrichment {
     Enriched(KubernetesIdentity),
     Stale(KubernetesIdentity),
@@ -126,27 +123,28 @@ pub enum Enrichment {
     AmbiguousContainer(ContainerId),
 }
 
-// Implement display, wtf
 impl Enrichment {
-    pub fn source(&self) -> String {
+    pub fn description(&self) -> String {
         match self {
             Self::Enriched(identity) => format!(
-                "k8s={}/{}/{} pod_uid={} node={} container_id={}",
+                "k8s={}/{}/{} pod_uid={} node={} container_id={} workload={}",
                 identity.namespace,
                 identity.pod_name,
                 identity.container_name,
                 identity.pod_uid,
                 identity.node,
                 identity.container_id,
+                workload_description(identity),
             ),
             Self::Stale(identity) => format!(
-                "k8s={}/{}/{} pod_uid={} node={} container_id={} metadata=stale",
+                "k8s={}/{}/{} pod_uid={} node={} container_id={} workload={} metadata=stale",
                 identity.namespace,
                 identity.pod_name,
                 identity.container_name,
                 identity.pod_uid,
                 identity.node,
                 identity.container_id,
+                workload_description(identity),
             ),
             Self::UnresolvedCgroup => "k8s=unresolved reason=cgroup-not-indexed".to_owned(),
             Self::UnresolvedContainer(id) => {
@@ -158,6 +156,25 @@ impl Enrichment {
             Self::AmbiguousContainer(id) => {
                 format!("k8s=ambiguous reason=container-has-multiple-pods container_id={id}")
             }
+        }
+    }
+}
+
+fn workload_description(identity: &KubernetesIdentity) -> String {
+    match &identity.workload {
+        WorkloadResolution::Resolved(workload) => format!(
+            "{}/{}/{}:{}",
+            workload.api_version, workload.kind, workload.name, workload.uid
+        ),
+        WorkloadResolution::NoController => format!("standalone-pod:{}", identity.pod_uid),
+        WorkloadResolution::UnresolvedReplicaSet(owner) => {
+            format!("unresolved-replicaset:{}", owner.uid)
+        }
+        WorkloadResolution::UnsupportedOwner(owner) => {
+            format!(
+                "unsupported:{}/{}:{}",
+                owner.api_version, owner.kind, owner.uid
+            )
         }
     }
 }
@@ -217,9 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn source_is_clear_when_metadata_is_missing() {
+    fn description_is_clear_when_metadata_is_missing() {
         assert_eq!(
-            Enrichment::UnresolvedCgroup.source(),
+            Enrichment::UnresolvedCgroup.description(),
             "k8s=unresolved reason=cgroup-not-indexed"
         );
     }
@@ -239,6 +256,7 @@ mod tests {
             requested_len: 3,
             truncated: false,
             read_failed: false,
+            capture_gaps: Vec::new(),
             bytes: b"hi\n".to_vec(),
         }
     }
@@ -253,6 +271,7 @@ mod tests {
             pod_uid: "pod-uid".into(),
             container_name: "checkout".into(),
             container_id: container.clone(),
+            workload: WorkloadResolution::NoController,
         };
         let (cgroup_sender, cgroup_receiver) = watch::channel(Arc::new(CgroupSnapshot::default()));
         let (pod_sender, pod_receiver) = watch::channel(Arc::new(PodSnapshot::default()));
@@ -275,6 +294,7 @@ mod tests {
         pod_sender.send_replace(Arc::new(PodSnapshot {
             identities: HashMap::from([(container, vec![identity.clone()])]),
             stale: false,
+            ..Default::default()
         }));
         assert_eq!(
             enricher.enrich(&operation(456)),
@@ -292,6 +312,7 @@ mod tests {
             pod_uid: "pod-uid".into(),
             container_name: "checkout".into(),
             container_id: container.clone(),
+            workload: WorkloadResolution::NoController,
         };
         let (_, cgroups) = watch::channel(Arc::new(CgroupSnapshot {
             containers: HashMap::from([(456, vec![container.clone()])]),
@@ -299,6 +320,7 @@ mod tests {
         let (pods_sender, pods) = watch::channel(Arc::new(PodSnapshot {
             identities: HashMap::from([(container.clone(), vec![identity.clone()])]),
             stale: true,
+            ..Default::default()
         }));
         let enricher = Enricher { cgroups, pods };
 
@@ -309,6 +331,7 @@ mod tests {
         pods_sender.send_replace(Arc::new(PodSnapshot {
             identities: HashMap::from([(container.clone(), vec![identity.clone(), identity])]),
             stale: false,
+            ..Default::default()
         }));
         assert_eq!(
             enricher.enrich(&operation(456)),

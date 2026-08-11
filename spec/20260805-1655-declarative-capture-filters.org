@@ -1,0 +1,289 @@
+#+title: Declarative capture filters
+#+date: 2026-08-05 16:55 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-05. The maintainer approved
+=game-servers= in the checked-in ConfigMap for guarded Skaffold validation;
+live results remain to be recorded.
+
+* Goal
+
+Introduce one honest filter contract from YAML configuration through
+Kubernetes discovery and userspace pipeline decisions.
+Start with an exact Kubernetes namespace allowlist, while leaving a clear path
+for Pod, container, label, process, stream, and framed-record filters later.
+
+Filtering should avoid work at the earliest boundary that has enough
+information:
+
+#+begin_example
+YAML filter declaration
+  -> discovery plan: watch only relevant Pods
+  -> userspace decision: enforce the namespace policy authoritatively
+#+end_example
+
+* Starting state
+
+Before this implementation, the in-progress =Filters= prototype in
+=pipeline.rs= read one environment variable but was not constructed or
+evaluated and left =Pipeline= uncompilable. It also could not state what
+happened when enrichment was stale, unresolved, or ambiguous. This
+implementation replaces that prototype without discarding the surrounding
+approved pipeline cleanup.
+
+The eBPF =admitted= function already rejects the collector cgroup and
+non-configured descriptors before creating =WRITE_STARTS= or =WRITEV_STARTS=.
+Namespace pushdown was investigated for that boundary and deliberately
+deferred: scoped watches cannot positively classify absent cgroups.
+
+* Configuration contract
+
+Add a versioned YAML document. Policy configuration lives in YAML; environment
+variables remain only for deployment facts that cannot be baked into a
+ConfigMap, such as the Downward-API node name and host cgroup mount.
+
+#+begin_src yaml
+version: 1
+
+sampling:
+  percent: 100
+
+filters:
+  - type: kubernetes-namespace
+    include:
+      - game-servers
+#+end_src
+
+- =version= is required and must equal =1=.
+- =filters= defaults to an empty list, which admits every reconstructed write.
+- Multiple filters are a logical AND. Configuration order does not change
+  semantics; the planner chooses the cheapest safe evaluation order.
+- =kubernetes-namespace.include= is a non-empty, duplicate-free list of exact
+  namespace names. Trim surrounding YAML string whitespace, reject empty names,
+  and validate Kubernetes DNS-label syntax.
+- A namespace allowlist admits =Enriched= and =Stale= identities in the listed
+  namespaces. Unresolved and ambiguous identities do not prove membership and
+  are deliberately dropped.
+- =sampling.percent= keeps its current validated =0..=100= contract and moves
+  from =BORING_LOGTAIL_SAMPLE_PERCENT= into YAML. Sampling is not a filter and
+  remains separately accounted.
+- =BORING_LOGTAIL_CONFIG= optionally names the YAML file. When absent, built-in
+  defaults preserve the current admit-all and 100-percent local behavior. When
+  set, an unreadable, malformed, or unsupported file is a startup error.
+- Kubernetes mounts a non-secret ConfigMap at
+  =/etc/boring-logtail/config.yaml= and sets =BORING_LOGTAIL_CONFIG= to that
+  path. =RUST_LOG=, =BORING_LOGTAIL_NODE_NAME=, and
+  =BORING_LOGTAIL_HOST_CGROUP_ROOT= remain deployment environment variables.
+
+Use a tagged configuration enum rather than a generic YAML value or plugin
+trait. Adding a filter later means adding one validated config variant and its
+planner/evaluator implementation. Do not build arbitrary boolean expressions,
+dynamic reload, or a filter plugin system in this slice.
+
+* Filter planning
+
+Parse and validate configuration before loading or attaching eBPF. Compile it
+into an immutable =FilterPlan= with two projections:
+
+1. =PodWatchPlan=: the smallest Kubernetes watch set needed for identity.
+2. =WriteFilterPlan=: the authoritative decision over an enriched operation.
+
+Keep parsing in a focused configuration module and filter semantics in a
+focused filter module. =Pipeline= owns when the userspace plan runs; it does not
+own environment access, YAML parsing, Kubernetes watcher construction, or eBPF
+map synchronization.
+
+* Scoped Kubernetes discovery
+
+- With no Kubernetes filter, preserve the current all-namespaces, node-scoped
+  Pod watch for enrichment.
+- With namespace includes, create one =Api<Pod>::namespaced= watcher per listed
+  namespace. Keep the existing =spec.nodeName=$NODE= field selector on every
+  watcher.
+- Merge watcher state into one immutable =PodSnapshot=. Track initial-list
+  readiness and stale/error state per watcher; the aggregate is ready only when
+  every configured watcher completes its initial list.
+- Keep one global bound across merged Pods rather than granting the existing
+  maximum independently to every namespace.
+- A watch failure keeps the last known identity for that namespace and marks
+  the aggregate stale. Watch retries use kube-runtime's bounded default
+  backoff; the next successful live event clears stale state. A failure must
+  not silently widen the namespace set.
+- Keep the current read-only Pod ClusterRole in this slice. Namespaced API calls
+  reduce watched objects and event traffic but do not claim namespace-scoped
+  authorization.
+
+Future Pod-label filters may contribute a server-side label selector to the
+same =PodWatchPlan=. Exclusion-only filters cannot generally narrow a
+Kubernetes watch and must say so.
+
+* Kernel pushdown is deferred
+
+Namespace names do not exist at the eBPF write/writev boundary. The proposed
+=DENIED_CGROUPS= controller attempted to infer exclusion when a cgroup's
+container ID was absent from the scoped included-namespace Pod cache. That
+inference is unsafe: an included Pod's cgroup can appear before Kubernetes
+status publishes its =containerID=. A deny inserted during that window would
+silently lose the Pod's first writes before the authoritative pipeline sees
+them.
+
+The implementation therefore does not install a namespace deny map. Both
+syscall paths retain the existing collector-cgroup and descriptor admission;
+all namespace decisions occur after enrichment. Kernel pushdown remains valid
+future work only for a filter that supplies positive exclusion evidence and
+defines safe startup, stale-cache, map-failure, cgroup-reuse, and recovery
+semantics. Watching every Pod merely to create that evidence would conflict
+with this slice's deliberate reduction in Kubernetes watch work.
+
+* Userspace decisions
+
+Replace =Pipeline::accept -> Option<ProcessedWrite>= with an explicit outcome:
+
+#+begin_src rust
+enum PipelineDecision {
+    Pending,
+    Dropped(DropReason),
+    Emit(ProcessedWrite),
+}
+
+enum DropReason {
+    Namespace,
+    UnresolvedIdentity,
+    AmbiguousIdentity,
+    Sampled,
+}
+#+end_src
+
+The stage order is:
+
+#+begin_example
+assemble complete WriteOperation
+  -> enrich from in-memory snapshots
+  -> apply authoritative filters
+  -> apply sampling
+  -> classify descriptor
+  -> emit ProcessedWrite
+#+end_example
+
+- =Pending= means only that more chunks are required.
+- Every intentional drop has one reason and a counter. Filter drops, sampling,
+  malformed transport, reconstruction failure, ring-buffer
+  loss, and future exporter backpressure must never share accounting.
+- Do not log every filtered write. Publish bounded periodic totals and include
+  configured filters in startup diagnostics.
+- A filter never mutates captured bytes or changes reconstruction integrity.
+
+Later content, severity, JSON, regex, and multiline filters belong after the
+future =LogRecord= framing boundary. Do not parse application content in eBPF.
+
+* Resource and lifecycle bounds
+
+- Bound namespace count in configuration so one typo cannot create unbounded
+  watchers; initially allow at most 64 included namespaces.
+- Process exit currently tears down watcher tasks. Explicit task ownership for
+  independently testable graceful shutdown remains deferred.
+- Configuration is immutable for one process lifetime. A change rolls the
+  DaemonSet; dynamic map-policy replacement is deferred until its transition
+  semantics are designed.
+
+* Non-goals
+
+- Payload, JSON, regex, severity, multiline, or redaction filters.
+- Namespace exclusions, OR expressions, nested boolean expressions, or filter
+  ordering semantics.
+- Dynamic configuration reload.
+- Treating eBPF pushdown as complete or authorization-grade enforcement.
+- Eliminating the host cgroup scan; it is still needed to compile container
+  identity into cgroup decisions.
+- Changing the OTLP collector or introducing an exporter in this slice.
+
+* Verification
+
+- YAML tests: absent config, valid defaults, exact namespace list, malformed
+  YAML, unsupported version/type, empty/duplicate/invalid namespaces, bounds,
+  and sample percentage.
+- Filter tests: enriched include/exclude, stale include/exclude, unresolved,
+  ambiguous, logical AND scaffolding, and distinct drop reasons.
+- Watch tests: all-namespace plan, one/multiple namespace plans, node field
+  selector preservation, merged initial readiness, deletion, stale watcher,
+  and global bound.
+- eBPF tests/verifier load: collector exclusion and fd checks remain intact;
+  no namespace deny map can silently suppress =write= or =writev= events.
+- Pipeline tests prove filtering happens after enrichment and before sampling,
+  and that every non-emission has an observable category.
+- Render and inspect the ConfigMap, mount, environment, and RBAC. Never edit
+  encrypted SOPS content.
+- Live guarded rollout with one included namespace: compare eBPF event volume,
+  Pod-cache size/watch traffic, CPU, included output, excluded output, startup,
+  new Pod creation, metadata outage, and recovery against the unfiltered
+  baseline.
+
+* TODO
+
+- [X] F1 Approve the YAML schema, namespace semantics, and live allowlist.
+- [X] F2 Implement validated versioned configuration and replace the current
+  environment sampling/filter prototype.
+- [X] F3 Compile filters into scoped Pod-watch and userspace plans.
+- [X] F4 Implement merged namespaced Pod watchers with readiness and bounded
+  stale-state behavior.
+- [X] F5 Implement explicit pipeline decisions, authoritative namespace drops,
+  and separate accounting.
+- [X] F6 Reject unsafe absence-based =DENIED_CGROUPS= pushdown and record the
+  positive-evidence requirement as deferred work.
+- [X] F7 Add the ConfigMap/mount, update the field guide and roadmap, and pass
+  local validation.
+- [ ] F8 Perform a guarded live rollout and record measured filtering savings
+  and known pushdown gaps.
+
+* Validation results
+
+- =cargo test --workspace=: passed, 48 tests. Configuration, watch merging,
+  relist continuity and global bounds, filter outcomes, pipeline
+  decisions, reconstruction, sampling, and the shared ABI are covered.
+- =cargo clippy --package boring-logtail --package boring-logtail-common
+  --all-targets -- -D warnings=: passed.
+- =cargo build --release=: passed, including the release eBPF object build. The
+  existing non-fatal nightly LLVM shared-library linker warning remains.
+- =cargo fmt --all= and =git diff --check=: passed; stable rustfmt printed the
+  repository's existing warnings for nightly-only formatting options.
+- =kubectl apply --dry-run=client -f k8s/boring-logtail.yaml=: passed for the
+  Namespace, ServiceAccount, ConfigMap, unchanged ClusterRole/Binding, and
+  DaemonSet.
+- A privileged verifier load, syscall admission integration test, and guarded
+  live rollout were not run: they require sudo and a rollout target. The eBPF
+  object builds, but F8 remains open until runtime checks complete.
+
+* Guarded rollout observations
+
+On 2026-08-05 the maintainer deployed the =game-servers= allowlist with
+Skaffold. Grafana/Loki received boring-logtail output through the existing
+node-local path: boring-logtail stdout, CRI file, OpenTelemetry Collector
+=filelog= receiver, Loki. Included Palworld writes carried exact namespace,
+Pod, container, node, cgroup, PID/TID, stream-candidate, and payload data.
+
+Periodic totals reported =UnresolvedIdentity= drops on multiple nodes. Under a
+scoped included-namespace watch, that category includes ordinary writes from
+excluded namespaces because their Pod identities are deliberately not watched;
+it can also include an included container during cgroup/Pod-status convergence.
+The current counter is truthful about missing attribution but cannot distinguish
+those causes without additional positive identity evidence. F8 remains open
+until excluded-output absence and new-Pod convergence are checked explicitly.
+
+* Approval questions
+
+1. Should the committed Kubernetes configuration initially include only
+   =game-servers=, or ship with =filters: []= and use =game-servers= only for the
+   live validation override? This spec recommends =filters: []= as the safe
+   repository default and a temporary =game-servers= rollout for measurement.
+2. Is strict namespace membership correct: stale known identity may pass, while
+   unresolved and ambiguous identity is dropped? This spec recommends yes; an
+   allowlist should not silently become allow-all when attribution fails.
+
+* Approval
+
+Approved by the maintainer on 2026-08-05 with strict allowlist handling that
+drops unresolved and ambiguous identity. The initial safe committed default was
+=filters: []=. The maintainer subsequently approved changing the checked-in
+ConfigMap to =game-servers= for the guarded Skaffold validation.

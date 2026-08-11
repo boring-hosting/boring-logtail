@@ -52,12 +52,23 @@ eBPF WriteEvent chunks --ring buffer--> userspace WriteAssembler
                                       WriteOperation
                                             |
                                             v
-                                  temporary human output
+                              enrich/filter/frame/sample
+                                             |
+                                             v
+                                        LogRecord
+                                             |
+                                             v
+                              bounded store + temporary output
 #+end_example
 
-The capture and write-reconstruction pieces exist. Durable stream identity,
-record framing, kubernetes identity, and export are still being built. The
-[[file:../ROADMAP.org][roadmap]] is the source of truth for that frontier.
+Capture, write reconstruction, newline framing, Kubernetes identity, and
+bounded process-local replay now exist. Durable stream identity, persistence,
+and an authenticated network streaming adapter remain frontier work. The
+[[file:../ROADMAP.org][roadmap]] is the source of truth for it.
+
+History is one ring per workload UID, shared by current and historical Pod
+replicas while each record keeps its Pod identity. Replay selectors name a
+workload, Pod, or namespace. Container streams remain private framing lanes.
 
 * Keep this alive
 
