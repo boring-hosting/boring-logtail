@@ -1,0 +1,81 @@
+#+title: Time-based log retention
+#+date: 2026-08-12 16:12 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-12 after maintainer approval.
+
+* Goal
+
+Let operators bound how long records remain replayable without turning
+retention into periodic whole-store deletion.
+
+* Configuration
+
+#+begin_src yaml
+store:
+  max_memory: 128MiB
+  max_logs: 500
+  retention: 1h
+#+end_src
+
+=retention= is required to be a positive integer followed immediately by one
+unit: =s= for seconds, =m= for minutes, or =h= for hours. Examples are =30s=,
+=15m=, and =2h=. Fractions, compound durations, whitespace, zero, missing
+units, uppercase units, overflow, and unknown units fail startup.
+
+The default is =1h= so an omitted store section remains useful and bounded.
+
+* Semantics
+
+Each accepted record receives a userspace monotonic insertion instant. It
+expires when its age reaches =retention=. Kernel event timestamps are not used:
+their clock domain is a capture fact, while retention begins when the store
+accepts ownership.
+
+Expiry evicts individual records in store insertion order. It never clears a
+young record merely because an older record expired. Empty workload rings and
+Pod counters are cleaned through the same eviction path as count and memory
+pressure. Existing replay/live references remain valid shared references after
+the record leaves retained history; expiry cannot revoke data already handed
+to a subscriber.
+
+The store actor owns a Tokio interval and expires records without incoming
+commands. Append and subscribe also expire overdue records before operating, so
+timer scheduling delay cannot expose stale history at those boundaries. The
+timer cadence is at most one second and never exceeds the configured duration.
+
+Retention eviction has its own counter. It is distinct from per-workload count
+and global memory-pressure eviction.
+
+* Acceptance
+
+- =Ns=, =Nm=, and =Nh= parse to the exact duration and round-trip through the
+  store configuration.
+- Invalid and overflowing spellings fail configuration validation.
+- Records remain replayable before their age reaches retention and disappear
+  at the boundary.
+- Mixed-age records expire individually; workload and Pod accounting stays
+  exact as rings become empty.
+- Expiry runs while the actor is idle and before subscription replay.
+- Existing replay references survive expiry.
+- Retention, README, manifest, field guide, and roadmap describe the same
+  behavior.
+
+* TODO
+
+- [X] R1 Add strict duration parsing and the lean public configuration field.
+- [X] R2 Add monotonic per-record age and shared retention eviction mechanics.
+- [X] R3 Drive idle expiry from the store actor and guard append/subscribe.
+- [X] R4 Cover parsing, boundary, mixed-age, accounting, idle, and replay-pin
+  behavior.
+- [X] R5 Update README, manifest, field guide, and roadmap.
+- [X] R6 Pass workspace tests, strict Clippy, formatting, and diff checks.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 78 tests and one ignored manual
+  benchmark.
+- Strict userspace/shared Clippy passed with warnings denied.
+- Formatting and =git diff --check= passed.

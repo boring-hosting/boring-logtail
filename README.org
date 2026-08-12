@@ -66,6 +66,61 @@ the transported collector output can create a cross-cgroup observer loop.
 Set =RUST_LOG= if you want something other than the default userspace =info=
 output. Make a process write to stdout or stderr and watch it go.
 
+Configuration stays small. Save this as =config.yaml=:
+
+#+begin_src yaml
+sampling:
+  percent: 100
+
+store:
+  max_memory: 128MiB
+  max_logs: 500
+  retention: 1h
+
+filters:
+  namespaces:
+    include:
+      - game-servers
+
+events:
+  joined:
+    type: info
+    message: "Someone has joined!"
+
+event_catchers:
+  - regex: '(?i)\bjoined\b'
+    event: joined
+    emitters:
+      - stdout
+      - discord
+
+event_emitters:
+  stdout: {}
+  discord:
+    channel_id: "123456789"
+    secret_from_env: WOW_MY_DISCORD_SECRET
+#+end_src
+
+Point =BORING_LOGTAIL_CONFIG= at the file and set the Discord token only if the
+Discord emitter is configured:
+
+#+begin_src shell
+export BORING_LOGTAIL_CONFIG=./config.yaml
+export WOW_MY_DISCORD_SECRET='your-discord-bot-token'
+mise run run
+#+end_src
+
+The secret value comes from the named environment variable, never the YAML.
+Event matching uses a precompiled regex set and never makes capture wait for
+stdout or Discord. The stdout emitter writes one escaped line such as
+=event="joined" type=info message="Someone has joined!" identity="k8s=game-servers/game-1/server ..." stream=Stdout ... log="player-7 joined"=.
+Discord receives the configured message and the same caught log. The event is
+the useful bit; the message is just context.
+
+=store.retention= accepts whole seconds, minutes, or hours such as =30s=,
+=15m=, and =2h=. Records age out individually; this is not a periodic
+everything-must-go button.
+
 * Cross-compile it
 
 #+begin_src shell

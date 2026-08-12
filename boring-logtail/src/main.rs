@@ -10,11 +10,12 @@ use boring_logtail::{
     cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache},
     config::Config,
     decode_event,
+    emitter::EventEmitters,
     enrichment::{Enricher, PodSnapshot},
+    event::EventCatcher,
     filter::{DropReason, FilterPlan},
     k8s_watch::spawn_kubernetes_cache,
     pipeline::{Pipeline, PipelineDecision},
-    record::LogRecord,
     sampling::OutputPolicy,
     store::{LogStore, TryAppendError},
 };
@@ -37,6 +38,7 @@ struct LogTailApplication {
     event_task: Option<JoinHandle<anyhow::Result<()>>>,
     event_shutdown: Option<oneshot::Sender<()>>,
     store: LogStore,
+    emitters: Option<EventEmitters>,
 }
 
 #[derive(Debug, Default)]
@@ -75,16 +77,17 @@ impl LogTailApplication {
 
         let config_path = std::env::var_os("BORING_LOGTAIL_CONFIG").map(PathBuf::from);
         let config = Config::load(config_path.as_deref()).context("configure boring-logtail")?;
+        let (emitter_senders, emitters) = EventEmitters::spawn(&config)?;
+        let event_catcher = EventCatcher::compile(&config, &emitter_senders)?;
         let filter_plan = FilterPlan::compile(&config);
         let output_policy = OutputPolicy::WithSample(config.sampling.percent.try_into()?);
         info!(
-            "configuration: sample_percent={} pod_watch={:?} max_workloads={} max_logs={} max_memory={} max_record_bytes={} derived_limits=\"{}\"",
+            "configuration: sample_percent={} pod_watch={:?} max_logs={} retention={:?} max_memory={} derived_limits=\"{}\"",
             config.sampling.percent,
             filter_plan.pod_watch,
-            config.store.max_workloads,
             config.store.max_logs,
+            config.store.retention,
             config.store.max_memory,
-            config.store.max_record_bytes,
             config
                 .store
                 .derived_limits_summary()
@@ -136,7 +139,8 @@ impl LogTailApplication {
         let enricher = Enricher { cgroups, pods };
         let (event_task, event_shutdown) = spawn_capture_loop(
             &mut ebpf,
-            Pipeline::new(enricher, output_policy, filter_plan.writes, &config.store),
+            Pipeline::new(enricher, output_policy, filter_plan.writes, &config.store)
+                .with_event_catcher(event_catcher),
             store.clone(),
         )?;
 
@@ -145,6 +149,7 @@ impl LogTailApplication {
             event_task: Some(event_task),
             event_shutdown: Some(event_shutdown),
             store,
+            emitters: Some(emitters),
         })
     }
 
@@ -160,6 +165,9 @@ impl LogTailApplication {
             }
         }
         self.store.shutdown().await;
+        if let Some(emitters) = self.emitters.take() {
+            emitters.shutdown().await;
+        }
     }
 }
 
@@ -252,6 +260,7 @@ fn spawn_capture_loop(
         let mut ingress_drops = StdHashMap::<TryAppendError, u64>::new();
         let mut integrity_totals = RecordIntegrityTotals::default();
         let mut report = tokio::time::interval(Duration::from_secs(60));
+
         loop {
             let mut guard = tokio::select! {
                 guard = ring_buf.readable_mut() => guard?,
@@ -262,6 +271,7 @@ fn spawn_capture_loop(
                     continue;
                 }
             };
+
             while let Some(item) = guard.get_inner_mut().next() {
                 match decode_event(&item) {
                     Ok(event) => match pipeline.accept(event) {
@@ -287,10 +297,12 @@ fn spawn_capture_loop(
             }
             guard.clear_ready();
         }
+
         if let PipelineDecision::Records { emitted, sampled } = pipeline.flush() {
             *drops.entry(DropReason::Sampled).or_default() += sampled as u64;
             publish_records(emitted, &store, &mut ingress_drops, &mut integrity_totals);
         }
+
         if !drops.is_empty()
             || !ingress_drops.is_empty()
             || integrity_totals.capacity_splits > 0
@@ -307,7 +319,7 @@ fn spawn_capture_loop(
 }
 
 fn publish_records(
-    records: Vec<LogRecord>,
+    records: Vec<Arc<boring_logtail::record::LogRecord>>,
     store: &LogStore,
     ingress_drops: &mut StdHashMap<TryAppendError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
@@ -317,23 +329,10 @@ fn publish_records(
         integrity_totals.capacity_splits += u64::from(integrity.capacity_split);
         integrity_totals.capture_gaps += u64::from(integrity.capture_gap);
         integrity_totals.unterminated_flushes += u64::from(integrity.unterminated);
-        emit_record(&record);
         if let Err(reason) = store.try_append(record) {
             *ingress_drops.entry(reason).or_default() += 1;
         }
     }
-}
-
-fn emit_record(record: &LogRecord) {
-    info!(
-        "incoming_log sample_percent={} identity=\"{}\" severity={:?} bytes={} integrity={:?} payload={:?}",
-        record.sample_percent(),
-        record.enrichment().description(),
-        record.severity(),
-        record.bytes().len(),
-        record.integrity(),
-        String::from_utf8_lossy(record.bytes()),
-    );
 }
 
 fn load_enter_program(ebpf: &mut Ebpf) -> anyhow::Result<()> {

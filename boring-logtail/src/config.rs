@@ -1,24 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Versioned, immutable process configuration.
+//! Small, immutable process configuration.
 
-use crate::{sampling::SamplePercent, store::StoreConfig};
+use crate::{event::EventType, sampling::SamplePercent, store::StoreConfig};
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::Path,
+};
 
 pub const MAX_INCLUDED_NAMESPACES: usize = 64;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub version: u8,
     #[serde(default)]
     pub sampling: SamplingConfig,
     #[serde(default)]
     pub store: StoreConfig,
     #[serde(default)]
-    pub filters: Vec<FilterConfig>,
+    pub filters: FilterConfig,
+    #[serde(default)]
+    pub events: BTreeMap<String, EventConfig>,
+    #[serde(default)]
+    pub event_catchers: Vec<EventCatcherConfig>,
+    #[serde(default)]
+    pub event_emitters: EventEmittersConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -38,21 +47,50 @@ const fn default_percent() -> u8 {
     100
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum FilterConfig {
-    KubernetesNamespace { include: Vec<String> },
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterConfig {
+    pub namespaces: Option<NamespaceFilterConfig>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            sampling: SamplingConfig::default(),
-            store: StoreConfig::default(),
-            filters: Vec::new(),
-        }
-    }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceFilterConfig {
+    pub include: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventConfig {
+    #[serde(rename = "type")]
+    pub kind: EventType,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventCatcherConfig {
+    pub regex: String,
+    pub event: String,
+    pub emitters: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventEmittersConfig {
+    pub discord: Option<DiscordEmitterConfig>,
+    pub stdout: Option<StdoutEmitterConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdoutEmitterConfig {}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordEmitterConfig {
+    pub channel_id: String,
+    pub secret_from_env: String,
 }
 
 impl Config {
@@ -69,13 +107,10 @@ impl Config {
     }
 
     pub fn validate(&mut self) -> anyhow::Result<()> {
-        if self.version != 1 {
-            bail!("unsupported config version {}", self.version);
-        }
         SamplePercent::try_from(self.sampling.percent)?;
         self.store.validate().map_err(anyhow::Error::msg)?;
-        for filter in &mut self.filters {
-            let FilterConfig::KubernetesNamespace { include } = filter;
+        if let Some(filter) = &mut self.filters.namespaces {
+            let include = &mut filter.include;
             if include.is_empty() {
                 bail!("kubernetes namespace include must not be empty");
             }
@@ -93,8 +128,69 @@ impl Config {
                 }
             }
         }
+        for (name, event) in &self.events {
+            if !valid_event_name(name) {
+                bail!("invalid event name {name:?}");
+            }
+            if event.message.trim().is_empty() {
+                bail!("event {name:?} message must not be empty");
+            }
+        }
+        for catcher in &self.event_catchers {
+            if catcher.regex.is_empty() {
+                bail!("event catcher regex must not be empty");
+            }
+            if !self.events.contains_key(&catcher.event) {
+                bail!("event catcher references unknown event {:?}", catcher.event);
+            }
+            if catcher.emitters.is_empty() {
+                bail!("event catcher for {:?} has no emitters", catcher.event);
+            }
+            let mut unique = HashSet::new();
+            for emitter in &catcher.emitters {
+                if !unique.insert(emitter) {
+                    bail!(
+                        "event catcher for {:?} repeats emitter {emitter:?}",
+                        catcher.event
+                    );
+                }
+                let configured = match emitter.as_str() {
+                    "discord" => self.event_emitters.discord.is_some(),
+                    "stdout" => self.event_emitters.stdout.is_some(),
+                    _ => false,
+                };
+                if !configured {
+                    bail!("event catcher references unknown emitter {emitter:?}");
+                }
+            }
+        }
+        regex::bytes::RegexSet::new(
+            self.event_catchers
+                .iter()
+                .map(|catcher| catcher.regex.as_str()),
+        )
+        .context("compile event catcher regex")?;
+        if let Some(discord) = &mut self.event_emitters.discord {
+            discord.channel_id = discord.channel_id.trim().to_owned();
+            discord.secret_from_env = discord.secret_from_env.trim().to_owned();
+            if discord.channel_id.is_empty() {
+                bail!("discord channel_id must not be empty");
+            }
+            if discord.secret_from_env.is_empty() {
+                bail!("discord secret_from_env must not be empty");
+            }
+        }
         Ok(())
     }
+}
+
+fn valid_event_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
 }
 
 fn valid_dns_label(value: &str) -> bool {
@@ -126,31 +222,34 @@ mod tests {
     #[test]
     fn defaults_are_admit_all_and_full_sample() {
         let config = Config::load(None).unwrap();
-        assert!(config.filters.is_empty());
         assert_eq!(config.sampling.percent, 100);
         assert_eq!(config.store.max_logs, 500);
-        assert_eq!(config.store.max_record_bytes, 64 * 1024);
-        assert_eq!(parse("version: 1\n").unwrap().sampling.percent, 100);
+        assert!(config.filters.namespaces.is_none());
+        assert_eq!(parse("{}\n").unwrap().sampling.percent, 100);
     }
 
     #[test]
     fn trims_and_accepts_exact_namespaces() {
-        let config = parse("version: 1\nsampling: { percent: 7 }\nfilters:\n- type: kubernetes-namespace\n  include: [' game-servers ', kube-system]\n").unwrap();
-        let FilterConfig::KubernetesNamespace { include } = &config.filters[0];
+        let config = parse("sampling: { percent: 7 }\nfilters:\n  namespaces:\n    include: [' game-servers ', kube-system]\n").unwrap();
+        let include = &config.filters.namespaces.as_ref().unwrap().include;
         assert_eq!(include, &["game-servers", "kube-system"]);
     }
 
     #[test]
     fn rejects_bad_contracts() {
         for yaml in [
-            "version: 2\n",
-            "version: 1\nsampling: { percent: 101 }\n",
-            "version: 1\nstore: { max_logs: 0 }\n",
-            "version: 1\nstore: { max_memory: 1MiB }\n",
-            "version: 1\nfilters: [{type: nope}]\n",
-            "version: 1\nfilters: [{type: kubernetes-namespace, include: []}]\n",
-            "version: 1\nfilters: [{type: kubernetes-namespace, include: [foo, foo]}]\n",
-            "version: 1\nfilters: [{type: kubernetes-namespace, include: ['Bad_Name']}]\n",
+            "version: 1\n",
+            "sampling: { percent: 101 }\n",
+            "store: { max_logs: 0 }\n",
+            "store: { max_memory: 1MiB }\n",
+            "store: { max_workloads: 12 }\n",
+            "store: { max_record_bytes: 64KiB }\n",
+            "filters: {kubernetes-namespace: {include: [foo]}}\n",
+            "filters: {namespaces: {include: []}}\n",
+            "filters: {namespaces: {include: [foo, foo]}}\n",
+            "filters: {namespaces: {include: ['Bad_Name']}}\n",
+            "event_emitters: {stdout: {nope: true}}\n",
+            "events: {joined: {type: info, message: hi}}\nevent_catchers: [{regex: hi, event: joined, emitters: [stdout]}]\n",
         ] {
             assert!(parse(yaml).is_err(), "accepted {yaml}");
         }
@@ -160,7 +259,7 @@ mod tests {
             .join(", ");
         assert!(
             parse(&format!(
-                "version: 1\nfilters: [{{type: kubernetes-namespace, include: [{names}]}}]\n"
+                "filters: {{namespaces: {{include: [{names}]}}}}\n"
             ))
             .is_err()
         );

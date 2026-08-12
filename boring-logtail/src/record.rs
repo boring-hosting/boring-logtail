@@ -132,6 +132,17 @@ pub enum Severity {
     Error,
 }
 
+impl std::fmt::Display for Severity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unknown => "unknown",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct LogRecord {
     pub(crate) sampling_seed: u64,
@@ -148,6 +159,10 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    pub fn stream(&self) -> StreamFileDescriptor {
+        self.stream
+    }
+
     pub fn enrichment(&self) -> &Enrichment {
         &self.enrichment
     }
@@ -166,6 +181,22 @@ impl LogRecord {
 
     pub fn severity(&self) -> Severity {
         self.severity
+    }
+
+    pub fn first_timestamp_ns(&self) -> u64 {
+        self.first_timestamp_ns
+    }
+
+    pub fn last_timestamp_ns(&self) -> u64 {
+        self.last_timestamp_ns
+    }
+
+    pub fn first_operation_id(&self) -> u64 {
+        self.first_operation_id
+    }
+
+    pub fn last_operation_id(&self) -> u64 {
+        self.last_operation_id
     }
 }
 

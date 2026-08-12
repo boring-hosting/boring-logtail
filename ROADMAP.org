@@ -62,8 +62,17 @@ and enriches them with Kubernetes identity.
   UID, container name and ID, stream, PID, and TID.
 - [ ] Retain deleted Pod identity long enough to classify late writes.
 - [X] Keep control-plane and filesystem lookups outside the capture hot path.
-- [X] Apply versioned namespace include filters after enrichment and scope Pod
+- [X] Apply namespace include filters after enrichment and scope Pod
   watches to the included namespaces on the current node.
+- [X] Compile event catchers once and hand matches to bounded Tokio emitter
+  actors without network backpressure on capture.
+- [X] Deliver static typed events to Discord with secrets sourced from the
+  environment.
+- [X] Deliver escaped one-line events to stdout through the same bounded actor
+  path.
+- [X] Share the exact final =LogRecord= across pipeline output, store, and event
+  emitters without lossy shadow payloads.
+- [ ] Add more key-selected emitters when a real use needs them.
 - [ ] Push filters into eBPF only when positive evidence can reject a write
   without turning Pod-cache lag into silent loss.
 - [ ] Design atomic transition semantics before adding dynamic filter reload.
@@ -78,6 +87,8 @@ and enriches them with Kubernetes identity.
 - [X] Select replay by workload, Pod, or namespace identity.
 - [X] Isolate slow subscribers and account for every ingress, eviction, replay,
   and subscriber-loss boundary.
+- [X] Expire retained records individually by monotonic age with =Ns=, =Nm=,
+  and =Nh= configuration.
 - [X] Benchmark ordinary allocation before considering a custom arena. See
   =spec/20260809-1626-bounded-replay-log-store.org=.
 

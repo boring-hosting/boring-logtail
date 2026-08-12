@@ -16,18 +16,22 @@ env_logger = { workspace = true }
 futures = "0.3"
 libc = { workspace = true }
 log = { workspace = true }
+regex = { version = "1", default-features = false, features = ["perf", "std", "unicode-perl"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 kube = { version = "4.2", features = ["runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { workspace = true, features = [
     "macros",
+    "io-std",
     "rt",
     "rt-multi-thread",
     "net",
     "signal",
     "sync",
     "time",
+    "test-util",
 ] }
 [build-dependencies]
 anyhow = { workspace = true }

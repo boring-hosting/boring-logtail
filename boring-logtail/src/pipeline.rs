@@ -31,9 +31,11 @@ use boring_logtail_common::WriteEvent;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::{
     enrichment::{Enricher, Enrichment},
+    event::EventCatcher,
     filter::{DropReason, WriteFilterPlan},
     record::{LogRecord, RecordFramer},
     sampling::OutputPolicy,
@@ -350,12 +352,19 @@ impl WriteAssembler {
     }
 }
 
+#[cfg(test)]
+impl Default for WriteAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum PipelineDecision {
     Pending,
     Dropped(DropReason),
     Records {
-        emitted: Vec<LogRecord>,
+        emitted: Vec<Arc<LogRecord>>,
         sampled: usize,
     },
 }
@@ -366,6 +375,7 @@ pub struct Pipeline {
     output_policy: OutputPolicy,
     filters: WriteFilterPlan,
     framer: RecordFramer,
+    event_catcher: Option<EventCatcher>,
 }
 
 impl Pipeline {
@@ -387,11 +397,17 @@ impl Pipeline {
             output_policy,
             filters,
             framer: RecordFramer::with_limits(
-                store_config.max_record_bytes,
+                limits.max_record_bytes,
                 limits.framing_lanes,
                 limits.framing_bytes,
             ),
+            event_catcher: None,
         }
+    }
+
+    pub fn with_event_catcher(mut self, event_catcher: EventCatcher) -> Self {
+        self.event_catcher = Some(event_catcher);
+        self
     }
 
     pub fn accept(&mut self, event: WriteEvent) -> Result<PipelineDecision, JoinWriteError> {
@@ -428,8 +444,12 @@ impl Pipeline {
         let emitted = records
             .into_iter()
             .filter_map(|mut record| {
+                record.sample_percent = self.output_policy.sample_percent().get();
+                let record = Arc::new(record);
+                if let Some(event_catcher) = &self.event_catcher {
+                    event_catcher.catch(record.clone());
+                }
                 if self.output_policy.should_emit(&record) {
-                    record.sample_percent = self.output_policy.sample_percent().get();
                     Some(record)
                 } else {
                     sampled += 1;
@@ -702,10 +722,8 @@ mod tests {
 
     #[test]
     fn namespace_filter_precedes_sampling_and_drops_unknown_identity() {
-        let mut config: crate::config::Config = serde_yaml::from_str(
-            "version: 1\nfilters: [{type: kubernetes-namespace, include: [payments]}]\n",
-        )
-        .unwrap();
+        let mut config: crate::config::Config =
+            serde_yaml::from_str("filters: {namespaces: {include: [payments]}}\n").unwrap();
         config.validate().unwrap();
         let mut pipeline = pipeline_with_config(
             CgroupSnapshot::default(),

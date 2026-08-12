@@ -199,7 +199,7 @@ One write can finish zero, one, or many =LogRecord= values. Sampling after
 framing cannot punch a hole into the middle of a line.
 
 The framer preserves opaque bytes across write boundaries. One record is capped
-at the configured =max_record_bytes=, 64 KiB by default. Container streams are
+at an internal 64 KiB safety bound. Container streams are
 internal framing lanes so bytes from different containers or descriptors are
 never joined. Aggregate pending bytes are derived from the store memory
 envelope; pressure emits an integrity-marked fragment instead of silently
@@ -346,6 +346,8 @@ The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
 - [[file:../boring-logtail/src/pipeline.rs][Write reconstruction and per-event pipeline]]
 - [[file:../boring-logtail/src/record.rs][Newline framing and record integrity]]
 - [[file:../boring-logtail/src/store.rs][Bounded retention and replay/live handoff]]
+- [[file:../boring-logtail/src/event.rs][Precompiled event catching]]
+- [[file:../boring-logtail/src/emitter.rs][Bounded asynchronous event delivery]]
 - [[file:../boring-logtail/src/main.rs][Userspace startup, ring-buffer transport, and temporary output]]
 - [[file:../k8s/boring-logtail.yaml][Kubernetes DaemonSet]]
 - [[file:../spec/20260801-0854-capture-boundary-hardening.org][Self-capture hardening spec]]
@@ -355,8 +357,24 @@ Retention belongs to a resolved Kubernetes workload UID, not an FD or container
 stream. A standalone Pod uses its Pod UID as its workload UID. One workload ring
 interleaves all Pod replicas in store order; Pod metadata remains on each record.
 Unresolved owner chains are rejected rather than guessed. Operators configure
-only =max_memory=, =max_workloads=, =max_logs=, and =max_record_bytes=; the last
-defaults to 64 KiB. Framing, ingress, replay, and subscriber bounds are derived
-internally. Slow subscriber reads release only delivery references—they never
+only =max_memory=, =max_logs=, and =retention=. Retention accepts whole seconds,
+minutes, or hours and expires each record from its monotonic store-admission
+instant. Workload admission and the 64 KiB framing
+limit are safety bounds derived or owned internally. Framing, ingress, replay,
+and subscriber bounds are derived internally. Slow subscriber reads release only delivery references—they never
 drain retained history. Severity remains =Unknown= until a classifier has
 evidence; stdout/stderr is not evidence.
+
+** Event catching without clogging capture
+
+One compiled regex set sees complete, identity-accepted records before output
+sampling. A match clones a tiny typed event into a bounded Tokio channel with
+=try_send=. The Discord worker owns network I/O. If delivery slows down, its
+queue fills and notifications are counted and dropped; log capture never waits
+for the internet or a slow output stream. The stdout emitter renders one quoted,
+escaped physical line; Discord performs HTTP delivery. Event messages are
+static context, while every caught event shares the exact final =LogRecord=
+that matched. Emitters therefore retain identity, provenance, timestamps,
+integrity, severity, and bytes without maintaining a lossy shadow record.
+Invalid UTF-8 is rendered explicitly as hexadecimal escapes instead of being
+silently replaced.

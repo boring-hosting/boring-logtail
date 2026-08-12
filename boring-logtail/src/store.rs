@@ -3,14 +3,18 @@
 //! Workload-owned bounded retention and gap-free replay/live handoff.
 
 use crate::enrichment::{Enrichment, KubernetesIdentity, WorkloadResolution};
-use crate::record::{FRAMING_LANE_CHARGE, LogRecord};
+use crate::record::{DEFAULT_MAX_RECORD_BYTES, FRAMING_LANE_CHARGE, LogRecord};
 use serde::{Deserialize, Deserializer};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     sync::Arc,
+    time::Duration,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    time::{Instant, MissedTickBehavior},
+};
 
 const RECORD_CHARGE: usize = 256;
 const WORKLOAD_CHARGE: usize = 2_048;
@@ -25,19 +29,17 @@ const MIN_MEMORY: usize = 32 * 1024 * 1024;
 pub struct StoreConfig {
     #[serde(deserialize_with = "deserialize_bytes")]
     pub max_memory: usize,
-    pub max_workloads: usize,
     pub max_logs: usize,
-    #[serde(deserialize_with = "deserialize_bytes")]
-    pub max_record_bytes: usize,
+    #[serde(deserialize_with = "deserialize_duration")]
+    pub retention: Duration,
 }
 
 impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             max_memory: 128 * 1024 * 1024,
-            max_workloads: 128,
             max_logs: 500,
-            max_record_bytes: 64 * 1024,
+            retention: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -49,6 +51,8 @@ pub(crate) struct StoreLimits {
     pub(crate) assembly_operations: usize,
     pub(crate) framing_bytes: usize,
     pub(crate) framing_lanes: usize,
+    pub(crate) max_record_bytes: usize,
+    workload_capacity: usize,
     ingress_bytes: usize,
     ingress_records: usize,
     replay_bytes: usize,
@@ -62,8 +66,11 @@ impl StoreConfig {
         if self.max_memory < MIN_MEMORY {
             return Err("store max_memory must be at least 32MiB");
         }
-        if self.max_workloads == 0 || self.max_logs == 0 || self.max_record_bytes == 0 {
-            return Err("store counts and max_record_bytes must be non-zero");
+        if self.max_logs == 0 {
+            return Err("store max_logs must be non-zero");
+        }
+        if self.retention.is_zero() {
+            return Err("store retention must be non-zero");
         }
         let part = |percent| self.max_memory / 100 * percent;
         let limits = StoreLimits {
@@ -74,13 +81,16 @@ impl StoreConfig {
             replay_bytes: part(40),
             subscriber_bytes: part(5) / MAX_SUBSCRIBERS,
             headroom_bytes: self.max_memory - part(95),
-            framing_lanes: self.max_workloads.saturating_mul(8).clamp(1, 4_096),
-            assembly_operations: self.max_workloads.saturating_mul(8).clamp(1, 4_096),
-            ingress_records: self.max_workloads.saturating_mul(4).clamp(16, 8_192),
+            framing_lanes: (part(3) / (DEFAULT_MAX_RECORD_BYTES + FRAMING_LANE_CHARGE)).max(1),
+            assembly_operations: (part(2) / WORKLOAD_CHARGE).max(1),
+            ingress_records: 0,
             subscriber_records: 0,
+            max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            workload_capacity: (part(40) / WORKLOAD_CHARGE).max(1),
         };
-        let one = self.max_record_bytes + RECORD_CHARGE + QUEUE_CHARGE;
+        let one = DEFAULT_MAX_RECORD_BYTES + RECORD_CHARGE + QUEUE_CHARGE;
         let limits = StoreLimits {
+            ingress_records: (limits.ingress_bytes / one).max(1),
             subscriber_records: (limits.subscriber_bytes / one)
                 .clamp(1, MAX_LIVE_RECORDS_PER_SUBSCRIBER),
             ..limits
@@ -94,7 +104,7 @@ impl StoreConfig {
             + limits.headroom_bytes;
         if limits.framing_lanes == 0
             || total > self.max_memory
-            || limits.framing_bytes < self.max_record_bytes + FRAMING_LANE_CHARGE
+            || limits.framing_bytes < DEFAULT_MAX_RECORD_BYTES + FRAMING_LANE_CHARGE
             || limits.ingress_bytes < one
             || limits.replay_bytes < one
             || limits.subscriber_bytes < one
@@ -109,7 +119,7 @@ impl StoreConfig {
             .into_iter()
             .any(|n| n > u32::MAX as usize)
         {
-            return Err("store max_memory is too small for max_record_bytes and internal buffers");
+            return Err("store max_memory is too small for internal record and delivery buffers");
         }
         Ok(limits)
     }
@@ -121,7 +131,7 @@ impl StoreConfig {
     pub fn derived_limits_summary(&self) -> Result<String, &'static str> {
         let limits = self.limits()?;
         Ok(format!(
-            "retained={} assembly={} framing={} ingress={} replay={} live_total={} headroom={} assembly_operations={} framing_lanes={} ingress_records={} subscribers={} live_records_per_subscriber={}",
+            "retained={} assembly={} framing={} ingress={} replay={} live_total={} headroom={} workload_capacity={} assembly_operations={} framing_lanes={} ingress_records={} subscribers={} live_records_per_subscriber={}",
             limits.retained_bytes,
             limits.assembly_bytes,
             limits.framing_bytes,
@@ -129,6 +139,7 @@ impl StoreConfig {
             limits.replay_bytes,
             limits.subscriber_bytes * MAX_SUBSCRIBERS,
             limits.headroom_bytes,
+            limits.workload_capacity,
             limits.assembly_operations,
             limits.framing_lanes,
             limits.ingress_records,
@@ -151,6 +162,30 @@ fn deserialize_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error>
             .ok_or_else(|| serde::de::Error::custom(format!("invalid byte size {text:?}"))),
     }
 }
+
+fn deserialize_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    let text = String::deserialize(d)?;
+    parse_duration(&text)
+        .ok_or_else(|| serde::de::Error::custom(format!("invalid duration {text:?}")))
+}
+
+fn parse_duration(value: &str) -> Option<Duration> {
+    let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        _ => return None,
+    };
+    value.checked_mul(multiplier).map(Duration::from_secs)
+}
 fn parse_bytes(value: &str) -> Option<usize> {
     let split = value
         .find(|c: char| !c.is_ascii_digit())
@@ -172,6 +207,7 @@ pub struct StoredRecord {
     sequence: StoreSequence,
     record: Arc<LogRecord>,
     accounted_bytes: usize,
+    retained_at: Instant,
 }
 impl StoredRecord {
     pub fn accounted_bytes(&self) -> usize {
@@ -217,6 +253,7 @@ pub struct StoreStats {
     pub accepted_records: u64,
     pub per_workload_evictions: u64,
     pub global_budget_evictions: u64,
+    pub retention_evictions: u64,
     pub workload_limit_rejections: u64,
     pub unresolved_workload_rejections: u64,
     pub retained_record_rejections: u64,
@@ -299,13 +336,17 @@ impl LogStore {
             commands,
             ingress: ingress.clone(),
             ingress_bytes: limits.ingress_bytes,
-            max_record_bytes: config.max_record_bytes,
+            max_record_bytes: limits.max_record_bytes,
             stats,
         };
         tokio::spawn(run(State::new(config, limits, stats_sender), receiver));
         store
     }
-    pub fn try_append(&self, record: LogRecord) -> Result<(), TryAppendError> {
+    pub fn try_append<R>(&self, record: R) -> Result<(), TryAppendError>
+    where
+        R: Into<Arc<LogRecord>>,
+    {
+        let record = record.into();
         if record.bytes().len() > self.max_record_bytes {
             return Err(TryAppendError::RecordTooLarge);
         }
@@ -319,7 +360,7 @@ impl LogStore {
             .try_acquire_many_owned(charge as u32)
             .map_err(|_| TryAppendError::IngressByteLimit)?;
         self.commands
-            .try_send(Command::Append(Box::new(record), permit))
+            .try_send(Command::Append(record, permit))
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Closed(_) => TryAppendError::StoreClosed,
                 mpsc::error::TrySendError::Full(_) => TryAppendError::IngressFull,
@@ -348,7 +389,7 @@ impl LogStore {
 }
 
 enum Command {
-    Append(Box<LogRecord>, OwnedSemaphorePermit),
+    Append(Arc<LogRecord>, OwnedSemaphorePermit),
     Subscribe(
         Selector,
         oneshot::Sender<Result<ReplaySession, SubscribeError>>,
@@ -399,7 +440,12 @@ impl State {
             stats_sender,
         }
     }
-    fn append(&mut self, record: LogRecord) {
+    fn append(&mut self, record: Arc<LogRecord>) {
+        self.expire(Instant::now());
+        self.append_at(record, Instant::now());
+    }
+
+    fn append_at(&mut self, record: Arc<LogRecord>, retained_at: Instant) {
         let Some((workload, pod)) =
             identity(&record).and_then(|id| workload_uid(id).map(|w| (w, id.pod_uid.clone())))
         else {
@@ -412,15 +458,16 @@ impl State {
             self.stats.retained_record_rejections += 1;
             return;
         }
-        if new && self.workloads.len() >= self.config.max_workloads {
+        if new && self.workloads.len() >= self.limits.workload_capacity {
             self.stats.workload_limit_rejections += 1;
             return;
         }
         self.next += 1;
         let stored = Arc::new(StoredRecord {
             sequence: self.next,
-            record: Arc::new(record),
+            record,
             accounted_bytes: charge,
+            retained_at,
         });
         if new {
             self.workloads.insert(
@@ -441,18 +488,18 @@ impl State {
         self.global
             .insert(self.next, (workload.clone(), stored.clone()));
         while self.workloads[&workload].records.len() > self.config.max_logs {
-            self.evict(&workload, true);
+            self.evict(&workload, EvictionReason::PerWorkload);
         }
         while self.retained_bytes > self.limits.retained_bytes {
             let Some(workload) = self.global.first_key_value().map(|(_, (w, _))| w.clone()) else {
                 break;
             };
-            self.evict(&workload, false);
+            self.evict(&workload, EvictionReason::GlobalBudget);
         }
         self.stats.accepted_records += 1;
         self.publish(stored);
     }
-    fn evict(&mut self, workload: &str, per_workload: bool) {
+    fn evict(&mut self, workload: &str, reason: EvictionReason) {
         let removed = self
             .workloads
             .get_mut(workload)
@@ -468,10 +515,10 @@ impl State {
                     self.pod_counts.remove(&id.pod_uid);
                 }
             }
-            if per_workload {
-                self.stats.per_workload_evictions += 1
-            } else {
-                self.stats.global_budget_evictions += 1
+            match reason {
+                EvictionReason::PerWorkload => self.stats.per_workload_evictions += 1,
+                EvictionReason::GlobalBudget => self.stats.global_budget_evictions += 1,
+                EvictionReason::Retention => self.stats.retention_evictions += 1,
             }
         }
         if self
@@ -483,7 +530,25 @@ impl State {
             self.retained_bytes -= WORKLOAD_CHARGE;
         }
     }
+
+    fn expire(&mut self, now: Instant) {
+        loop {
+            let expired = self
+                .global
+                .first_key_value()
+                .filter(|(_, (_, record))| {
+                    now.saturating_duration_since(record.retained_at) >= self.config.retention
+                })
+                .map(|(_, (workload, _))| workload.clone());
+            let Some(workload) = expired else {
+                break;
+            };
+            self.evict(&workload, EvictionReason::Retention);
+        }
+    }
+
     fn subscribe(&mut self, selector: Selector) -> Result<ReplaySession, SubscribeError> {
+        self.expire(Instant::now());
         self.subscribers.retain(|s| !s.sender.is_closed());
         let slot = self.slots.clone().try_acquire_owned().map_err(|_| {
             self.stats.subscriber_limit_rejections += 1;
@@ -566,11 +631,33 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EvictionReason {
+    PerWorkload,
+    GlobalBudget,
+    Retention,
+}
+
 async fn run(mut state: State, mut rx: mpsc::Receiver<Command>) {
     let mut replies = vec![];
-    while let Some(command) = rx.recv().await {
+    let cadence = state.config.retention.min(Duration::from_secs(1));
+    let mut expiry = tokio::time::interval(cadence);
+    expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    expiry.tick().await;
+    loop {
+        let command = tokio::select! {
+            command = rx.recv() => command,
+            _ = expiry.tick() => {
+                state.expire(Instant::now());
+                state.publish_stats();
+                continue;
+            }
+        };
+        let Some(command) = command else {
+            break;
+        };
         match command {
-            Command::Append(record, _permit) => state.append(*record),
+            Command::Append(record, _permit) => state.append(record),
             Command::Subscribe(s, tx) => {
                 let _ = tx.send(state.subscribe(s));
             }
@@ -584,7 +671,7 @@ async fn run(mut state: State, mut rx: mpsc::Receiver<Command>) {
     }
     while let Some(command) = rx.recv().await {
         match command {
-            Command::Append(record, _) => state.append(*record),
+            Command::Append(record, _) => state.append(record),
             Command::Subscribe(_, tx) => {
                 let _ = tx.send(Err(SubscribeError::StoreClosed));
             }
@@ -666,14 +753,13 @@ mod tests {
         pipeline::StreamFileDescriptor,
         record::{RecordIntegrity, Severity},
     };
-    use std::{sync::Arc, time::Instant};
+    use std::sync::Arc;
 
     fn config() -> StoreConfig {
         StoreConfig {
             max_memory: 32 * 1024 * 1024,
-            max_workloads: 4,
             max_logs: 2,
-            max_record_bytes: 64 * 1024,
+            retention: Duration::from_secs(60 * 60),
         }
     }
 
@@ -716,13 +802,36 @@ mod tests {
 
     #[test]
     fn sizes_and_defaults() {
-        let c: StoreConfig = serde_yaml::from_str(
-            "max_memory: 128MiB\nmax_workloads: 128\nmax_logs: 500\nmax_record_bytes: 64KiB",
-        )
-        .unwrap();
+        let c: StoreConfig =
+            serde_yaml::from_str("max_memory: 128MiB\nmax_logs: 500\nretention: 15m").unwrap();
         assert_eq!(c.max_memory, 128 << 20);
         assert_eq!(c.max_logs, 500);
+        assert_eq!(c.retention, Duration::from_secs(15 * 60));
+        for (text, expected) in [
+            ("1s", Duration::from_secs(1)),
+            ("12m", Duration::from_secs(12 * 60)),
+            ("3h", Duration::from_secs(3 * 60 * 60)),
+        ] {
+            let parsed: StoreConfig = serde_yaml::from_str(&format!("retention: {text}")).unwrap();
+            assert_eq!(parsed.retention, expected);
+        }
+        for invalid in [
+            "0s",
+            "1",
+            "1d",
+            "1H",
+            "1.5h",
+            "1h30m",
+            " 1h",
+            "18446744073709551615h",
+        ] {
+            assert!(
+                serde_yaml::from_str::<StoreConfig>(&format!("retention: {invalid:?}")).is_err()
+            );
+        }
         for removed in [
+            "max_workloads: 128",
+            "max_record_bytes: 64KiB",
             "retained_bytes: 4",
             "records_per_source: 4",
             "framer_pending_bytes: 4",
@@ -823,20 +932,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workload_admission_limit_fails_closed() {
+    async fn workload_capacity_is_derived_from_memory() {
+        let small = config().limits().unwrap().workload_capacity;
+        let large = StoreConfig {
+            max_memory: 64 * 1024 * 1024,
+            ..config()
+        }
+        .limits()
+        .unwrap()
+        .workload_capacity;
+        assert!(small > 1);
+        assert!((small * 2..=small * 2 + 1).contains(&large));
+    }
+
+    #[test]
+    fn retention_expires_mixed_ages_and_cleans_identity_accounting() {
+        let mut config = config();
+        config.retention = Duration::from_secs(10);
+        let limits = config.limits().unwrap();
+        let (stats_sender, _) = watch::channel(StoreStats::default());
+        let mut state = State::new(config, limits, stats_sender);
+        let now = Instant::now();
+        state.append_at(
+            record("workload-1", "pod-old", 8).into(),
+            now - Duration::from_secs(11),
+        );
+        state.append_at(
+            record("workload-1", "pod-young", 8).into(),
+            now - Duration::from_secs(9),
+        );
+
+        state.expire(now);
+
+        assert_eq!(state.global.len(), 1);
+        assert_eq!(state.stats.retention_evictions, 1);
+        assert!(!state.pod_counts.contains_key("pod-old"));
+        assert_eq!(state.pod_counts["pod-young"], 1);
+        state.expire(now + Duration::from_secs(1));
+        assert!(state.global.is_empty());
+        assert!(state.workloads.is_empty());
+        assert!(state.pod_counts.is_empty());
+        assert_eq!(state.stats.retention_evictions, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_actor_expires_history_but_existing_replay_refs_survive() {
         let store = LogStore::spawn(StoreConfig {
-            max_workloads: 1,
+            retention: Duration::from_secs(2),
             ..config()
         });
         store.try_append(record("workload-1", "pod-a", 8)).unwrap();
-        store.try_append(record("workload-2", "pod-b", 8)).unwrap();
-
+        tokio::task::yield_now().await;
         let replay = store
-            .subscribe(Selector::Namespace("games".into()))
+            .subscribe(Selector::WorkloadUid("workload-1".into()))
             .await
             .unwrap();
-        assert_eq!(sequences(&replay), vec![1]);
-        assert_eq!(store.stats().workload_limit_rejections, 1);
+        assert_eq!(replay.replay.len(), 1);
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        let fresh = store
+            .subscribe(Selector::WorkloadUid("workload-1".into()))
+            .await
+            .unwrap();
+
+        assert!(fresh.replay.is_empty());
+        assert_eq!(replay.replay[0].record().bytes(), &[b'x'; 8]);
+        assert_eq!(store.stats().retention_evictions, 1);
+        store.shutdown().await;
     }
 
     #[tokio::test]
@@ -877,10 +1040,15 @@ mod tests {
         let retained_limit = cfg.limits().unwrap().retained_bytes;
         let store = LogStore::spawn(cfg);
         for _ in 0..256 {
-            store
-                .try_append(record("workload-1", "pod-a", 64 * 1024))
-                .unwrap();
-            tokio::task::yield_now().await;
+            loop {
+                match store.try_append(record("workload-1", "pod-a", 64 * 1024)) {
+                    Ok(()) => break,
+                    Err(TryAppendError::IngressFull | TryAppendError::IngressByteLimit) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("append failed: {error}"),
+                }
+            }
         }
         let replay = store
             .subscribe(Selector::WorkloadUid("workload-1".into()))
@@ -966,9 +1134,8 @@ mod tests {
             for workloads in [1, 32, 128] {
                 let store = LogStore::spawn(StoreConfig {
                     max_memory: 128 * 1024 * 1024,
-                    max_workloads: workloads,
                     max_logs: 500,
-                    max_record_bytes: 64 * 1024,
+                    retention: Duration::from_secs(60 * 60),
                 });
                 let started = Instant::now();
                 let mut latencies = Vec::with_capacity(OPERATIONS);

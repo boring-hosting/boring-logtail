@@ -28,18 +28,38 @@ metadata:
     app.kubernetes.io/part-of: boring-logtail
 data:
   config.yaml: |
-    version: 1
     sampling:
       percent: 100
+
     store:
       max_memory: 128MiB
-      max_workloads: 128
       max_logs: 500
-      max_record_bytes: 64KiB
+      retention: 1h
+
     filters:
-      - type: kubernetes-namespace
+      namespaces:
         include:
           - game-servers
+          - biomehub
+
+    events:
+      joined:
+        type: info
+        message: "Someone has joined!"
+      error:
+        type: error
+        message: "An error occurred!"
+
+    event_catchers:
+      - regex: '(?i)\bjoined\b'
+        event: joined
+        emitters: [stdout]
+      - regex: '(?i)\berror\b'
+        event: error
+        emitters: [stdout]
+
+    event_emitters:
+      stdout: {}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

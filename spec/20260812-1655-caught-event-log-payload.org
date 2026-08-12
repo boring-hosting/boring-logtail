@@ -1,0 +1,72 @@
+#+title: Caught events carry the caught log
+#+date: 2026-08-12 16:55 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-12 after maintainer approval.
+
+This amends =20260812-1405-lean-config-event-catchers.org= and
+=20260812-1631-stdout-event-emitter.org=. A static event message without the
+matched log is not an actionable event.
+
+* Contract
+
+Every =CaughtEvent= carries =Arc<LogRecord>=: the final immutable pipeline
+record that matched its catcher, alongside only the configured event
+definition. Fanout, storage, and sampled output share that same record object.
+There is no shadow event payload copying selected fields and inevitably losing
+identity, provenance, timestamps, integrity, severity, or future record data.
+
+The record is the exact framed record presented to the compiled regex set. It
+does not contain adjacent records, incomplete framing state, or regex capture
+groups.
+
+* Rendering
+
+Stdout always renders the event definition and useful complete record context:
+
+#+begin_example
+event="error" type=error message="An error occurred!" k8s="games/game-1/server" pod_uid="p1" node="n1" container_id="containerd://..." workload="apps/v1/Deployment/game:d1" stream="stderr-candidate" severity=unknown first_timestamp_ns=1 last_timestamp_ns=1 first_operation_id=2 last_operation_id=2 sample_percent=100 integrity="RecordIntegrity { ... }" log="database connection refused"
+#+end_example
+
+The byte renderer preserves readable UTF-8, escapes quotes, backslashes,
+newlines, carriage returns, tabs, and controls, and renders invalid UTF-8 bytes
+as =\xNN=. One event remains one physical line without pretending invalid bytes
+were valid text.
+
+Discord content is the configured message followed by =log: = and the same
+escaped caught bytes. Content is bounded before the HTTP request; oversized
+logs are cut at a character boundary and receive an explicit =...[truncated]=
+marker. Stdout retains the complete caught record subject only to the existing
+internal record-size bound.
+
+* Acceptance
+
+- A match places the exact final =Arc<LogRecord>= into =CaughtEvent=.
+- Pipeline output, storage, and multi-emitter fanout share the record object.
+- Stdout includes Kubernetes identity, provenance, timestamps, operation range,
+  sampling, severity, integrity, and log bytes from that record.
+- Stdout contains the actual caught UTF-8 log on one physical line.
+- Control characters and invalid UTF-8 have deterministic lossless escaping.
+- Discord contains both configured context and the caught log.
+- Oversized Discord content is visibly truncated within its configured bound.
+- README, field guide, and prior event specs no longer describe static-only
+  payload delivery.
+
+* TODO
+
+- [X] C1 Carry shared matched record bytes in every caught event.
+- [X] C2 Add exact byte escaping and include the log in stdout output.
+- [X] C3 Include bounded, visibly truncated caught logs in Discord content.
+- [X] C4 Cover payload identity, UTF-8, controls, invalid bytes, fanout, and
+  Discord truncation.
+- [X] C5 Update README, field guide, and amended event specs.
+- [X] C6 Pass workspace tests, strict Clippy, formatting, and diff checks.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 83 tests and one ignored manual
+  benchmark.
+- Strict userspace/shared Clippy passed with warnings denied.
+- Formatting and =git diff --check= passed.

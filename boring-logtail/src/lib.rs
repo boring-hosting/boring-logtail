@@ -2,7 +2,9 @@
 
 pub mod cgroup_resolver;
 pub mod config;
+pub mod emitter;
 pub mod enrichment;
+pub mod event;
 pub mod filter;
 pub mod k8s_watch;
 pub mod pipeline;

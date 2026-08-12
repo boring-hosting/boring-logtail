@@ -1,0 +1,74 @@
+#+title: Standard-output event emitter
+#+date: 2026-08-12 16:31 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-12 after maintainer approval.
+
+* Goal
+
+Add the smallest useful local event destination without creating a second
+delivery path.
+
+* Configuration
+
+#+begin_src yaml
+event_catchers:
+  - regex: '(?i)\bjoined\b'
+    event: joined
+    emitters: [stdout]
+
+event_emitters:
+  stdout: {}
+#+end_src
+
+The =stdout= map key selects the built-in emitter. Its configuration is an
+empty map; unknown fields fail startup. A catcher may target =stdout= alone or
+fan out to =stdout= and =discord=.
+
+* Delivery
+
+Stdout uses the existing bounded Tokio MPSC actor boundary. The pipeline only
+performs =try_send= and never writes to a file descriptor. The worker owns
+Tokio stdout and emits exactly one UTF-8 line for each accepted event:
+
+#+begin_example
+event="joined" type=info message="Someone has joined!" log="player-7 joined"
+#+end_example
+
+Names, messages, and caught log bytes use quoted escaping. Newlines, carriage
+returns, quotes, backslashes, invalid UTF-8, and control characters therefore
+cannot fabricate a second physical line or another field. =EventType= renders
+as the stable lowercase configuration spelling. See
+=20260812-1655-caught-event-log-payload.org= for the amended payload contract.
+
+Each line is written as one prepared byte buffer and flushed through the
+buffered Tokio stdout handle. Write failures increment the shared delivery
+failure counter and close that stdout worker; capture and other emitters
+continue. Queue saturation remains observable through catcher counters.
+
+* Acceptance
+
+- =event_emitters: {stdout: {}}= parses and can be referenced by catchers.
+- Missing stdout configuration and unknown stdout fields fail validation.
+- Info, warning, and error render with stable lowercase spellings.
+- Quotes, slashes, newlines, and controls remain one physical output line.
+- One catcher can fan out to stdout and Discord through the same matcher.
+- Writer failure is counted without panicking or blocking the pipeline.
+- README, field guide, roadmap, and deferred-work index stay accurate.
+
+* TODO
+
+- [X] S1 Add the key-selected empty stdout configuration and validation.
+- [X] S2 Implement stable one-line rendering and the bounded stdout actor.
+- [X] S3 Cover rendering, actor delivery/failure, and emitter fanout.
+- [X] S4 Update README, field guide, roadmap, and deferred-work index.
+- [X] S5 Pass workspace tests, strict Clippy, formatting, and diff checks.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 81 tests and one ignored manual
+  benchmark.
+- Strict userspace/shared Clippy passed with warnings denied.
+- Formatting and =git diff --check= passed.

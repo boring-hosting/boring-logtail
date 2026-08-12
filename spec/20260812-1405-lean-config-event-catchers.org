@@ -1,0 +1,169 @@
+#+title: Lean configuration and asynchronous event catchers
+#+date: 2026-08-12 14:05 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-12 after maintainer approval.
+
+This replaces the public configuration surface in
+=20260809-1905-workload-store-product-contract.org=. Its storage and memory
+safety invariants remain in force; implementation bounds stop leaking into
+operator YAML.
+
+* Goal
+
+Keep configuration about things a human actually wants to choose. Add a fast
+event path that recognizes interesting, accepted log records synchronously and
+hands delivery to bounded Tokio actors without holding up capture.
+
+* Configuration
+
+#+begin_src yaml
+sampling:
+  percent: 100
+
+store:
+  max_memory: 128MiB
+  max_logs: 500
+
+filters:
+  namespaces:
+    include: [game-servers]
+
+events:
+  joined:
+    type: info
+    message: "Someone has joined!"
+
+event_catchers:
+  - regex: '(?i)\bjoined\b'
+    event: joined
+    emitters: [discord]
+
+event_emitters:
+  discord:
+    channel_id: "123456789"
+    secret_from_env: WOW_MY_DISCORD_SECRET
+#+end_src
+
+- There is no configuration version until incompatible formats actually exist
+  in the wild and need migration.
+- =max_memory= is the store memory envelope. =max_logs= is the per-workload
+  retention ceiling.
+- Workload count and maximum framed-record size are derived, bounded internals.
+  They are not operator choices. A new workload may be rejected only when the
+  memory envelope cannot admit it; there is no arbitrary configured workload
+  count.
+- Keys below =filters= select a built-in filter. =namespaces= means exact
+  Kubernetes namespace inclusion in the Kubernetes capture application; the
+  redundant =type: kubernetes-namespace= spelling is removed.
+- Keys below =event_emitters= select the built-in emitter and are also the
+  names referenced by catchers. The first contract permits one configured
+  instance of each built-in kind. Discord is the first implemented kind.
+- =secret_from_env= names an environment variable. Configuration never accepts
+  the secret itself and diagnostics never print its value.
+
+Unknown fields, filter keys, emitter keys, event references, emitter
+references, duplicate references, empty expressions, invalid regular
+expressions, invalid event names, and missing/empty secret environment
+variables fail startup with a concise error.
+
+* Event model
+
+An event definition has a user-chosen name and a statically typed severity.
+The initial =EventType= values are =info=, =warning=, and =error=. The name is
+the stable configured identity; the type describes its meaning to emitters.
+
+The definition's static =message= supplies context. Every caught event also
+carries the complete framed log bytes that matched, as specified by
+=20260812-1655-caught-event-log-payload.org=. Regex capture interpolation is
+deliberately absent until its missing-group semantics have a separate contract.
+Log bytes remain the matching input and are never rewritten by event handling.
+
+* Catching path
+
+Catchers are compiled together once at startup with BurntSushi's regex engine.
+No expression is compiled and no configuration is searched on each record.
+The matcher returns the configured catcher identities that match one complete
+framed record.
+
+Matching occurs after syscall reconstruction, enrichment, configured source
+filtering, and record framing. Only records with accepted, resolved Kubernetes
+identity are eligible. It occurs before ordinary output sampling so sampling
+cannot silently disable alerts. A record may match several catchers, and one
+catcher may target several configured emitters.
+
+The pipeline owns an =EventCatcher= handle. For each match it performs a
+nonblocking bounded =try_send= of a small owned =CaughtEvent=. It never awaits
+network I/O. Full or closed queues are observable with separate counters and do
+not stall capture, storage, or other emitters.
+
+* Emitter actors
+
+Each configured emitter owns a bounded Tokio MPSC receiver and one spawned
+worker. The sending handle is cheap to clone and the receiver plus network
+client stay inside the worker. Shutdown closes senders, drains already accepted
+events up to a bounded deadline, and then joins the workers.
+
+The Discord worker posts a bot message to the configured channel using the bot
+token read from =secret_from_env=. HTTP success and failure are explicit;
+responses and logs must not expose authorization material. HTTP/TLS is the one
+place where a focused crate is preferable to hand-rolled protocol code.
+
+* Bounds and allocation
+
+- Store indexes, actor queues, and matcher state reserve known capacity at
+  startup where their bounds are known.
+- Variable-size log and message payloads remain honestly variable-size; the
+  implementation does not claim that Rust collections can be permanently
+  length-fixed while storing arbitrary log bytes.
+- Store, incomplete framing, event queues, and delivery payloads are included
+  in memory accounting or assigned explicit fixed bounds beneath
+  =max_memory=.
+- Event delivery overload loses event notifications explicitly. It never grows
+  an unbounded queue and never applies network backpressure to eBPF capture.
+
+* Non-goals
+
+- User-loaded emitter plugins or arbitrary emitter type strings.
+- Multiple instances of the same emitter kind.
+- Regex capture interpolation in messages.
+- Guaranteed event delivery or an on-disk retry queue.
+- Inferring event severity from stdout or stderr.
+
+* Acceptance
+
+- The example configuration above parses without =version=, =max_workloads=,
+  =max_record_bytes=, or filter/emitter =type= tags.
+- Removed fields fail with useful migration errors rather than being ignored.
+- All catchers compile once at startup and matching performs no regex
+  compilation.
+- Namespace-rejected and unresolved records cannot produce events.
+- Output sampling does not suppress an otherwise accepted caught event.
+- Pipeline processing remains nonblocking when an emitter is slow, failed, or
+  full.
+- Discord delivery is covered with a local fake HTTP endpoint; tests never call
+  Discord and never require a real secret.
+- Queue saturation, invalid references, secret handling, shutdown, and
+  multi-catcher/multi-emitter fanout are tested.
+- The field guide, README example, roadmap, and deliberately deferred work stay
+  synchronized with the shipped behavior.
+
+* TODO
+
+- [X] E1 Replace the leaked configuration contract and its migration tests.
+- [X] E2 Implement typed events and one startup-compiled catcher set.
+- [X] E3 Implement bounded emitter actors and Discord delivery.
+- [X] E4 Attach nonblocking catching to the accepted pipeline path.
+- [X] E5 Update the field guide, README, roadmap, and deferred-work index.
+- [X] E6 Pass focused tests, workspace tests, Clippy, formatting, and memory
+  bound validation.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 76 tests, one ignored manual benchmark.
+- Strict userspace/shared Clippy passed with warnings denied.
+- Formatting and =git diff --check= passed.
+- Store derivation tests prove the configured envelope contains every derived
+  pool; Discord uses a loopback fake server and no external service.

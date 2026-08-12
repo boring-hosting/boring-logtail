@@ -2,10 +2,7 @@
 
 //! Small immutable projections of the configured capture policy.
 
-use crate::{
-    config::{Config, FilterConfig},
-    enrichment::Enrichment,
-};
+use crate::{config::Config, enrichment::Enrichment};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,15 +32,11 @@ pub enum DropReason {
 
 impl FilterPlan {
     pub fn compile(config: &Config) -> Self {
-        let mut namespaces: Option<BTreeSet<String>> = None;
-        for filter in &config.filters {
-            let FilterConfig::KubernetesNamespace { include } = filter;
-            let current = include.iter().cloned().collect::<BTreeSet<_>>();
-            namespaces = Some(match namespaces {
-                Some(previous) => previous.intersection(&current).cloned().collect(),
-                None => current,
-            });
-        }
+        let namespaces = config
+            .filters
+            .namespaces
+            .as_ref()
+            .map(|filter| filter.include.iter().cloned().collect::<BTreeSet<_>>());
         let pod_watch = namespaces
             .as_ref()
             .map_or(PodWatchPlan::AllNamespaces, |set| {
@@ -89,24 +82,20 @@ mod tests {
         let all = FilterPlan::compile(&Config::default());
         assert_eq!(all.pod_watch, PodWatchPlan::AllNamespaces);
 
-        let mut config: Config = serde_yaml::from_str(
-            "version: 1\nfilters:\n- type: kubernetes-namespace\n  include: [zebra, alpha]\n- type: kubernetes-namespace\n  include: [beta, alpha]\n",
-        )
-        .unwrap();
+        let mut config: Config =
+            serde_yaml::from_str("filters:\n  namespaces:\n    include: [zebra, alpha]\n").unwrap();
         config.validate().unwrap();
         let scoped = FilterPlan::compile(&config);
         assert_eq!(
             scoped.pod_watch,
-            PodWatchPlan::Namespaces(vec!["alpha".into()])
+            PodWatchPlan::Namespaces(vec!["alpha".into(), "zebra".into()])
         );
     }
 
     #[test]
     fn namespace_filter_distinguishes_identity_outcomes() {
-        let mut config: Config = serde_yaml::from_str(
-            "version: 1\nfilters: [{type: kubernetes-namespace, include: [yes]}]\n",
-        )
-        .unwrap();
+        let mut config: Config =
+            serde_yaml::from_str("filters: {namespaces: {include: [yes]}}\n").unwrap();
         config.validate().unwrap();
         let plan = FilterPlan::compile(&config);
         assert_eq!(plan.pod_watch, PodWatchPlan::Namespaces(vec!["yes".into()]));
