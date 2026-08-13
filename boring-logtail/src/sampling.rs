@@ -127,6 +127,7 @@ mod tests {
 
     fn record(number: u64) -> LogRecord {
         LogRecord {
+            observed_at: "2026-08-12T18:00:00Z".parse().unwrap(),
             sampling_seed: 456,
             stream: StreamFileDescriptor::Stderr,
             enrichment: Enrichment::UnresolvedCgroup,

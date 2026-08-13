@@ -1,0 +1,71 @@
+#+title: Compact Discord event embeds
+#+date: 2026-08-12 18:59 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved by the maintainer on 2026-08-12.
+
+* Goal
+
+Make Discord alerts readable at a glance. Discord is an alert destination, not
+a dump of every internal =LogRecord= field.
+
+* Record time
+
+The existing kernel =timestamp_ns= comes from =bpf_ktime_get_ns=: monotonic
+time since boot, not wall-clock Unix time. Relabeling it as a human timestamp
+would be false. =LogRecord= therefore gains one userspace =observed_at= UTC
+timestamp when framing finalizes the immutable record. Emitters use that one
+time; kernel timing remains available internally for ordering and sampling.
+
+Use BurntSushi's =jiff= crate for an exact RFC 3339 timestamp rather than
+hand-rolling calendar arithmetic.
+
+* Discord shape
+
+Discord sends one rich embed with:
+
+- configured event message as the title;
+- color selected from event type: blue info, amber warning, red error;
+- the caught log as the description in a code block;
+- compact fields for namespace, Pod, container, and stream when resolved; and
+- =observed_at= as the embed timestamp, letting Discord render local time.
+
+Do not send container ID, Pod UID, workload, node, operation IDs, sample
+percentage, record severity, raw monotonic nanoseconds, or clean integrity
+flags. The event definition already supplies severity. Integrity is omitted
+from Discord entirely for now; its loss markers remain on =LogRecord= and in
+diagnostics.
+
+Unresolved identity renders one small =Source= field from the existing honest
+enrichment description. Invalid UTF-8 and control bytes are escaped. Markdown
+fences inside logs are neutralized. Description truncation is explicit and
+stays within Discord embed limits. =allowed_mentions.parse= is empty so caught
+logs cannot ping users or roles.
+
+Stdout remains a diagnostic emitter and may retain the detailed one-line
+record rendering.
+
+* Acceptance
+
+- Discord requests use an embed rather than raw content.
+- Error, warning, and info produce stable distinct colors.
+- Resolved alerts contain only title, log, namespace, Pod, container, stream,
+  and one RFC 3339 timestamp.
+- Forbidden identity/internal fields are absent from serialized Discord JSON.
+- Logs cannot break their code block or create Discord mentions.
+- Oversized and invalid-byte logs render safely with visible truncation.
+- README and field guide show the compact alert contract.
+
+* TODO
+
+- [X] D1 Add one honest UTC observation time to finalized =LogRecord=.
+- [X] D2 Replace Discord content rendering with compact typed embeds.
+- [X] D3 Escape code blocks, suppress mentions, and bound descriptions.
+- [X] D4 Cover colors, resolved/unresolved identity, forbidden fields,
+  timestamp, binary logs, and truncation.
+- [X] D5 Update README and field guide.
+- [X] D6 Pass workspace tests, strict Clippy, formatting, and diff checks.
+- [X] D7 Inspect every =game-servers= workload and tune the joined catcher from
+  observed log evidence.

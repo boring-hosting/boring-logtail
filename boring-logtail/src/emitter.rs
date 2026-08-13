@@ -26,8 +26,11 @@ use tokio::{
 const EMITTER_QUEUE_CAPACITY: usize = 128;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCORD_API: &str = "https://discord.com/api/v10";
-const DISCORD_CONTENT_CHARS: usize = 2_000;
+const DISCORD_DESCRIPTION_CHARS: usize = 4_096;
 const TRUNCATED: &str = "...[truncated]";
+const INFO_COLOR: u32 = 0x3b82f6;
+const WARNING_COLOR: u32 = 0xf59e0b;
+const ERROR_COLOR: u32 = 0xef4444;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EmitterStats {
@@ -187,19 +190,50 @@ fn quote_bytes(bytes: &[u8]) -> String {
     quoted
 }
 
-fn discord_content(event: &CaughtEvent) -> String {
-    let content = format!(
-        "{}\n{}",
-        event.definition.message,
-        render_record(&event.record)
-    );
-    if content.chars().count() <= DISCORD_CONTENT_CHARS {
-        return content;
+fn discord_message(event: &CaughtEvent) -> DiscordMessage {
+    let record = &event.record;
+    let quoted_log = quote_bytes(record.bytes());
+    let mut log = quoted_log[1..quoted_log.len() - 1].replace('`', "ˋ");
+    let wrapper_chars = "```text\n\n```".chars().count();
+    let available = DISCORD_DESCRIPTION_CHARS - wrapper_chars;
+    if log.chars().count() > available {
+        let keep = available - TRUNCATED.chars().count();
+        log = log.chars().take(keep).collect();
+        log.push_str(TRUNCATED);
     }
-    let keep = DISCORD_CONTENT_CHARS - TRUNCATED.chars().count();
-    let mut truncated = content.chars().take(keep).collect::<String>();
-    truncated.push_str(TRUNCATED);
-    truncated
+    let mut fields = Vec::with_capacity(4);
+    match record.enrichment() {
+        crate::enrichment::Enrichment::Enriched(identity)
+        | crate::enrichment::Enrichment::Stale(identity) => {
+            fields.push(DiscordField::inline("Namespace", &identity.namespace));
+            fields.push(DiscordField::inline("Pod", &identity.pod_name));
+            fields.push(DiscordField::inline("Container", &identity.container_name));
+        }
+        enrichment => fields.push(DiscordField::inline("Source", enrichment.description())),
+    }
+    fields.push(DiscordField::inline(
+        "Stream",
+        match record.stream() {
+            crate::pipeline::StreamFileDescriptor::Stdout => "stdout".to_owned(),
+            crate::pipeline::StreamFileDescriptor::Stderr => "stderr".to_owned(),
+            crate::pipeline::StreamFileDescriptor::Other(fd) => format!("fd {fd}"),
+            crate::pipeline::StreamFileDescriptor::Unknown => "unknown".to_owned(),
+        },
+    ));
+    DiscordMessage {
+        embeds: vec![DiscordEmbed {
+            title: event.definition.message.to_string(),
+            description: format!("```text\n{log}\n```"),
+            color: match event.definition.kind {
+                crate::event::EventType::Info => INFO_COLOR,
+                crate::event::EventType::Warning => WARNING_COLOR,
+                crate::event::EventType::Error => ERROR_COLOR,
+            },
+            fields,
+            timestamp: record.observed_at().to_string(),
+        }],
+        allowed_mentions: AllowedMentions { parse: Vec::new() },
+    }
 }
 
 fn spawn_discord(
@@ -218,11 +252,11 @@ fn spawn_discord(
         );
         let authorization = format!("Bot {secret}");
         while let Some(event) = receiver.recv().await {
-            let content = discord_content(&event);
+            let message = discord_message(&event);
             let response = client
                 .post(&endpoint)
                 .header(AUTHORIZATION, &authorization)
-                .json(&DiscordMessage { content: &content })
+                .json(&message)
                 .send()
                 .await;
             match response {
@@ -250,9 +284,41 @@ fn discord_success(status: StatusCode) -> bool {
     status.is_success()
 }
 
-#[derive(Serialize)]
-struct DiscordMessage<'a> {
-    content: &'a str,
+#[derive(Debug, Serialize)]
+struct DiscordMessage {
+    embeds: Vec<DiscordEmbed>,
+    allowed_mentions: AllowedMentions,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscordEmbed {
+    title: String,
+    description: String,
+    color: u32,
+    fields: Vec<DiscordField>,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscordField {
+    name: &'static str,
+    value: String,
+    inline: bool,
+}
+
+impl DiscordField {
+    fn inline(name: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            name,
+            value: value.into(),
+            inline: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AllowedMentions {
+    parse: Vec<String>,
 }
 
 #[cfg(test)]
@@ -273,13 +339,36 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 4_096];
-            let count = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..count]);
+            let mut request = Vec::new();
+            let mut chunk = [0; 1_024];
+            loop {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "Discord request ended before its body arrived");
+                request.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap();
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("POST /channels/42/messages HTTP/1.1"));
             assert!(request.contains("authorization: Bot hush"));
-            assert!(request.contains("Someone joined!\\nidentity="));
-            assert!(request.contains(r#"log=\"database failed\""#));
+            assert!(request.contains(r#""title":"Someone joined!""#));
+            assert!(request.contains(r#""description":"```text\ndatabase failed\n```""#));
+            assert!(request.contains(r#""name":"Namespace","value":"games""#));
+            assert!(request.contains(r#""parse":[]"#));
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
                 .await
@@ -325,10 +414,9 @@ mod tests {
     }
 
     fn test_record(bytes: &[u8]) -> Arc<LogRecord> {
-        Arc::new(LogRecord {
-            sampling_seed: 1,
-            stream: StreamFileDescriptor::Stderr,
-            enrichment: Enrichment::Enriched(KubernetesIdentity {
+        test_record_with_enrichment(
+            bytes,
+            Enrichment::Enriched(KubernetesIdentity {
                 node: "node-1".into(),
                 namespace: "games".into(),
                 pod_name: "game-1".into(),
@@ -340,6 +428,15 @@ mod tests {
                 },
                 workload: WorkloadResolution::NoController,
             }),
+        )
+    }
+
+    fn test_record_with_enrichment(bytes: &[u8], enrichment: Enrichment) -> Arc<LogRecord> {
+        Arc::new(LogRecord {
+            observed_at: "2026-08-12T18:00:00Z".parse().unwrap(),
+            sampling_seed: 1,
+            stream: StreamFileDescriptor::Stderr,
+            enrichment,
             first_timestamp_ns: 10,
             last_timestamp_ns: 11,
             first_operation_id: 20,
@@ -391,17 +488,57 @@ mod tests {
     }
 
     #[test]
-    fn discord_content_includes_the_log_and_marks_truncation() {
+    fn discord_embed_is_compact_and_marks_truncation() {
         let event = caught(EventType::Error, "An error occurred!");
-        let content = discord_content(&event);
-        assert!(content.starts_with("An error occurred!\nidentity="));
-        assert!(content.ends_with("log=\"actual error\\n\\xff\""));
+        let message = discord_message(&event);
+        let embed = &message.embeds[0];
+        assert_eq!(embed.title, "An error occurred!");
+        assert_eq!(embed.color, ERROR_COLOR);
+        assert_eq!(embed.timestamp, "2026-08-12T18:00:00Z");
+        assert_eq!(
+            embed
+                .fields
+                .iter()
+                .map(|field| field.name)
+                .collect::<Vec<_>>(),
+            ["Namespace", "Pod", "Container", "Stream"]
+        );
+        assert!(embed.description.contains("actual error\\n\\xff"));
+        let json = serde_json::to_string(&message).unwrap();
+        for forbidden in [
+            "pod_uid",
+            "container_id",
+            "workload",
+            "operation_id",
+            "sample_percent",
+        ] {
+            assert!(!json.contains(forbidden), "Discord leaked {forbidden}");
+        }
+        assert!(json.contains(r#""parse":[]"#));
         let oversized = CaughtEvent {
-            record: test_record(&vec![b'x'; DISCORD_CONTENT_CHARS * 2]),
+            record: test_record(&vec![b'x'; DISCORD_DESCRIPTION_CHARS * 2]),
             ..event
         };
-        let content = discord_content(&oversized);
-        assert_eq!(content.chars().count(), DISCORD_CONTENT_CHARS);
-        assert!(content.ends_with(TRUNCATED));
+        let description = &discord_message(&oversized).embeds[0].description;
+        assert_eq!(description.chars().count(), DISCORD_DESCRIPTION_CHARS);
+        assert!(description.contains(TRUNCATED));
+        assert!(description.ends_with("\n```"));
+
+        assert_eq!(
+            discord_message(&caught(EventType::Info, "info")).embeds[0].color,
+            INFO_COLOR
+        );
+        assert_eq!(
+            discord_message(&caught(EventType::Warning, "warning")).embeds[0].color,
+            WARNING_COLOR
+        );
+
+        let unresolved = CaughtEvent {
+            record: test_record_with_enrichment(b"lost", Enrichment::UnresolvedCgroup),
+            ..caught(EventType::Info, "unresolved")
+        };
+        let fields = &discord_message(&unresolved).embeds[0].fields;
+        assert_eq!(fields[0].name, "Source");
+        assert_eq!(fields[0].value, "k8s=unresolved reason=cgroup-not-indexed");
     }
 }

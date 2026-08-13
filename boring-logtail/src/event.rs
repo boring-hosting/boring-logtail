@@ -240,6 +240,7 @@ mod tests {
         .unwrap();
         let bytes: Arc<[u8]> = Arc::from(&b"database failed\n"[..]);
         let record = Arc::new(LogRecord {
+            observed_at: "2026-08-12T18:00:00Z".parse().unwrap(),
             sampling_seed: 1,
             stream: StreamFileDescriptor::Stderr,
             enrichment: Enrichment::Enriched(KubernetesIdentity {

@@ -145,6 +145,7 @@ impl std::fmt::Display for Severity {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct LogRecord {
+    pub(crate) observed_at: jiff::Timestamp,
     pub(crate) sampling_seed: u64,
     pub(crate) stream: StreamFileDescriptor,
     pub(crate) enrichment: Enrichment,
@@ -159,6 +160,9 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    pub fn observed_at(&self) -> jiff::Timestamp {
+        self.observed_at
+    }
     pub fn stream(&self) -> StreamFileDescriptor {
         self.stream
     }
@@ -244,6 +248,7 @@ impl PendingRecord {
         self.integrity.capture_gap = capture_gap;
         self.integrity.unterminated = unterminated;
         LogRecord {
+            observed_at: jiff::Timestamp::now(),
             sampling_seed: framing_key.sampling_seed(),
             stream: framing_key.stream(),
             enrichment: self.enrichment,

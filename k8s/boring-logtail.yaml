@@ -39,8 +39,12 @@ data:
     filters:
       namespaces:
         include:
-          - game-servers
+          - auth
           - biomehub
+          - biomehub-dev
+          - factorio-dev
+          - flux-system
+          - game-servers
 
     events:
       joined:
@@ -48,18 +52,26 @@ data:
         message: "Someone has joined!"
       error:
         type: error
-        message: "An error occurred!"
+        message: "boring-logtail caught an operational failure"
 
     event_catchers:
-      - regex: '(?i)\bjoined\b'
+      # Observed in the Valheim/Avrustet servers. Keeping this precise avoids
+      # treating Steam master-server connections as player joins.
+      - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
         event: joined
-        emitters: [stdout]
-      - regex: '(?i)\berror\b'
+        emitters: [discord]
+      # Flux emits structured JSON with level=error and messages such as
+      # "Reconciliation failed". The remaining alternatives cover common
+      # unstructured operational failures without needing one catcher each.
+      - regex: '(?i)(?:"level"\s*:\s*"(?:error|fatal|panic)"|\b(?:error|failed|failure|reconciliation failed|reconciler error|panic|panicked|fatal|time(?:d)? out|timeout|permission denied|connection refused|unhealthy|crashloopbackoff|oomkilled)\b)'
         event: error
-        emitters: [stdout]
+        emitters: [discord]
 
     event_emitters:
-      stdout: {}
+      discord:
+        # Replace this with the numeric ID from Discord's Copy Channel ID.
+        channel_id: "1537166176331898890"
+        secret_from_env: WOW_MY_DISCORD_SECRET
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -135,6 +147,11 @@ spec:
               value: /host/sys/fs/cgroup
             - name: BORING_LOGTAIL_CONFIG
               value: /etc/boring-logtail/config.yaml
+            - name: WOW_MY_DISCORD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: boring-logtail-discord
+                  key: bot-token
           resources:
             requests:
               cpu: 50m

@@ -68,6 +68,8 @@ and enriches them with Kubernetes identity.
   actors without network backpressure on capture.
 - [X] Deliver static typed events to Discord with secrets sourced from the
   environment.
+- [X] Render Discord alerts as compact colored embeds with the caught log,
+  useful Kubernetes identity, and one honest wall-clock timestamp.
 - [X] Deliver escaped one-line events to stdout through the same bounded actor
   path.
 - [X] Share the exact final =LogRecord= across pipeline output, store, and event

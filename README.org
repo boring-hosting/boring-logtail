@@ -88,7 +88,7 @@ events:
     message: "Someone has joined!"
 
 event_catchers:
-  - regex: '(?i)\bjoined\b'
+  - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
     event: joined
     emitters:
       - stdout
@@ -113,9 +113,10 @@ mise run run
 The secret value comes from the named environment variable, never the YAML.
 Event matching uses a precompiled regex set and never makes capture wait for
 stdout or Discord. The stdout emitter writes one escaped line such as
-=event="joined" type=info message="Someone has joined!" identity="k8s=game-servers/game-1/server ..." stream=Stdout ... log="player-7 joined"=.
-Discord receives the configured message and the same caught log. The event is
-the useful bit; the message is just context.
+=event="joined" type=info message="Someone has joined!" identity="k8s=game-servers/game-1/server ..." stream=Stdout ... log="peer connected: PeerId(123)"=.
+Discord receives a compact colored embed: the configured message, the actual
+caught log, namespace, Pod, container, stream, and one normal UTC timestamp.
+It deliberately leaves internal IDs and sampling machinery out of the alert.
 
 =store.retention= accepts whole seconds, minutes, or hours such as =30s=,
 =15m=, and =2h=. Records age out individually; this is not a periodic

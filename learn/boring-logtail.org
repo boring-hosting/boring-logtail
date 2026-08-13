@@ -378,3 +378,9 @@ that matched. Emitters therefore retain identity, provenance, timestamps,
 integrity, severity, and bytes without maintaining a lossy shadow record.
 Invalid UTF-8 is rendered explicitly as hexadecimal escapes instead of being
 silently replaced.
+
+The kernel timestamp is monotonic time since boot, not wall time. Record
+finalization therefore adds one userspace UTC =observed_at= timestamp. Discord
+uses it in a compact colored embed with only the caught log, namespace, Pod,
+container, and stream. Internal IDs, sampling state, and the integrity debug
+dump stay out of alerts; stdout remains the detailed diagnostic rendering.
