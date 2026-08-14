@@ -1,0 +1,86 @@
+#+title: Direct shared log store
+#+date: 2026-08-14 17:22 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved for implementation on 2026-08-14.
+
+* Context
+
+=blt-store= is the in-memory database, but its public =LogStore= is currently a
+command sender while a private actor owns the records. The queue was meant to
+decouple capture from ingestion; making append, query, stream setup, flush, and
+shutdown actor commands hides the database and makes ordinary access needlessly
+indirect.
+
+* Decision
+
+=LogStore= directly owns the bounded database and is shared as =Arc<LogStore>=.
+One lock protects state that must change coherently. Ingestion calls =append=
+on the store after its existing bounded transport queue; API code calls =query=,
+=flush=, and =stream= on the same store.
+
+#+begin_example
+capture -> bounded transport -> ingestion task -> Arc<LogStore>
+                                                /            \
+                                      append / flush       query / stream
+                                                                  |
+                                                                  v
+                                                                 API
+#+end_example
+
+Retained ownership follows Kubernetes identity:
+
+#+begin_example
+namespace -> workload UID -> Pod UID -> record ring
+#+end_example
+
+A small sequence index may remain for global ordering and oldest-first
+eviction. It is an index, not a second database owner.
+
+Streaming is one operation. Internally it takes a matching retained snapshot
+and follows insert notifications after the snapshot watermark. The public API
+does not expose separate replay and live database concepts.
+
+Remove the store actor, command protocol, oneshot replies, shutdown command,
+stats watch snapshots, replay reservations, and global subscriber slots.
+Bounded notification receivers still report lag rather than blocking writes.
+
+* Consequences
+
+- =Arc= clones point to the one actual database.
+- Queries and flushes become ordinary store operations.
+- One database lock keeps indexes and accounting coherent; per-ring locks do
+  not create partial updates or a lock-order problem.
+- Append remains short and synchronous once admitted. No await occurs while the
+  database write lock is held.
+- Retained memory remains bounded. Stream receivers are bounded independently
+  by Tokio broadcast capacity and may lag explicitly.
+- This supersedes the actor ownership decision in
+  =20260809-1626-bounded-replay-log-store.org=.
+
+* Acceptance
+
+- Ingestion and =blt-api= share the exact same =Arc<LogStore>=.
+- Append, selector query, flush, and continuous selector stream are direct
+  database methods with tests.
+- A stream yields retained matching records followed by later matching records
+  without a handoff gap or duplicate sequence.
+- Namespace, workload, and Pod selection preserve sequence order.
+- Retention, global memory eviction, per-workload limits, and time expiry remain
+  bounded and tested.
+- No store actor, =Command= enum, store oneshot reply, replay reservation,
+  subscriber slot semaphore, or =LogStore::shutdown= remains.
+- Store, API, collector, workspace tests, formatting, and strict Clippy pass.
+
+* TODO
+
+- [X] DS1 Replace actor ownership with the directly shared store and simplify
+  hierarchical retained state.
+- [X] DS2 Add direct query, flush, and unified bounded stream behavior with
+  retention and handoff tests.
+- [X] DS3 Adapt =blt-api= and =boring-collector= to share =Arc<LogStore>=.
+- [X] DS4 Update the field guide, roadmap, and deferred-work index for the new
+  database boundary.
+- [X] DS5 Run formatting, crate/workspace tests, and strict Clippy.

@@ -16,7 +16,8 @@ run = [
 
 [tasks.push]
 description = "Build and push commit and latest images to GHCR"
-run = [
-  "skaffold build --push=true",
-  "skaffold build --push=true --tag latest",
-]
+run = ["skaffold build --push=true", "skaffold build --push=true --tag latest"]
+
+[tasks.fmt]
+description = "Format project"
+run = ["cargo fmt"]

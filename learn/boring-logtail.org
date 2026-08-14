@@ -34,16 +34,16 @@ application thread
   WriteOperation { identity, result, integrity, bytes }
        |
        v
-  cgroup snapshot + scoped, node-filtered Pod snapshot(s)
+  cgroup snapshot + node-filtered Pod snapshot
        |
        v
   Kubernetes identity or an explicit unresolved reason
        |
        v
-  authoritative namespace filter, then deterministic sampling
+  bounded OTLP batch -> boring-collector
        |
        v
-  temporary human-readable log line
+  policy -> retention / alerts
 #+end_example
 
 The kernel side reports syscall facts and opaque bytes. Userspace reconstructs
@@ -84,7 +84,7 @@ namespace translation problem disappears.
 
 * 1. Catch syscall entry
 
-[[file:../boring-logtail-ebpf/src/main.rs][boring_logtail_enter]] runs at
+[[file:../blt-ebpf/src/main.rs][boring_logtail_enter]] runs at
 =syscalls/sys_enter_write=.
 
 It reads:
@@ -114,7 +114,7 @@ this observation. We do not yet expose a loss counter.
 
 * 2. Pair syscall exit
 
-[[file:../boring-logtail-ebpf/src/main.rs][boring_logtail_exit]] runs at
+[[file:../blt-ebpf/src/main.rs][boring_logtail_exit]] runs at
 =syscalls/sys_exit_write=.
 
 It reads the signed result, looks up the matching entry state, and removes that
@@ -126,7 +126,7 @@ state insertion rejected the operation.
 
 * 3. Copy bounded chunks
 
-The chunk worker asks [[file:../boring-logtail-common/src/lib.rs][next_write_chunk]] what piece comes
+The chunk worker asks [[file:../blt-abi/src/lib.rs][next_write_chunk]] what piece comes
 next. Current limits are:
 
 #+begin_example
@@ -152,7 +152,7 @@ the exact bytes Linux copied internally.
 * 4. Cross the ring buffer
 
 =EVENTS= is a 256 KiB BPF ring buffer. Each record has the fixed =WriteEvent=
-layout defined in =boring-logtail-common=.
+layout defined in =blt-abi=.
 
 The userspace capture loop waits asynchronously for readability and drains all
 available records. =decode_event= rejects the wrong byte size or ABI version and
@@ -190,59 +190,47 @@ missing chunks become an error only when a terminal chunk lets assembly run.
 =operation_id= currently reuses the entry timestamp; its collision guarantee is
 not yet formally defined.
 
-* 6. Frame, retain, and make temporary output
+* 6. Frame and export
 
 After reconstruction, =Pipeline= joins the current in-memory Kubernetes
-identity snapshots, applies the immutable namespace filter, chooses an internal
-framing lane, frames newline-delimited records, then samples complete records.
-One write can finish zero, one, or many =LogRecord= values. Sampling after
-framing cannot punch a hole into the middle of a line.
+identity snapshots, chooses an internal framing lane, and frames newline-delimited
+records. One write can finish zero, one, or many =LogRecord= values. The node
+does not apply cluster policy: it exports every honest framed result.
 
 The framer preserves opaque bytes across write boundaries. One record is capped
 at an internal 64 KiB safety bound. Container streams are
 internal framing lanes so bytes from different containers or descriptors are
-never joined. Aggregate pending bytes are derived from the store memory
-envelope; pressure emits an integrity-marked fragment instead of silently
+never joined. Aggregate pending bytes have explicit node capture bounds;
+pressure emits an integrity-marked fragment instead of silently
 growing or discarding it. Kernel read failures become explicit capture gaps, so
 bytes from opposite sides of missing evidence are never stitched into a fake
 complete line.
 
-Accepted records enter a bounded channel without blocking eBPF ring-buffer
-drain. One Tokio task owns the in-memory store: one ring per workload UID, Pod
-and namespace indexes, process-local sequence allocation, and subscribers. A
-workload's =max_logs= count is shared by all current and historical Pod replicas;
-every record keeps Pod UID and name. The global =max_memory= envelope can evict
-globally oldest records before a workload reaches that count.
+Records enter a byte- and count-bounded OTLP queue without blocking eBPF
+ring-buffer drain. One task batches them by record count, encoded bytes, and
+time, then retries the collector endpoint for a bounded interval. Shutdown
+drains the framer and exporter in that order. Queue pressure and every delivery
+failure have counters.
 
-The current edge also renders one human-readable line:
+* Query and continuous stream
 
-#+begin_example
-incoming_log source="k8s namespace=payments pod_uid=... container_id=... \
-  stream=stdout-candidate" bytes=83 integrity=RecordIntegrity {...} \
-  payload="{\"kind\":\"checkout\",\"order_id\":\"BLT-42\",...}\n"
-#+end_example
+The collector shares one =Arc<LogStore>= between OTLP ingestion and the API.
+The store directly owns namespace, workload, and Pod record rings behind one
+lock; there is no database actor or command queue. A selector names a workload
+UID, Pod UID, or namespace. =query= returns matching retained records, =flush=
+clears retention, and =stream= is one ordered feed of retained matches followed
+by later matching inserts.
 
-Invalid UTF-8 is rendered with replacement characters for the terminal, while
-the =LogRecord.bytes= value stays unchanged.
-
-This output is deliberately temporary. Printing every node record is noisy and
-creates observer effects. The cgroup filter prevents recursion; the future
-network adapter still needs authentication, authorization, and a wire contract.
-
-* The replay/live handoff
-
-A subscription selector names a workload UID, Pod UID, or namespace.
-The owner task chooses watermark =N=, snapshots matching retained records
-through =N=, then registers live delivery before processing another append.
-Replay followed by live delivery therefore has no duplicate or gap at that
-boundary.
+Internally, =stream= opens its bounded insert-notification receiver before it
+reads the retained snapshot and watermark =N=. Notifications through =N= are
+duplicates of the snapshot and are skipped; later sequences continue the feed.
+An append cannot disappear between the two steps.
 
 This is connected-session truth, not durable exactly once. Sequences reset on
 restart, there are no acknowledgements or reconnect cursors, and retained
-history can already have been evicted. Reading replay or live delivery removes
-only the subscriber's reference; it never drains retained history. Slow
-subscribers never stall capture, and overflow closes only that session with
-=SubscriberLagged=.
+history can already have been evicted. Reading a stream removes only the
+reader's shared reference; it never drains retained history. Slow readers never
+stall ingestion, and a bounded notification receiver reports lag explicitly.
 
 * What “valuable data” means today
 
@@ -298,37 +286,29 @@ container. The second form keeps the bytes but refuses to fake attribution.
 =stdout-candidate= and =stderr-candidate= mean only “observed on fd 1 or 2”; fd
 tracking is still needed before those become durable stream identities.
 
-Configuration is a versioned YAML file. No file means =filters: []= and a
-100-percent sample. Kubernetes mounts the same safe default from a ConfigMap;
-an allowlist creates one namespaced Pod watch per namespace while preserving
-the =spec.nodeName= selector and one global Pod bound. Policy is immutable for
-the process lifetime.
-
-The Kubernetes deployment currently renders every admitted framed record. Sampling
-happens after framing, so it never creates a partial line.
-Each visible line carries the configured =sample_percent=. Local runs also
-default to 100 percent unless =BORING_LOGTAIL_CONFIG= names a YAML file.
-
-Sampling can also limit observer loops outside the collector's own
-cgroup. On the live cluster, following collector output through =kubectl logs=
+Node configuration contains only capture bounds and collector delivery. The
+collector owns namespace filtering and deterministic whole-record sampling.
+On the live cluster, following output through =kubectl logs=
 crosses konnectivity agents configured with =-v=8=. They log the transported
 packets; the collector sees those new writes; another rendered record causes
 more transport. Self-cgroup exclusion cannot stop that cross-cgroup cycle. A
-low sampling percentage can make the loop subcritical, while source filtering
-or lower agent verbosity is the real cure.
+collector policy can make the loop subcritical, while lower transport verbosity
+is the real cure.
 
 Disappeared cgroup mappings stay in a bounded five-minute retention cache.
 Deleted Pods currently leave the Pod snapshot immediately; a late write is then
-explicitly unresolved. The cgroup path decoder supports the measured containerd
-and CRI-O cgroup-v2 layouts.
+explicitly unresolved. The cgroup path decoder supports the containerd layouts
+exercised on this project's hosts. It also recognizes CRI-O's standard
+=crio-<64-hex-id>.scope= systemd form; that is parser support, not a claim that
+we measured a CRI-O node.
 
 * Things we intentionally do not claim
 
 - We capture =write= and bounded =writev=, not every route bytes can take.
 - Numeric fd 1/2 is not durable stdout/stderr identity.
 - We frame newlines, but do not interpret semantic multiline or JSON documents.
-- Retained history is volatile and node-local; restart forgets it.
-- Replay/live is gap-free only for one connected session, not durable exactly once.
+- Retained history is volatile and collector-local; restart forgets it.
+- A continuous stream is gap-free only while connected, not durable exactly once.
 - We do not yet quantify every loss boundary.
 - We do not map unsupported runtime or cgroup layouts to Kubernetes identity.
 - We do not promise every architecture or compatibility syscall ABI.
@@ -337,23 +317,28 @@ The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
 
 * Source tour
 
-- [[file:../boring-logtail-common/src/lib.rs][Shared kernel/userspace ABI and chunk math]]
-- [[file:../boring-logtail-ebpf/src/main.rs][Kernel-side capture programs]]
+- [[file:workspace.org][Workspace crate map and dependency direction]]
+- [[file:../blt-abi/src/lib.rs][Shared kernel/userspace ABI and chunk math]]
+- [[file:../blt-ebpf/src/main.rs][Kernel-side capture programs]]
 - [[file:../boring-logtail/src/cgroup.rs][Collector cgroup discovery]]
 - [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID snapshot]]
 - [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes Pod snapshot]]
 - [[file:../boring-logtail/src/enrichment.rs][Exact identity join]]
 - [[file:../boring-logtail/src/pipeline.rs][Write reconstruction and per-event pipeline]]
-- [[file:../boring-logtail/src/record.rs][Newline framing and record integrity]]
-- [[file:../boring-logtail/src/store.rs][Bounded retention and replay/live handoff]]
-- [[file:../boring-logtail/src/event.rs][Precompiled event catching]]
-- [[file:../boring-logtail/src/emitter.rs][Bounded asynchronous event delivery]]
-- [[file:../boring-logtail/src/main.rs][Userspace startup, ring-buffer transport, and temporary output]]
-- [[file:../k8s/boring-logtail.yaml][Kubernetes DaemonSet]]
+- [[file:../boring-logtail/src/framing.rs][Newline framing and record integrity]]
+- [[file:../blt-store/src/lib.rs][Direct shared database, queries, and streams]]
+- [[file:../boring-collector/src/policy.rs][Collector filtering, sampling, and catching]]
+- [[file:../blt-emitter/src/lib.rs][Bounded asynchronous event delivery]]
+- [[file:../blt-emitter/src/stdout.rs][Escaped stdout delivery]]
+- [[file:../blt-emitter/src/discord.rs][Compact Discord delivery]]
+- [[file:../blt-otel/src/exporter.rs][Bounded OTLP batching and delivery]]
+- [[file:../boring-logtail/src/main.rs][Node-agent process wiring]]
+- [[file:../boring-collector/src/main.rs][Collector process wiring]]
+- [[file:../k8s/boring-logtail.yaml][Collector Deployment and agent DaemonSet]]
 - [[file:../spec/20260801-0854-capture-boundary-hardening.org][Self-capture hardening spec]]
 ** Store identity and bounds
 
-Retention belongs to a resolved Kubernetes workload UID, not an FD or container
+Collector retention belongs to a resolved Kubernetes workload UID, not an FD or container
 stream. A standalone Pod uses its Pod UID as its workload UID. One workload ring
 interleaves all Pod replicas in store order; Pod metadata remains on each record.
 Unresolved owner chains are rejected rather than guessed. Operators configure
@@ -367,8 +352,8 @@ evidence; stdout/stderr is not evidence.
 
 ** Event catching without clogging capture
 
-One compiled regex set sees complete, identity-accepted records before output
-sampling. A match clones a tiny typed event into a bounded Tokio channel with
+One collector-owned regex set sees complete, identity-accepted records after
+policy admission. A match clones a tiny typed event into a bounded Tokio channel with
 =try_send=. The Discord worker owns network I/O. If delivery slows down, its
 queue fills and notifications are counted and dropped; log capture never waits
 for the internet or a slow output stream. The stdout emitter renders one quoted,
@@ -384,3 +369,17 @@ finalization therefore adds one userspace UTC =observed_at= timestamp. Discord
 uses it in a compact colored embed with only the caught log, namespace, Pod,
 container, and stream. Internal IDs, sampling state, and the integrity debug
 dump stay out of alerts; stdout remains the detailed diagnostic rendering.
+* Node memory after the collector split
+
+Removing the node-local store removes retention ownership, not every userspace
+allocation. The agent still owns bounded write assembly, partial-line framing,
+OTLP queues, Kubernetes watch state, cgroup snapshots, TLS, and the Tokio
+runtime.
+
+On the two-node CRI-O smoke cluster, glibc also kept one malloc arena per busy
+worker near its burst high-water mark. Those freed pages still counted as RSS.
+Bounding glibc to two arenas and lowering its trim threshold reduced the node
+Pods from 55--58 MiB to 33--34 MiB under the same traffic. This is allocator
+retention, not retained log history. The manifest carries the tunable; a future
+heap profile must attribute the remaining anonymous memory before more knobs
+are guessed.

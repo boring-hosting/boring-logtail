@@ -1,77 +1,138 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 apiVersion: v1
 kind: Namespace
 metadata:
   name: boring-logtail
   labels:
-    app.kubernetes.io/name: boring-logtail
     app.kubernetes.io/part-of: boring-logtail
     pod-security.kubernetes.io/enforce: privileged
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: boring-logtail
-  namespace: boring-logtail
-  labels:
-    app.kubernetes.io/name: boring-logtail
-    app.kubernetes.io/component: collector
-    app.kubernetes.io/part-of: boring-logtail
-automountServiceAccountToken: true
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: boring-logtail
   namespace: boring-logtail
-  labels:
-    app.kubernetes.io/name: boring-logtail
-    app.kubernetes.io/part-of: boring-logtail
 data:
   config.yaml: |
-    sampling:
-      percent: 100
-
+    collector:
+      endpoint: http://boring-collector:4318/v1/logs
+      queue_records: 1024
+      queue_bytes: 8388608
+      batch_records: 512
+      batch_bytes: 1048576
+      flush_interval_ms: 1000
+      retry_max_elapsed_ms: 30000
+      request_timeout_ms: 10000
+    capture:
+      assembly_operations: 1024
+      assembly_bytes: 4194304
+      framing_lanes: 64
+      framing_bytes: 8388608
+      max_record_bytes: 65536
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boring-collector
+  namespace: boring-logtail
+data:
+  config.yaml: |
+    listen: 0.0.0.0:4318
+    max_request_bytes: 4194304
     store:
       max_memory: 128MiB
       max_logs: 500
       retention: 1h
-
+    sampling:
+      percent: 100
     filters:
       namespaces:
-        include:
-          - auth
-          - biomehub
-          - biomehub-dev
-          - factorio-dev
-          - flux-system
-          - game-servers
-
+        include: [auth, biomehub, biomehub-dev, factorio-dev, flux-system, game-servers]
     events:
-      joined:
-        type: info
-        message: "Someone has joined!"
-      error:
-        type: error
-        message: "boring-logtail caught an operational failure"
-
+      joined: {type: info, message: "Someone has joined!"}
+      error: {type: error, message: "boring-logtail caught an operational failure"}
     event_catchers:
-      # Observed in the Valheim/Avrustet servers. Keeping this precise avoids
-      # treating Steam master-server connections as player joins.
       - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
         event: joined
         emitters: [discord]
-      # Flux emits structured JSON with level=error and messages such as
-      # "Reconciliation failed". The remaining alternatives cover common
-      # unstructured operational failures without needing one catcher each.
-      - regex: '(?i)(?:"level"\s*:\s*"(?:error|fatal|panic)"|\b(?:error|failed|failure|reconciliation failed|reconciler error|panic|panicked|fatal|time(?:d)? out|timeout|permission denied|connection refused|unhealthy|crashloopbackoff|oomkilled)\b)'
-        event: error
-        emitters: [discord]
-
+      # - regex: '(?i)(?:"level"\s*:\s*"(?:error|fatal|panic)"|\b(?:error|failed|failure|reconciliation failed|reconciler error|panic|panicked|fatal|time(?:d)? out|timeout|permission denied|connection refused|unhealthy|crashloopbackoff|oomkilled)\b)'
+      #   event: error
+      #   emitters: [discord]
     event_emitters:
       discord:
-        # Replace this with the numeric ID from Discord's Copy Channel ID.
         channel_id: "1537166176331898890"
         secret_from_env: WOW_MY_DISCORD_SECRET
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boring-collector
+  namespace: boring-logtail
+spec:
+  selector:
+    app.kubernetes.io/name: boring-collector
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boring-collector
+  namespace: boring-logtail
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: boring-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: boring-collector
+        app.kubernetes.io/component: collector
+        app.kubernetes.io/part-of: boring-logtail
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: boring-collector
+          image: ghcr.io/alfredosa/boring-collector:latest
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+          env:
+            - {name: RUST_LOG, value: info}
+            - {name: BORING_COLLECTOR_CONFIG, value: /etc/boring-collector/config.yaml}
+            - name: WOW_MY_DISCORD_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: boring-logtail-discord
+                  key: bot-token
+          readinessProbe:
+            httpGet: {path: /healthz, port: otlp-http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: otlp-http}
+          resources:
+            requests: {cpu: 50m, memory: 160Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/boring-collector, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: boring-collector}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: boring-logtail
+  namespace: boring-logtail
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -79,11 +140,11 @@ metadata:
   name: boring-logtail-pod-reader
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["get", "list", "watch"]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -94,31 +155,22 @@ roleRef:
   kind: ClusterRole
   name: boring-logtail-pod-reader
 subjects:
-  - kind: ServiceAccount
-    name: boring-logtail
-    namespace: boring-logtail
+  - {kind: ServiceAccount, name: boring-logtail, namespace: boring-logtail}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: boring-logtail
   namespace: boring-logtail
-  labels:
-    app.kubernetes.io/name: boring-logtail
-    app.kubernetes.io/component: collector
-    app.kubernetes.io/part-of: boring-logtail
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: boring-logtail
+      # Kept for an in-place upgrade: Deployment selectors are immutable and
+      # the original DaemonSet unfortunately called the node process collector.
       app.kubernetes.io/component: collector
-  minReadySeconds: 5
-  revisionHistoryLimit: 3
   updateStrategy:
     type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
   template:
     metadata:
       labels:
@@ -127,63 +179,38 @@ spec:
         app.kubernetes.io/part-of: boring-logtail
     spec:
       serviceAccountName: boring-logtail
-      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 30
       tolerations:
-        - operator: Exists
-          effect: NoSchedule
+        - {operator: Exists, effect: NoSchedule}
       containers:
         - name: boring-logtail
           image: ghcr.io/alfredosa/boring-logtail:latest
-          imagePullPolicy: IfNotPresent
           env:
-            - name: RUST_LOG
-              value: info
+            - {name: RUST_LOG, value: info}
+            # Capture bursts allocate on several Tokio workers. Bound glibc's
+            # per-thread arenas and return freed pages instead of pinning the
+            # burst high-water mark in every node agent.
+            - {name: GLIBC_TUNABLES, value: "glibc.malloc.arena_max=2:glibc.malloc.trim_threshold=131072"}
             - name: BORING_LOGTAIL_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: BORING_LOGTAIL_HOST_CGROUP_ROOT
-              value: /host/sys/fs/cgroup
-            - name: BORING_LOGTAIL_CONFIG
-              value: /etc/boring-logtail/config.yaml
-            - name: WOW_MY_DISCORD_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: boring-logtail-discord
-                  key: bot-token
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: BORING_LOGTAIL_POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: BORING_LOGTAIL_HOST_CGROUP_ROOT, value: /host/sys/fs/cgroup}
+            - {name: BORING_LOGTAIL_CONFIG, value: /etc/boring-logtail/config.yaml}
           resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              memory: 192Mi
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi}
           securityContext:
             privileged: true
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
             readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: true
           volumeMounts:
-            - name: tracefs
-              mountPath: /sys/kernel/tracing
-              readOnly: true
-            - name: host-cgroup
-              mountPath: /host/sys/fs/cgroup
-              readOnly: true
-            - name: config
-              mountPath: /etc/boring-logtail
-              readOnly: true
+            - {name: tracefs, mountPath: /sys/kernel/tracing, readOnly: true}
+            - {name: host-cgroup, mountPath: /host/sys/fs/cgroup, readOnly: true}
+            - {name: config, mountPath: /etc/boring-logtail, readOnly: true}
       volumes:
         - name: tracefs
-          hostPath:
-            path: /sys/kernel/tracing
-            type: Directory
+          hostPath: {path: /sys/kernel/tracing, type: Directory}
         - name: host-cgroup
-          hostPath:
-            path: /sys/fs/cgroup
-            type: Directory
+          hostPath: {path: /sys/fs/cgroup, type: Directory}
         - name: config
-          configMap:
-            name: boring-logtail
+          configMap: {name: boring-logtail}

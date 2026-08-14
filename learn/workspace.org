@@ -1,0 +1,94 @@
+#+title: The BLT crate map
+#+license: GFDL-1.3-or-later
+
+BLT is two programs assembled from small Rust crates. The split is
+about dependency direction, not collecting tiny directories for sport.
+
+* The short version
+
+The kernel reports pieces of successful writes as =WriteEvent=. Userspace
+reconstructs and frames those pieces into an immutable =LogRecord=. The store,
+event emitters, and future API all use that exact record.
+
+#+begin_example
+blt-ebpf -> blt-abi -> boring-logtail -> blt-model
+                            |                  ^
+                            +-> blt-otel ------+
+                                   |
+                                   v
+                           boring-collector
+                            /      |       \
+                     blt-store  blt-api  blt-emitter
+#+end_example
+
+Arrows mean “depends on.” =boring-logtail= is the node capture process;
+=boring-collector= is the cluster composition root. =blt-ebpf= is an internal eBPF
+artifact because the kernel needs executable bytecode; the host build embeds
+it into =boring-logtail=.
+
+* Crates
+
+** =blt-abi=
+
+The fixed kernel/userspace agreement. =WriteEvent= fields, flags, versions,
+and chunk math live here. It stays small because kernel-side Rust cannot use
+the normal standard library.
+
+** =blt-model=
+
+Durable userspace facts: =LogRecord=, integrity, stream, Kubernetes identity,
+and caught-event values. Formatting or validation intrinsic to those values is
+welcome. Watchers, queues, storage, regexes, and network clients are not.
+
+=WriteEvent= is one transport chunk. =LogRecord= is one framed log record.
+=CaughtEvent= is a matched definition plus the same shared =LogRecord=. Calling
+all three merely “Event” would hide the useful boundary.
+
+** =blt-store=
+
+The bounded in-memory log database. The collector shares one =Arc<LogStore>=:
+ingestion appends final =LogRecord= values while the API queries, clears, or
+opens a selector stream against that exact store. A stream yields retained
+matches and then matching inserts as one sequence. The bounded transport queue
+ends before the database; the store is not an actor or a command sender.
+
+** =blt-api=
+
+A transport-free read façade holding the same =Arc<LogStore>= as ingestion. It
+gives future HTTP, gRPC, or another transport a query and continuous-stream
+seam without choosing one prematurely. It opens no listener and currently
+makes no wire-compatibility or authentication claim.
+
+** =blt-emitter=
+
+Bounded delivery actors. [[file:../blt-emitter/src/stdout.rs][stdout]] and
+[[file:../blt-emitter/src/discord.rs][Discord]] live in separate files and own
+their own rendering and delivery details. A slow destination can fill its own
+queue; it cannot apply network backpressure to capture.
+
+** =blt-otel=
+
+The versioned, byte-preserving bridge between =LogRecord= and OTLP Logs, plus
+the node's bounded batch/retry actor. OTLP is ingestion, not querying.
+
+** =blt-ebpf=
+
+Kernel-side programs and maps. It depends on =blt-abi=, not on userspace
+models, storage, emitters, Kubernetes clients, or the API.
+
+** =boring-logtail= and =boring-collector=
+
+The node owns eBPF loading, write reconstruction, framing, Kubernetes
+enrichment, and bounded collector delivery. The collector owns retention,
+filtering, sampling, catchers, emitters, and the transport-free API façade.
+
+* Where new code goes
+
+Put code with the facts or resource lifecycle it owns. A formatter used by one
+emitter stays with that emitter. Store admission stays with the store. A value
+shared by storage and an API belongs in the model only when it is a durable
+domain fact, not merely because two modules happen to mention it.
+
+If a boundary is still moving, leave it in its current composition root until evidence
+makes the dependency direction obvious. One coherent application module is
+better than a speculative crate with the wrong public API.

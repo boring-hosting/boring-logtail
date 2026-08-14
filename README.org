@@ -3,8 +3,14 @@
 
 very fast and furious eBPF log scraper, with kubernetes aware enrichment
 
-It grabs writes on the way through the Linux kernel, rebuilds the log stream in
-userspace, and figures out which kubernetes workload made the noise.
+The node agent grabs writes on the way through the Linux kernel, rebuilds log
+records, adds Kubernetes identity, and ships bounded OTLP batches. One
+=boring-collector= receives them, retains them, and owns policy and alerts.
+
+#+begin_example
+application -> boring-logtail -> OTLP -> boring-collector -> store / alerts
+               every node                 once per cluster
+#+end_example
 
 Very early. My goal is to replace Promtail. Get into Observability at root.
 
@@ -41,10 +47,11 @@ work.
 The agent is a privileged DaemonSet because kernels tend not to let random
 processes load eBPF programs. Your cluster must allow privileged workloads in
 the =boring-logtail= namespace. Identity enrichment watches only Pods assigned
-to the collector's node and joins their exact container IDs to the cgroup
+to the agent's node and joins their exact container IDs to the cgroup
 snapshot. It does not mount or call the container-runtime socket.
 
-Development images live at =ghcr.io/alfredosa/boring-logtail=. Push one with:
+Development images live at =ghcr.io/alfredosa/boring-logtail= and
+=ghcr.io/alfredosa/boring-collector=. Push both with:
 
 #+begin_src shell
 mise run push
@@ -66,11 +73,31 @@ the transported collector output can create a cross-cgroup observer loop.
 Set =RUST_LOG= if you want something other than the default userspace =info=
 output. Make a process write to stdout or stderr and watch it go.
 
-Configuration stays small. Save this as =config.yaml=:
+The node configuration stays intentionally dull:
 
 #+begin_src yaml
-sampling:
-  percent: 100
+collector:
+  endpoint: http://boring-collector:4318/v1/logs
+  queue_records: 1024
+  queue_bytes: 8388608
+  batch_records: 512
+  batch_bytes: 1048576
+  flush_interval_ms: 1000
+  retry_max_elapsed_ms: 30000
+  request_timeout_ms: 10000
+capture:
+  assembly_operations: 1024
+  assembly_bytes: 4194304
+  framing_lanes: 64
+  framing_bytes: 8388608
+  max_record_bytes: 65536
+#+end_src
+
+The collector gets retention and the interesting policy:
+
+#+begin_src yaml
+listen: 0.0.0.0:4318
+max_request_bytes: 4194304
 
 store:
   max_memory: 128MiB
@@ -101,24 +128,27 @@ event_emitters:
     secret_from_env: WOW_MY_DISCORD_SECRET
 #+end_src
 
-Point =BORING_LOGTAIL_CONFIG= at the file and set the Discord token only if the
-Discord emitter is configured:
+Point =BORING_LOGTAIL_CONFIG= at the node file and =BORING_COLLECTOR_CONFIG= at
+the collector file. Set the Discord token only on the collector:
 
 #+begin_src shell
-export BORING_LOGTAIL_CONFIG=./config.yaml
+export BORING_COLLECTOR_CONFIG=./collector.yaml
 export WOW_MY_DISCORD_SECRET='your-discord-bot-token'
-mise run run
+cargo run --package boring-collector
 #+end_src
 
 The secret value comes from the named environment variable, never the YAML.
-Event matching uses a precompiled regex set and never makes capture wait for
-stdout or Discord. The stdout emitter writes one escaped line such as
+Event matching uses a precompiled regex set and bounded emitter queues. The
+stdout emitter writes one escaped line such as
 =event="joined" type=info message="Someone has joined!" identity="k8s=game-servers/game-1/server ..." stream=Stdout ... log="peer connected: PeerId(123)"=.
 Discord receives a compact colored embed: the configured message, the actual
 caught log, namespace, Pod, container, stream, and one normal UTC timestamp.
-It deliberately leaves internal IDs and sampling machinery out of the alert.
+Valid JSON is rendered as JSON instead of a double-escaped blob, while raw
+stored bytes stay unchanged. Internal IDs and sampling machinery stay out of
+the alert.
 
-=store.retention= accepts whole seconds, minutes, or hours such as =30s=,
+=store.retention= is collector configuration and accepts whole seconds,
+minutes, or hours such as =30s=,
 =15m=, and =2h=. Records age out individually; this is not a periodic
 everything-must-go button.
 

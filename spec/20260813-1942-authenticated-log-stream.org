@@ -1,0 +1,97 @@
+#+title: Authenticated collector log stream
+#+date: 2026-08-13 19:42 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Draft for maintainer approval. No external listener may be implemented yet.
+
+* Context
+
+Authorized Pods need replay followed by live logs from =boring-collector=.
+OTLP is an ingestion protocol, not a query protocol. =blt-api= already provides
+an atomic replay-watermark/live handoff but deliberately has no transport.
+
+#+begin_example
+Pod -- HTTPS + ServiceAccount token --> boring-collector
+                                           |
+                                           v
+                          blt-api -> replay(N) -> live(N+1...)
+#+end_example
+
+The first API should be easy to consume without claiming durable cursors or
+exactly-once delivery that the in-memory store cannot provide.
+
+* Decision
+
+Expose one HTTPS streaming endpoint from the collector:
+
+#+begin_example
+GET /v1/stream?namespace=flux-system
+GET /v1/stream?pod_uid=<uid>
+GET /v1/stream?workload_uid=<uid>
+Authorization: Bearer <Kubernetes ServiceAccount token>
+Accept: application/x-ndjson
+#+end_example
+
+Exactly one selector is required. Each line is a versioned JSON envelope:
+
+#+begin_example
+{"version":1,"sequence":42,"phase":"replay","record":{...}}
+{"version":1,"through":57,"phase":"live","record":{...}}
+{"version":1,"terminal":"subscriber_lagged"}
+#+end_example
+
+Record bytes use UTF-8 text when valid and base64 otherwise. The envelope
+preserves the BLT identity, timestamps, integrity, stream, severity, and raw
+body; it is not the OTLP ingestion mapping.
+
+Authenticate bearer tokens through Kubernetes =TokenReview=. Authorize each
+request through =SubjectAccessReview= against a custom logical resource:
+
+#+begin_example
+verb=watch group=boring-logtail.io resource=logs
+namespace=<selected namespace, or the record namespace for UID selectors>
+#+end_example
+
+Namespace selectors are authorized before subscription. UID selectors require
+a bounded store lookup to resolve their namespace before the stream opens; no
+cross-namespace wildcard exists in v1. Cache successful TokenReviews briefly,
+bounded by token expiry and a small configured entry limit. Never log tokens.
+
+Serve HTTPS only. In Kubernetes, mount a TLS Secret managed outside BLT. The
+collector does not invent certificates or accept plaintext bearer tokens.
+
+Use the shared store's bounded continuous stream and explicit lag error. Add
+request/body/header/time limits and counters for auth failure, authorization
+denial, disconnect, and lag. The internal retained/insert transition is not a
+second public database concept.
+
+* Consequences
+
+- =blt-api= stays transport-free; the collector owns Axum, Kubernetes auth, and
+  wire rendering.
+- A connection is gap-free only from its replay watermark into its live tail.
+- Collector restart ends streams and loses retained history. Reconnectable
+  cursors wait for persistence.
+- NDJSON is inspectable and broadly consumable; it costs more bytes than a
+  protobuf stream. Compression may be added later without changing records.
+- External Loki/OTLP export remains a separate collector output path.
+
+* Acceptance
+
+- Invalid, expired, denied, and wrong-audience tokens never open a stream.
+- Namespace and UID selectors cannot cross their authorized namespace.
+- Replay and live sequences have no handoff gap or duplicate.
+- UTF-8, non-UTF-8, JSON, and integrity evidence round-trip in fixtures.
+- Slow clients terminate explicitly without pinning unbounded memory.
+- TLS, auth caches, stream notifications, and response buffers are bounded.
+- RBAC examples and a two-Pod allow/deny integration test are documented.
+
+* TODO
+
+- [ ] AS1 Approve transport, wire envelope, and Kubernetes authorization model.
+- [ ] AS2 Add versioned wire fixtures and renderer in =blt-api=.
+- [ ] AS3 Implement bounded TokenReview/SAR authentication in the collector.
+- [ ] AS4 Implement TLS NDJSON replay/live streaming and terminal envelopes.
+- [ ] AS5 Add RBAC manifests, allow/deny integration tests, and field-guide docs.

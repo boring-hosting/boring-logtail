@@ -21,15 +21,25 @@ WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
 COPY boring-logtail/Cargo.toml boring-logtail/build.rs ./boring-logtail/
-COPY boring-logtail-common/Cargo.toml ./boring-logtail-common/
-COPY boring-logtail-ebpf/Cargo.toml boring-logtail-ebpf/build.rs ./boring-logtail-ebpf/
+COPY blt-abi/Cargo.toml ./blt-abi/
+COPY blt-ebpf/Cargo.toml blt-ebpf/build.rs ./blt-ebpf/
+COPY blt-emitter/Cargo.toml ./blt-emitter/
+COPY blt-model/Cargo.toml ./blt-model/
+COPY blt-otel/Cargo.toml ./blt-otel/
+COPY blt-store/Cargo.toml ./blt-store/
+COPY boring-collector/Cargo.toml ./boring-collector/
 COPY boring-logtail/src ./boring-logtail/src
-COPY boring-logtail-common/src ./boring-logtail-common/src
-COPY boring-logtail-ebpf/src ./boring-logtail-ebpf/src
+COPY blt-abi/src ./blt-abi/src
+COPY blt-ebpf/src ./blt-ebpf/src
+COPY blt-emitter/src ./blt-emitter/src
+COPY blt-model/src ./blt-model/src
+COPY blt-otel/src ./blt-otel/src
+COPY blt-store/src ./blt-store/src
+COPY boring-collector/src ./boring-collector/src
 
-RUN cargo build --locked --package boring-logtail --release
+RUN cargo build --locked --package boring-logtail --package boring-collector --release
 
-FROM debian:${DEBIAN_VERSION}-slim AS runtime
+FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
 
 LABEL org.opencontainers.image.source="https://github.com/alfredosa/boring-logtail" \
       org.opencontainers.image.description="very fast and furious eBPF log scraper, with kubernetes aware enrichment" \
@@ -39,7 +49,13 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /workspace/target/release/boring-logtail /usr/local/bin/boring-logtail
-
 USER 0:0
+
+FROM runtime-base AS collector
+COPY --from=builder /workspace/target/release/boring-collector /usr/local/bin/boring-collector
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/boring-collector"]
+
+FROM runtime-base AS logtail
+COPY --from=builder /workspace/target/release/boring-logtail /usr/local/bin/boring-logtail
 ENTRYPOINT ["/usr/local/bin/boring-logtail"]

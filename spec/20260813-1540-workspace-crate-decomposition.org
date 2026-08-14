@@ -1,0 +1,278 @@
+#+title: BLT workspace crate decomposition
+#+date: 2026-08-13 15:40 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Implemented and locally validated on 2026-08-13 after maintainer approval.
+
+* Goal
+
+Split the userspace monolith into small crates around boundaries the project
+already has: capture ABI, durable models, bounded storage, delivery, and API
+composition. Clean up the growing =emitter.rs= at the same time, with one file
+per emitter.
+
+Only the host application package and user-facing executable keep the full
+=boring-logtail= name. Internal packages use =blt-<purpose>=. This initiative
+changes internal names and code ownership, not configuration or runtime
+behavior.
+
+This is also a documentation cleanup. The field guide should explain the
+boundaries and data flow instead of pointing readers into one large
+application crate.
+
+* Naming and vocabulary
+
+The initial workspace packages are:
+
+| Package          | Kind                 | Purpose                              |
+|------------------+----------------------+--------------------------------------|
+| =boring-logtail= | host binary          | composition, process lifecycle, CLI |
+| =blt-abi=        | library              | kernel/userspace capture ABI         |
+| =blt-model=      | library              | durable userspace facts              |
+| =blt-store=      | library              | bounded retention and subscriptions  |
+| =blt-emitter=    | library              | bounded destination actors           |
+| =blt-api=        | library, bootstrapped| future external store access         |
+| =blt-ebpf=       | eBPF build package   | kernel capture programs              |
+
+The eBPF program is necessarily compiled as an executable artifact for the
+kernel, but it is internal and is not a host CLI. =boring-logtail= remains the
+only executable installed or invoked by users.
+
+There are two distinct event-shaped facts:
+
+- =WriteEvent= is the fixed-layout eBPF/userspace ABI record for a captured
+  piece of one successful write operation.
+- =CaughtEvent= is a userspace notification produced after one complete
+  =LogRecord= matches a configured catcher.
+
+Keep these concrete names. Do not introduce a bare =Event= type or an
+=events.rs= dumping ground.
+
+* Dependency direction
+
+#+begin_example
+                         blt-abi
+                            ^
+                            |
+                    boring-logtail
+                    /      |      \
+                   v       v       v
+             blt-store  blt-api  blt-emitter
+                   \       |       /
+                    \      v      /
+                       blt-model
+
+blt-ebpf ---> blt-abi
+#+end_example
+
+=boring-logtail= is the composition root. Internal crates never depend on it.
+=blt-model= is the leaf shared by the userspace store, API, and emitters.
+=blt-store= and =blt-emitter= do not depend on each other. =blt-api= may depend
+on =blt-store= for its internal service boundary and on =blt-model= for values
+it exposes. No cycle is permitted.
+
+* Crate responsibilities
+
+** =blt-abi=
+
+Rename =boring-logtail-common= to =blt-abi=. It owns only the versioned
+kernel/userspace wire layout, ABI flags/constants, and chunk math used on both
+sides. =WriteEvent= stays here. Preserve its =no_std= suitability and optional
+userspace Aya integration.
+
+** =blt-model=
+
+Own stable, byte-preserving userspace facts and small behavior intrinsic to
+those facts:
+
+- =LogRecord= and =RecordIntegrity=;
+- stream and severity values plus their stable formatting;
+- container, Kubernetes, workload, and honest unresolved-source identity;
+- =EventType=, =EventDefinition=, and =CaughtEvent=; and
+- constructors, accessors, descriptions, equality, hashing, and accounting
+  calculations that refer only to these model values.
+
+It must not own active orchestration just because orchestration produces a
+model. Syscall reconstruction, newline framing state machines, Kubernetes
+watching, regex compilation, queues, retention, HTTP, and configuration stay
+outside =blt-model=.
+
+=blt-model= does not depend on Tokio, Aya, kube, reqwest, regex, the store,
+emitters, API, or application. This is the stable seam through which storage,
+emitters, and a future streaming API share the exact same =Arc<LogRecord>=.
+
+** =blt-store=
+
+Own the bounded in-memory product contract currently implemented by
+=store.rs=:
+
+- =StoreConfig= and derived memory limits;
+- =LogStore= lifecycle and append admission;
+- workload-owned retention and expiry;
+- selectors, sequences, replay snapshots, and live subscriptions;
+- subscriber isolation, accounting, and store statistics; and
+- focused storage tests and allocation benchmark.
+
+It depends on =blt-model=. It receives finalized records and knows nothing
+about eBPF, reconstruction, enrichment watches, catchers, emitters, HTTP, or
+the application configuration as a whole.
+
+** =blt-emitter=
+
+Own bounded emitter queues, sender handles, delivery counters, actor lifecycle,
+runtime destination configuration, and shutdown coordination. Destination
+implementations are separate files:
+
+#+begin_example
+blt-emitter/src/
+  lib.rs
+  stdout.rs
+  discord.rs
+#+end_example
+
+=stdout.rs= owns one-line rendering, byte quoting, writer delivery, and its
+tests. =discord.rs= owns embed/request types, rendering, HTTP delivery, and its
+loopback fake-server tests. Shared =lib.rs= stays small and contains only
+genuinely destination-neutral actor machinery and wiring.
+
+Application YAML types and environment lookup remain in =boring-logtail=.
+Startup validates the Discord secret and constructs runtime emitter
+configuration without exposing the secret through diagnostics.
+
+** =blt-api=
+
+Bootstrap the library boundary for streaming records from =blt-store=. In
+this initiative it defines only an in-process API service façade over store
+selection and subscription primitives, expressed with =blt-model= values.
+It compiles, has construction/contract tests, and makes the intended dependency
+direction real.
+
+It does not open a socket, select HTTP/gRPC, define authentication, stabilize a
+wire format, or claim a public compatibility contract. Those require their own
+specification and threat model. The bootstrap must not leak store internals
+merely to appear substantial.
+
+** =blt-ebpf=
+
+Rename =boring-logtail-ebpf= to =blt-ebpf=. Preserve the internal executable
+artifact and build-script embedding used by =boring-logtail=. It depends only
+on =blt-abi= plus kernel-side dependencies.
+
+** =boring-logtail=
+
+Remain the host composition root. It owns YAML loading, process lifecycle,
+eBPF loading, syscall reconstruction, record framing, Kubernetes watches,
+filter/sampling policy, catcher compilation, and wiring between store, API,
+and emitters.
+
+These remaining responsibilities are not declared permanently inseparable.
+Future evidence may justify =blt-capture=, =blt-enrichment=, or =blt-config=,
+but this initiative will not create speculative one-module crates or freeze
+interfaces that have not settled.
+
+* Migration rules
+
+- Move behavior with the data boundary it implements; do not leave proxy
+  modules in =boring-logtail= merely to preserve internal import paths.
+- Preserve the user's uncommitted changes in the old =emitter.rs= while moving
+  that implementation.
+- Keep every new program file and manifest under =GPL-3.0-or-later= and every
+  new documentation file under =GFDL-1.3-or-later=.
+- Update Cargo package names, Rust import names, build metadata lookup,
+  container build paths, mise/CI commands, field-guide links, and examples as
+  one migration.
+- A crate must have a coherent public surface and private implementation; file
+  relocation alone is not completion.
+
+* Behavioral invariants
+
+- Capture, reconstruction, filtering, sampling, framing, storage, matching,
+  and delivery order do not change.
+- =Arc<LogRecord>= remains the exact immutable value shared by ordinary
+  output, the store, caught events, and future API access; no lossy shadow
+  payload is introduced.
+- Store memory bounds, retention, replay/live handoff, selectors, counters,
+  and shutdown behavior remain unchanged.
+- Each configured emitter retains one bounded Tokio queue and one worker;
+  capture uses nonblocking =try_send=.
+- Emitter queue capacity, five-second shutdown, counters, stdout escaping,
+  compact Discord embeds, and secret handling remain unchanged.
+- Discord tests use only a loopback endpoint. No test needs a real secret or
+  internet access.
+- The API bootstrap exposes no network port and makes no unauthenticated
+  external service available.
+
+* Documentation initiative
+
+Add a field-guide page for the workspace architecture with a plain-language
+data-flow overview and an exact dependency map. Update existing pages and
+links to use =blt-= package names and distinguish =WriteEvent=, =LogRecord=,
+and =CaughtEvent=.
+
+Update =ROADMAP.org= to show the crate decomposition and API bootstrap as
+landed foundations while leaving external protocol/authentication work open.
+Resolve the existing deferred “revisit crate boundaries” item when the split
+lands. Keep the external streaming protocol entry open and point it at
+=blt-api= plus its future specification.
+
+* Acceptance
+
+- The workspace contains =blt-abi=, =blt-model=, =blt-store=, =blt-emitter=,
+  =blt-api=, =blt-ebpf=, and =boring-logtail= with the dependency direction
+  specified above and no cycles.
+- Only =boring-logtail= produces a user-facing host executable; the internal
+  =blt-ebpf= artifact continues to embed and load correctly.
+- =WriteEvent= lives only in =blt-abi=. Durable userspace models live in
+  =blt-model=. Store types and behavior live in =blt-store=. No ambiguous bare
+  =Event= type is introduced.
+- =blt-api= provides a tested in-process façade over store subscriptions but
+  has no transport, listener, authentication claim, or wire-format promise.
+- The application has no =emitter.rs=. Stdout and Discord reside in separate
+  files in =blt-emitter=, with focused tests beside their implementation.
+- Existing configuration and runtime behavior remain covered by migrated
+  focused tests.
+- Container builds, build-script eBPF embedding, mise tasks, and documented
+  developer commands use the renamed packages.
+- The field guide explains the resulting architecture; README stays small;
+  roadmap and deferred-work indexes remain truthful.
+- Focused crate tests, workspace tests, strict userspace and eBPF Clippy,
+  formatting, and diff checks pass locally.
+
+* TODO
+
+- [X] C1 Rename the shared ABI and internal eBPF packages to =blt-abi= and
+  =blt-ebpf= while preserving eBPF compilation and embedding.
+- [X] C2 Add =blt-model= and move durable record, identity, stream, and event
+  domain values plus intrinsic behavior.
+- [X] C3 Add =blt-store= and move bounded retention, replay/live subscription,
+  configuration, accounting, tests, and benchmark.
+- [X] C4 Bootstrap =blt-api= as a tested in-process store subscription façade,
+  without selecting an external transport.
+- [X] C5 Add =blt-emitter= with destination-neutral bounded actor lifecycle and
+  runtime configuration.
+- [X] C6 Move stdout and Discord into separate emitter modules with their
+  rendering, delivery, and focused tests.
+- [X] C7 Rewire =boring-logtail= as the composition root and remove superseded
+  application modules without behavior changes.
+- [X] C8 Update Cargo/build/container/task files for all package names and
+  verify the internal eBPF artifact still loads.
+- [X] C9 Add the workspace architecture field-guide page and update README,
+  existing learning links, roadmap, and deferred-work index.
+- [X] C10 Pass focused crate tests, workspace tests, strict userspace and eBPF
+  Clippy, formatting, and diff checks; record evidence here.
+
+* Validation results
+
+- =cargo test --workspace=: passed with 87 tests and one ignored manual store
+  benchmark. Discord delivery used only its loopback fake endpoint.
+- Strict Clippy passed with warnings denied for =boring-logtail=, =blt-abi=,
+  =blt-api=, =blt-emitter=, =blt-model=, and =blt-store= across all targets.
+- Nightly =blt-ebpf= library Clippy passed with warnings denied; the actual eBPF
+  executable compiled through Aya's =build-std= path in both host and container
+  release builds.
+- =docker build -t boring-logtail:crate-split .= passed and copied the sole host
+  executable to =/usr/local/bin/boring-logtail=.
+- =cargo fmt --all --check=, =git diff --check=, package-name searches, source
+  boundary searches, and the Cargo dependency-tree audit passed.

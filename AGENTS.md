@@ -27,8 +27,26 @@ This is a joyful hacker project, not corporate product collateral.
 
 ## Workflow Rules
 
+- Build from simple to needed. Start with the smallest design that satisfies a
+  concrete current use. Add another abstraction, queue, actor, index, cache,
+  configuration knob, or extension point only when a demonstrated requirement
+  makes it necessary.
+- Never build a complete imagined feature set in advance. A roadmap idea is not
+  an implementation requirement. Record plausible later work in `TODO.org` and
+  leave the code small until real use supplies the missing constraint.
+- Prefer deleting speculative machinery over preserving it for hypothetical
+  reuse. Existing complexity must justify itself against current behavior,
+  correctness, or measured performance; "we might need it" is not enough.
 - Never write or modify code without first checking spec/ folder for architectural alignment.
 - If a new feature is requested, propose a new spec file (prefixed with date and time) in the spec/ folder first and wait for approval.
+- Specs are compact ADRs, not design bibles. State the context, decision,
+  important consequences, acceptance checks, and TODOs in clear, terse language.
+  Do not repeat field-guide material, narrate obvious implementation details, or
+  inventory every possibility. Link to =learn/= or an older spec for background.
+  Add a small text diagram when it makes topology, ownership, or data flow
+  materially clearer; keep it focused and label the important boundary.
+  Keep a spec comfortably reviewable in one sitting; exceeding roughly 150
+  lines requires explicit maintainer approval.
 - Track all execution in a TODO section in the spec. Check off items only after tests pass locally.
 - Keep that spec TODO section in sync with the task list (the plan the user sees in Emacs): when
   you start/finish/restructure a spec TODO item, make the matching TaskCreate/TaskUpdate change

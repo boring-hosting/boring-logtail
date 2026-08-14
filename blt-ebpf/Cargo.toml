@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [package]
-name = "boring-logtail-ebpf"
+name = "blt-ebpf"
 version = "0.1.0"
 edition.workspace = true
 
 license.workspace = true
 
 [dependencies]
-boring-logtail-common = { path = "../boring-logtail-common" }
+blt-abi = { path = "../blt-abi" }
 
 aya-ebpf = { workspace = true }
 
@@ -16,6 +16,6 @@ aya-ebpf = { workspace = true }
 which = { workspace = true }
 
 [[bin]]
-name = "boring-logtail"
+name = "blt-ebpf"
 path = "src/main.rs"
 test = false

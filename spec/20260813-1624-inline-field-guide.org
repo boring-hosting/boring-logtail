@@ -1,0 +1,90 @@
+#+title: Inline field guide for tricky code
+#+date: 2026-08-13 16:24 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Requested by the maintainer and completed on 2026-08-13.
+
+* Goal
+
+Bring the teaching style of =learn/= next to the code that needs it. A reader
+who can read Rust should be able to understand what the non-obvious machinery
+does, why it exists, what invariant it protects, and where the simplification
+stops being true without first reverse-engineering the whole repository.
+
+* Writing contract
+
+- Start with the plain version, then state the exact mechanism.
+- Explain why a boundary or data structure exists; do not translate obvious
+  syntax into English.
+- Put crate/module overviews in =//!=== docs, public API contracts in =///= docs,
+  and local invariant explanations beside the relevant private code.
+- Document failure and ambiguity paths, memory/backpressure ownership, and
+  safety arguments around every non-trivial =unsafe= block.
+- Keep comments small enough to remain readable beside code. Link to =learn/=
+  for the longer walk rather than cloning whole chapters into Rust files.
+- Preserve the project's terse, joyful voice and technical honesty.
+
+* Scope
+
+The audit covers every Rust source file. Deep explanations concentrate on:
+
+- eBPF entry/exit pairing, maps, tail calls, bounded user-memory reads, and ABI
+  emission;
+- userspace write reconstruction, framing, sampling, and capture ownership;
+- cgroup scanning plus the exact cgroup/container/Pod identity join;
+- Kubernetes relists, stale snapshots, workload history, and ambiguity;
+- store memory partitions, admission permits, retention, replay/live handoff,
+  subscriber isolation, and shutdown;
+- model stage vocabulary and why values are shared through =Arc=;
+- emitter queues, failure isolation, Discord safety, and stdout escaping; and
+- the transport-free API façade and application composition root.
+
+Tests receive comments only where a fixture proves an invariant that is not
+obvious from its name. Generated API documentation must build with warnings
+denied and no broken intra-doc links.
+
+* Acceptance
+
+- Every crate and substantial application module has a useful plain-first
+  overview with a pointer to the relevant field-guide page.
+- Every public domain/store/API/emitter type and non-obvious public operation
+  explains its purpose and important ownership or failure semantics.
+- Complex private state machines and memory/accounting choices have nearby
+  “why” comments.
+- Every production =unsafe= block has a specific safety explanation.
+- Inline claims agree with =learn/=; any discovered mismatch is repaired in the
+  same TODO item.
+- Documentation adds no behavior change and avoids commentary on obvious code.
+- Rustdoc, workspace tests, strict userspace and eBPF Clippy, formatting,
+  field-guide link checks, and diff checks pass.
+
+* TODO
+
+- [X] I1 Document =blt-abi= and =blt-ebpf=: ABI stages, map ownership, tail
+  calls, bounded reads, and unsafe safety arguments.
+- [X] I2 Document =blt-model=, =blt-api=, and =blt-emitter=: vocabulary,
+  ownership, queue isolation, rendering, and transport boundaries.
+- [X] I3 Document =blt-store=: memory envelope, admission, retention,
+  subscriptions, accounting, lag, and shutdown.
+- [X] I4 Document userspace reconstruction, framing, sampling, filtering, and
+  application lifecycle in =boring-logtail=.
+- [X] I5 Document cgroup discovery, Kubernetes watches/relisting, enrichment,
+  and exact identity joins; reconcile =learn/= wording with code evidence.
+- [X] I6 Audit all remaining Rust files, remove stale comments/TODOs, and check
+  that inline docs teach why without narrating syntax.
+- [X] I7 Build rustdoc and pass workspace tests, strict Clippy, formatting,
+  field-guide link checks, and diff checks; record evidence here.
+
+* Validation evidence
+
+- =cargo fmt --all -- --check=: pass (stable Cargo reports the existing nightly
+  rustfmt-option warnings).
+- =RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps=: pass.
+- Strict userspace Clippy across =blt-abi=, =blt-model=, =blt-store=,
+  =blt-api=, =blt-emitter=, and =boring-logtail=: pass.
+- =cargo +nightly clippy --package blt-ebpf --lib -- -D warnings=: pass.
+- =cargo test --workspace=: 87 passed, one manual benchmark ignored.
+- Emacs =org-lint= over every Org file: pass.
+- =git diff --check=: pass.

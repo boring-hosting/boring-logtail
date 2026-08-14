@@ -8,7 +8,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-boring-logtail-common = { path = "../boring-logtail-common", features = ["user"] }
+blt-abi = { path = "../blt-abi", features = ["user"] }
+blt-model = { path = "../blt-model" }
+blt-otel = { path = "../blt-otel" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -17,15 +19,12 @@ futures = "0.3"
 libc = { workspace = true }
 log = { workspace = true }
 jiff = "0.2"
-regex = { version = "1", default-features = false, features = ["perf", "std", "unicode-perl"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
 kube = { version = "4.2", features = ["runtime"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { workspace = true, features = [
     "macros",
-    "io-std",
     "rt",
     "rt-multi-thread",
     "net",
@@ -50,7 +49,7 @@ cargo_metadata = { workspace = true }
 # Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
-boring-logtail-ebpf = { path = "../boring-logtail-ebpf" }
+blt-ebpf = { path = "../blt-ebpf" }
 
 [dev-dependencies]
 serde_json = "1"

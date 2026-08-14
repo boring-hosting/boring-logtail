@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Userspace pieces of the `boring-logtail` binary.
+//!
+//! The first boundary is intentionally tiny: copy one fixed-size ABI event out
+//! of the kernel ring buffer, reject an unknown layout version, then let the
+//! pipeline reconstruct its meaning. No kernel-owned pointer escapes here.
+
 pub mod cgroup_resolver;
 pub mod config;
-pub mod emitter;
 pub mod enrichment;
-pub mod event;
-pub mod filter;
+mod framing;
 pub mod k8s_watch;
 pub mod pipeline;
-pub mod record;
-pub mod sampling;
-pub mod store;
 
 use std::fmt;
 
-use boring_logtail_common::WriteEvent;
+use blt_abi::WriteEvent;
 
 #[derive(Debug, Eq, PartialEq)]
+
 pub struct InvalidEventSize {
     pub expected: usize,
     pub actual: usize,
@@ -35,6 +37,7 @@ impl fmt::Display for InvalidEventSize {
 impl std::error::Error for InvalidEventSize {}
 
 #[derive(Debug, Eq, PartialEq)]
+
 pub enum InvalidEvent {
     Size(InvalidEventSize),
     UnsupportedVersion { expected: u16, actual: u16 },
@@ -44,10 +47,12 @@ impl fmt::Display for InvalidEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Size(error) => error.fmt(formatter),
-            Self::UnsupportedVersion { expected, actual } => write!(
-                formatter,
-                "unsupported log event ABI version {actual}, expected {expected}"
-            ),
+            Self::UnsupportedVersion { expected, actual } => {
+                write!(
+                    formatter,
+                    "unsupported log event ABI version {actual}, expected {expected}"
+                )
+            }
         }
     }
 }
@@ -55,8 +60,10 @@ impl fmt::Display for InvalidEvent {
 impl std::error::Error for InvalidEvent {}
 
 /// Decode one fixed-size record received from the kernel ring buffer.
+
 pub fn decode_event(bytes: &[u8]) -> Result<WriteEvent, InvalidEvent> {
     let expected = size_of::<WriteEvent>();
+
     if bytes.len() != expected {
         return Err(InvalidEvent::Size(InvalidEventSize {
             expected,
@@ -64,21 +71,26 @@ pub fn decode_event(bytes: &[u8]) -> Result<WriteEvent, InvalidEvent> {
         }));
     }
 
-    // Every bit pattern is valid for WriteEvent's integer and byte-array fields.
-    // read_unaligned avoids requiring the ring-buffer byte slice to be aligned.
+    // SAFETY: WriteEvent is `repr(C)` and contains only integers and a byte
+    // array, for which every bit pattern is valid. The exact size was checked
+    // above; read_unaligned does not assume ring-buffer alignment.
     let event = unsafe { bytes.as_ptr().cast::<WriteEvent>().read_unaligned() };
-    if event.abi_version != boring_logtail_common::WRITE_EVENT_VERSION {
+
+    if event.abi_version != blt_abi::WRITE_EVENT_VERSION {
         return Err(InvalidEvent::UnsupportedVersion {
-            expected: boring_logtail_common::WRITE_EVENT_VERSION,
+            expected: blt_abi::WRITE_EVENT_VERSION,
             actual: event.abi_version,
         });
     }
+
     Ok(event)
 }
 
 #[cfg(test)]
+
 mod tests {
-    use boring_logtail_common::{
+
+    use blt_abi::{
         CAPTURE_SOURCE_APPLICATION_SYSCALL, FLAG_FD_KNOWN, FLAG_FIRST_CHUNK, FLAG_LAST_CHUNK,
         OPERATION_WRITE, WRITE_CHUNK_SIZE, WRITE_EVENT_VERSION,
     };
@@ -95,6 +107,7 @@ mod tests {
     }
 
     #[test]
+
     fn decodes_an_unaligned_ring_buffer_record() {
         let mut event = WriteEvent {
             abi_version: WRITE_EVENT_VERSION,
@@ -114,17 +127,22 @@ mod tests {
             captured_len: 3,
             data: [0; WRITE_CHUNK_SIZE],
         };
+
         event.data[..3_usize].copy_from_slice(b"hi\n");
+
         let mut storage = vec![0xaa];
+
         storage.extend_from_slice(event_bytes(&event));
 
         let decoded = decode_event(&storage[1..]).unwrap();
 
         assert_eq!(decoded, event);
+
         assert_eq!(decoded.payload(), b"hi\n");
     }
 
     #[test]
+
     fn rejects_records_with_the_wrong_size() {
         let error = decode_event(&[0u8; 12]).unwrap_err();
 
@@ -132,12 +150,13 @@ mod tests {
             error,
             InvalidEvent::Size(InvalidEventSize {
                 expected: size_of::<WriteEvent>(),
-                actual: 12,
+                actual: 12
             })
         );
     }
 
     #[test]
+
     fn rejects_records_from_an_unknown_abi_version() {
         let mut event = WriteEvent {
             abi_version: WRITE_EVENT_VERSION + 1,
@@ -162,7 +181,9 @@ mod tests {
             decode_event(event_bytes(&event)),
             Err(InvalidEvent::UnsupportedVersion { .. })
         ));
+
         event.abi_version = WRITE_EVENT_VERSION;
+
         assert!(decode_event(event_bytes(&event)).is_ok());
     }
 }

@@ -20,7 +20,7 @@ do not have libc, arbitrary syscalls, an allocator, or an unconstrained stack.
 Their world is deliberately smaller.
 
 *Why we care.* Three tracepoint programs currently handle write entry, write
-exit, and chunk emission in [[file:../boring-logtail-ebpf/src/main.rs][the eBPF binary]].
+exit, and chunk emission in [[file:../blt-ebpf/src/main.rs][the eBPF binary]].
 
 * The verifier: prove it before you run it
 
@@ -205,7 +205,7 @@ observable truncation limit.
 *Plain version.* Kernel and userspace must agree exactly on the shape of every
 message.
 
-*Technical truth.* [[file:../boring-logtail-common/src/lib.rs][boring-logtail-common]] defines
+*Technical truth.* [[file:../blt-abi/src/lib.rs][blt-abi]] defines
 =WriteEvent= with =#[repr(C)]=, fixed-width integer fields, and a fixed byte
 array. The ABI version is part of every event. Layout, alignment, endianness,
 field meaning, and flag meaning form the contract—not merely the Rust type

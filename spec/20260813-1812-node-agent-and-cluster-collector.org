@@ -1,0 +1,135 @@
+#+title: Split node capture from cluster collection
+#+date: 2026-08-13 18:12 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved 2026-08-13. Implementation in progress.
+
+* Context
+
+One process currently owns node capture, retention, querying, filtering, and
+alert delivery. Those jobs have different failure and scaling boundaries.
+Consumers also need one cluster endpoint, not fan-out to every DaemonSet Pod.
+
+#+begin_example
+each node                                      once per cluster
+
+application writes
+       |
+       v
+boring-logtail -- OTLP Logs --> boring-collector --> Loki / OTLP
+  capture + framing                 store + policy
+  node enrichment                  replay/live API <-- authorized Pods
+#+end_example
+
+The escaped Discord body (=\{\"level\":...\}\n=) is a rendering problem:
+capture preserved bytes, but a diagnostic byte representation was shown to a
+human. Structured interpretation must happen after record framing while raw
+bytes remain authoritative.
+
+* Decision
+
+** =boring-logtail=: node agent
+
+One DaemonSet Pod per node owns:
+
+- eBPF capture and =write=/=writev= reconstruction;
+- bounded newline framing and integrity evidence;
+- cgroup/container/Kubernetes enrichment;
+- BLT-to-OTLP Logs mapping; and
+- bounded batching, retry, timed/shutdown flush, and loss metrics.
+
+Its configuration is small: collector endpoint, batch/flush/retry bounds, and
+capture safety limits. It owns no queryable retention, rich filters, alerts,
+or external API.
+
+** =boring-collector=: database and API
+
+One Deployment plus Service owns:
+
+- OTLP Logs ingestion;
+- bounded cluster-wide retention;
+- filtering, sampling, JSON interpretation, catchers, and emitters;
+- downstream Loki/OTLP export; and
+- authenticated replay/live access for other Pods.
+
+Phase one reuses the bounded in-memory =blt-store=. “Database” means it owns the
+authoritative queryable copy, not that it is durable. Persistence, recovery,
+and reconnectable cursors require a later ADR.
+
+** Contracts
+
+Node agents send standard OTLP Logs, initially OTLP/HTTP protobuf on =/v1/logs=.
+Use OTel resource conventions for Kubernetes/container identity and =blt.*=
+attributes for capture integrity and exact workload UID. Kernel monotonic
+timestamps remain attributes; only wall-clock observations become OTLP Unix
+timestamps.
+
+The raw framed body always round-trips. Valid UTF-8 uses an OTLP string;
+non-UTF-8 uses bytes. The collector may parse a complete valid JSON body into a
+structured view, but never replaces or drops the raw body. Human emitters show
+JSON as JSON rather than double-escaped text.
+
+OTLP is ingestion, not querying. =blt-api= remains the internal replay/live
+seam. A separate ADR must choose the external streaming transport and define
+authentication, authorization, selectors, gaps, lag, and compatibility before
+opening a listener.
+
+** Retention
+
+Collector configuration retains the existing product guarantees:
+
+- total memory envelope;
+- retention duration;
+- maximum records per workload;
+- bounded ingress, replay, and live subscriber memory; and
+- explicit eviction, rejection, gap, and lag metrics.
+
+Retention remains keyed by workload UID, or standalone Pod UID, while each
+record preserves Pod/container identity. Expiry starts at collector admission
+using its monotonic clock. Unresolved records need a separately bounded policy;
+they must not disappear silently.
+
+* Consequences
+
+- =blt-store=, =blt-api=, catchers, and =blt-emitter= move to the collector.
+- Add =blt-otel= for the explicit internal-model/OTLP mapping.
+- Extract capture/enrichment crates only when moving coherent ownership.
+- Slow APIs, alerts, and exporters cannot stall node capture.
+- Phase one can lose buffered/retained data on restart and says so.
+- Semantic multiline framing and disk persistence remain separate work.
+
+* Migration
+
+1. Fixture-test the BLT-to-OTLP mapping.
+2. Start =boring-collector= with bounded OTLP ingestion and =blt-store=.
+3. Add bounded OTLP export to =boring-logtail= and prove the live path.
+4. Move policy, catchers, emitters, store, and API ownership.
+5. Remove obsolete node-local wiring and slim agent configuration.
+6. Specify and expose authenticated replay/live access.
+
+* Acceptance
+
+- DaemonSet agents only capture, frame, enrich, batch, and export.
+- The collector receives OTLP and owns all queryable retention and rich policy.
+- Mapping tests cover identity, integrity, timestamps, JSON text, and non-UTF-8.
+- Retention and every queue/pin/subscriber pool are configured and bounded.
+- JSON alerts are readable and raw bytes still round-trip.
+- All loss, eviction, rejection, lag, and restart boundaries are explicit.
+- Manifests, docs, tests, lint, builds, and a live two-node smoke test pass.
+
+* TODO
+
+- [X] NC1 Approve topology, responsibility split, in-memory database boundary,
+  and migration order.
+- [X] NC2 Specify and fixture-test the versioned BLT-to-OTLP Logs mapping.
+- [X] NC3 Bootstrap =boring-collector= with bounded OTLP/HTTP ingestion and
+  =blt-store=.
+- [X] NC4 Add bounded batching, flush, retry, and delivery telemetry to the
+  node agent.
+- [X] NC5 Move rich policy, catchers, emitters, and JSON rendering.
+- [-] NC6 Move API ownership and specify authenticated external streaming.
+- [X] NC7 Split coherent crates and remove obsolete node-agent wiring.
+- [-] NC8 Add manifests, migration mode, and end-to-end tests.
+- [ ] NC9 Reconcile docs and pass all release gates.

@@ -71,7 +71,7 @@ sed -n '1,120p' /sys/kernel/tracing/events/syscalls/sys_exit_write/format
 #+end_src
 
 Compare field offsets with the reads in
-[[file:../boring-logtail-ebpf/src/main.rs][boring-logtail-ebpf/src/main.rs]]. This is the concrete ABI beneath
+[[file:../blt-ebpf/src/main.rs][blt-ebpf/src/main.rs]]. This is the concrete ABI beneath
 =TracePointContext::read_at=.
 
 * Inspect the deployed collectors
@@ -147,10 +147,14 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy \
   --package boring-logtail \
-  --package boring-logtail-common \
+  --package blt-abi \
+  --package blt-api \
+  --package blt-emitter \
+  --package blt-model \
+  --package blt-store \
   --all-targets -- -D warnings
 cargo +nightly clippy \
-  --package boring-logtail-ebpf --lib -- -D warnings
+  --package blt-ebpf --lib -- -D warnings
 #+end_src
 
 The eBPF executable itself is built through Aya's nightly =build-std= path when
@@ -160,7 +164,7 @@ the userspace package builds. Stable workspace-wide Clippy tries an unwinding
 * Follow the code after the experiment
 
 - The cgroup test: [[file:../boring-logtail/src/cgroup.rs][CollectorCgroup]]
-- The eBPF filter and hooks: [[file:../boring-logtail-ebpf/src/main.rs][kernel capture]]
+- The eBPF filter and hooks: [[file:../blt-ebpf/src/main.rs][kernel capture]]
 - The ring-buffer decoder: [[file:../boring-logtail/src/lib.rs][decode_event]]
 - The write reconstruction: [[file:../boring-logtail/src/pipeline.rs][WriteAssembler]]
 - The full tour: [[file:boring-logtail.org][how boring-logtail hears a write]]

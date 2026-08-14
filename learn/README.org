@@ -20,9 +20,11 @@ before opening the kernel documentation and wondering where the floor went.
 3. [[file:boring-logtail.org][How boring-logtail hears a write]]
    The current path through this repository, including exactly where data can
    be lost or misunderstood.
-4. [[file:glossary.org][Words without gatekeeping]]
+4. [[file:workspace.org][The BLT crate map]]
+   Why the ABI, models, store, API, emitters, and host application live apart.
+5. [[file:glossary.org][Words without gatekeeping]]
    The quick alphabetical lookup when one suspicious noun blocks the paragraph.
-5. [[file:lab.org][Poke it and see]]
+6. [[file:lab.org][Poke it and see]]
    Small experiments that make the nouns visible on a real Linux machine.
 
 * The reading pattern

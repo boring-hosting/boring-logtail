@@ -5,13 +5,6 @@ This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
 =spec/=.
 
-* TODO Revisit crate boundaries after enrichment responsibilities settle
-
-Why: Linux capture, cgroup/runtime discovery, and Kubernetes-shaped identity
-may deserve separate crates, but splitting them before their interfaces have
-survived real use would freeze guesses. See
-=spec/20260802-0743-kubernetes-identity-enrichment.org=.
-
 * TODO Remove konnectivity packet tracing from ordinary cluster operation
 
 Why: both node agents run with =-v=8=; following boring-logtail through
@@ -37,19 +30,39 @@ workloads look unresolved, while metadata lag can produce the same outcome; one
 counter cannot diagnose both. See
 =spec/20260805-1655-declarative-capture-filters.org=.
 
-* TODO Design the authenticated external streaming protocol
+* TODO Implement the approved authenticated collector streaming protocol
 
-Why: the bounded store defines an internal replay-watermark/live-receiver
-contract, but transport, selectors exposed to users, authorization, and wire
-backpressure need their own threat model. Store selectors are workload, Pod,
-and namespace identity; the external representation is still undecided. See
-=spec/20260809-1905-workload-store-product-contract.org=.
+Why: =blt-api= now exposes one bounded selector stream from the shared database;
+the approved transport, selectors, authorization, and wire backpressure still
+need implementation before Pods can consume it. See
+=spec/20260813-1942-authenticated-log-stream.org= and
+=spec/20260814-1722-direct-shared-log-store.org=.
 
 * TODO Add durable replay cursors only with persistence and acknowledgements
 
 Why: process-local sequence numbers can make one connected replay/live handoff
 gap-free, but cannot provide exactly-once reconnects or survive agent restart.
 See =spec/20260809-1626-bounded-replay-log-store.org=.
+
+* TODO Specify collector persistence and crash recovery
+
+Why: calling the collector a database does not make bounded RAM survive a
+restart; disk format, corruption handling, recovery, compaction, and cursor
+durability need evidence and their own contract. See
+=spec/20260813-1812-node-agent-and-cluster-collector.org=.
+
+* TODO Specify bounded semantic multiline framing
+
+Why: whole-record JSON recognition is safe after newline framing, but joining
+stack traces or multi-line JSON changes record boundaries and memory pressure.
+See =spec/20260813-1812-node-agent-and-cluster-collector.org=.
+
+* TODO Profile the remaining node-agent heap under sustained burst traffic
+
+Why: bounding glibc arenas cut live RSS from 55--58 MiB to 33--34 MiB, but a
+heap profile should attribute the remaining roughly 25 MiB anonymous RSS
+before further tuning. See
+=spec/20260813-1812-node-agent-and-cluster-collector.org=.
 
 * TODO Design event message capture interpolation
 
