@@ -54,12 +54,13 @@ Development images live at =ghcr.io/alfredosa/boring-logtail= and
 =ghcr.io/alfredosa/boring-collector=. Push both with:
 
 #+begin_src shell
-mise run push
+mise publish
 #+end_src
 
-Pushing needs a local =docker login ghcr.io=. Once the GHCR package visibility
-is Public, pulling needs no login and kubernetes needs no registry Secret. Start
-the development loop with:
+This builds both Docker targets directly and publishes matching UTC
+=YYYYMMDD-HHMM= and =latest= tags. Pushing needs a local =docker login
+ghcr.io=. Once the GHCR package visibility is Public, pulling needs no login
+and kubernetes needs no registry Secret. Start the development loop with:
 
 #+begin_src shell
 skaffold dev
@@ -97,6 +98,7 @@ The collector gets retention and the interesting policy:
 
 #+begin_src yaml
 listen: 0.0.0.0:4318
+grpc_listen: 0.0.0.0:50051
 max_request_bytes: 4194304
 
 store:

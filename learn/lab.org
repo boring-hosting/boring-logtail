@@ -138,6 +138,22 @@ No match is the desired result. A nested collector =write= record inside
 =payload== means self-exclusion failed. Do not leave the collector running in
 that state; output amplification can be violent.
 
+* Stream retained and new logs through real gRPC
+
+*LOCAL.* This starts the collector's Tonic server on an ephemeral loopback
+port, connects with its generated client, reads the newest retained matching
+line, appends one non-match and one match, then proves only the match continues
+the stream. It also proves a non-following Pod-name request ends after its tail.
+
+#+begin_src shell
+cargo test -p boring-collector \
+  grpc::tests::real_client_gets_retained_tail_then_matching_inserts \
+  -- --nocapture
+#+end_src
+
+The fixture includes non-UTF-8 bytes so the protobuf =bytes line= field is
+tested rather than merely inferred from a Rust type.
+
 * Run the local correctness gates
 
 *LOCAL.* Builds under =target/= and does not change the cluster.
@@ -148,10 +164,10 @@ cargo test --workspace
 cargo clippy \
   --package boring-logtail \
   --package blt-abi \
-  --package blt-api \
   --package blt-emitter \
   --package blt-model \
   --package blt-store \
+  --package boring-collector \
   --all-targets -- -D warnings
 cargo +nightly clippy \
   --package blt-ebpf --lib -- -D warnings

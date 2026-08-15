@@ -209,8 +209,8 @@ impl StoredRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Selector {
-    PodUid(String),
-    WorkloadUid(String),
+    Pod(String),
+    Workload(String),
     Namespace(String),
 }
 
@@ -317,13 +317,15 @@ impl LogStore {
         Ok(state.query(selector))
     }
 
-    pub fn stream(&self, selector: Selector) -> Result<LogStream, StreamError> {
+    pub fn stream(&self, selector: Selector, tail_lines: usize) -> Result<LogStream, StreamError> {
         validate_selector(&selector)?;
         let receiver = self.notifications.subscribe();
         let mut state = self.state.write().expect("log store lock poisoned");
         state.expire(Instant::now());
         let through = state.next;
-        let retained = state.query(&selector).into();
+        let retained = state.query(&selector);
+        let skip = retained.len().saturating_sub(tail_lines);
+        let retained = retained.into_iter().skip(skip).collect();
         Ok(LogStream {
             selector,
             through,
@@ -584,7 +586,7 @@ enum EvictionReason {
 
 fn validate_selector(selector: &Selector) -> Result<(), StreamError> {
     let length = match selector {
-        Selector::PodUid(value) | Selector::WorkloadUid(value) | Selector::Namespace(value) => {
+        Selector::Pod(value) | Selector::Workload(value) | Selector::Namespace(value) => {
             value.len()
         }
     };
@@ -612,10 +614,20 @@ fn workload_uid(identity: &KubernetesIdentity) -> Option<String> {
     }
 }
 
+fn workload_name(identity: &KubernetesIdentity) -> Option<&str> {
+    match &identity.workload {
+        WorkloadResolution::Resolved(workload) => Some(&workload.name),
+        WorkloadResolution::NoController => Some(&identity.pod_name),
+        WorkloadResolution::UnresolvedReplicaSet(_) | WorkloadResolution::UnsupportedOwner(_) => {
+            None
+        }
+    }
+}
+
 fn matches(selector: &Selector, record: &LogRecord) -> bool {
     identity(record).is_some_and(|identity| match selector {
-        Selector::PodUid(uid) => &identity.pod_uid == uid,
-        Selector::WorkloadUid(uid) => workload_uid(identity).as_ref() == Some(uid),
+        Selector::Pod(name) => &identity.pod_name == name,
+        Selector::Workload(name) => workload_name(identity) == Some(name),
         Selector::Namespace(namespace) => &identity.namespace == namespace,
     })
 }
@@ -685,7 +697,7 @@ mod tests {
                 workload: WorkloadResolution::Resolved(WorkloadIdentity {
                     api_version: "apps/v1".into(),
                     kind: "Deployment".into(),
-                    name: "game".into(),
+                    name: workload_uid.into(),
                     uid: workload_uid.into(),
                 }),
             }),
@@ -740,13 +752,13 @@ mod tests {
         assert_eq!(
             sequences(
                 &store
-                    .query(&Selector::WorkloadUid("workload-1".into()))
+                    .query(&Selector::Workload("workload-1".into()))
                     .unwrap()
             ),
             vec![2, 3]
         );
         assert_eq!(
-            sequences(&store.query(&Selector::PodUid("pod-b".into())).unwrap()),
+            sequences(&store.query(&Selector::Pod("pod-pod-b".into())).unwrap()),
             vec![2]
         );
         assert_eq!(
@@ -779,19 +791,22 @@ mod tests {
         store
             .try_append(record("games", "workload-1", "pod-a", 8))
             .unwrap();
+        store
+            .try_append(record("games", "workload-1", "pod-b", 8))
+            .unwrap();
         let mut stream = store
-            .stream(Selector::WorkloadUid("workload-1".into()))
+            .stream(Selector::Workload("workload-1".into()), 1)
             .unwrap();
         store
-            .try_append(record("other", "workload-2", "pod-b", 8))
+            .try_append(record("other", "workload-2", "pod-c", 8))
             .unwrap();
         store
-            .try_append(record("games", "workload-1", "pod-c", 8))
+            .try_append(record("games", "workload-1", "pod-d", 8))
             .unwrap();
 
-        assert_eq!(stream.through(), 1);
-        assert_eq!(stream.recv().await.unwrap().sequence(), 1);
-        assert_eq!(stream.recv().await.unwrap().sequence(), 3);
+        assert_eq!(stream.through(), 2);
+        assert_eq!(stream.recv().await.unwrap().sequence(), 2);
+        assert_eq!(stream.recv().await.unwrap().sequence(), 4);
     }
 
     #[test]

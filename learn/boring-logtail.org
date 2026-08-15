@@ -216,10 +216,16 @@ failure have counters.
 
 The collector shares one =Arc<LogStore>= between OTLP ingestion and the API.
 The store directly owns namespace, workload, and Pod record rings behind one
-lock; there is no database actor or command queue. A selector names a workload
-UID, Pod UID, or namespace. =query= returns matching retained records, =flush=
+lock; there is no database actor or command queue. A selector names a workload,
+Pod, or namespace by exact Kubernetes name. =query= returns matching retained records, =flush=
 clears retention, and =stream= is one ordered feed of retained matches followed
 by later matching inserts.
+
+The collector exposes that operation as =LogService.StreamLogs= on its own gRPC
+port. A request chooses one name selector, a retained =tail_lines= count, and
+whether to follow later inserts. Responses keep raw bytes plus timestamp,
+sequence, namespace, workload kind/name, and Pod name. Workload and Pod names
+currently match cluster-wide; the returned identity makes collisions visible.
 
 Internally, =stream= opens its bounded insert-notification receiver before it
 reads the retained snapshot and watermark =N=. Notifications through =N= are
@@ -327,6 +333,7 @@ The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
 - [[file:../boring-logtail/src/pipeline.rs][Write reconstruction and per-event pipeline]]
 - [[file:../boring-logtail/src/framing.rs][Newline framing and record integrity]]
 - [[file:../blt-store/src/lib.rs][Direct shared database, queries, and streams]]
+- [[file:../boring-collector/src/grpc/stream_logs.rs][Collector gRPC log stream]]
 - [[file:../boring-collector/src/policy.rs][Collector filtering, sampling, and catching]]
 - [[file:../blt-emitter/src/lib.rs][Bounded asynchronous event delivery]]
 - [[file:../blt-emitter/src/stdout.rs][Escaped stdout delivery]]

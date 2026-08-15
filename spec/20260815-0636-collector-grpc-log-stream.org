@@ -1,0 +1,112 @@
+#+title: Collector gRPC log stream
+#+date: 2026-08-15 06:36 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved for implementation on 2026-08-15.
+
+* Context
+
+The web backend currently implements =GameService.StreamLogs= by resolving a
+server ID to a Pod, opening the Kubernetes Pod logs API, scanning timestamped
+lines, and forwarding them to its existing authenticated ConnectRPC stream.
+The collector already owns the log database and continuous selector stream.
+The next small step is a real collector RPC that can replace only that outbound
+Kubernetes log adapter.
+
+The deleted =blt-api= façade added no transport boundary. The collector owns
+this protocol and serves it directly from its shared =Arc<LogStore>=.
+
+* Decision
+
+Add one Tonic service on a separate collector port:
+
+#+begin_example
+web GameService.StreamLogs -> collector LogService.StreamLogs -> Arc<LogStore>
+                                  retained tail, then matching inserts
+#+end_example
+
+The collector-owned protobuf request is name based:
+
+#+begin_src protobuf
+message StreamLogsRequest {
+  oneof selector {
+    string namespace = 1;
+    string workload = 2;
+    string pod = 3;
+  }
+  bool follow = 4;
+  uint32 tail_lines = 5;
+}
+#+end_src
+
+Namespace, workload, and Pod selectors match exact names. Workload and Pod
+names match cluster-wide in this first contract. Every response includes its
+namespace, workload name/kind, and Pod name so collisions stay visible. The
+future authenticated edge may add namespace scoping when its authorization
+contract is implemented.
+
+=tail_lines= selects the newest retained matches and is capped by the store's
+existing retention. Zero requests no retained lines. =follow=false= ends after
+the retained tail. =follow=true= continues with later matching inserts. The
+response carries timestamp, sequence, raw bytes, and Kubernetes names.
+
+Keep routing small:
+
+#+begin_example
+boring-collector/src/grpc/mod.rs
+boring-collector/src/grpc/stream_logs.rs
+#+end_example
+
+=mod.rs= owns generated types and server registration. The route file owns the
+single RPC. Do not add another API crate, shared-port routing, reflection,
+authentication, TLS, durable cursors, or deployment machinery here.
+
+The web app keeps its public =biomehub.v1.GameService.StreamLogs= request and
+ownership check. A later web-app change replaces its Kubernetes =logStreamer=
+adapter with a collector client, normally selecting the deterministic workload
+name. The later =../gitops= change deploys and wires the endpoint instead of
+extending the current Skaffold setup.
+
+* Consequences
+
+- The protobuf lives with the collector server. The web app will consume the
+  same published/vendored contract rather than compiling through a sibling path.
+- The collector has two explicit listeners: OTLP/HTTP ingestion and gRPC reads.
+- Raw bytes remain intact across the collector protocol; the web adapter decides
+  how to populate its current string response.
+- Name selection is useful immediately but does not claim Kubernetes-global
+  uniqueness.
+
+* Acceptance
+
+- Store selectors match namespace, workload name, and Pod name.
+- Generated Tonic client/server code builds from the collector-owned proto.
+- A real loopback client receives only the requested retained tail.
+- With follow enabled, the same client then receives a later matching insert;
+  non-matching inserts do not appear.
+- With follow disabled, the RPC ends after retained records.
+- Response timestamp, sequence, bytes, namespace, workload kind/name, and Pod
+  name come from the stored record.
+- Formatting, collector/store tests, workspace tests, and strict relevant
+  Clippy pass.
+
+* TODO
+
+- [X] GL1 Add name selectors, retained-tail semantics, and focused store tests.
+- [X] GL2 Add the collector protobuf, generated Tonic service, route file, and
+  separate listener wiring.
+- [X] GL3 Prove retained, follow, filtering, and response mapping through a real
+  loopback gRPC client/server test.
+- [X] GL4 Update the field guide, roadmap, and deferred-work index, including
+  the later web-app adapter and =../gitops= deployment swaps.
+- [X] GL5 Run formatting, tests, and strict Clippy.
+- [X] GL6 Include collector proto build inputs in the container and prove the
+  collector image target builds locally.
+
+* Container validation
+
+- =docker build --target collector --tag boring-collector:grpc-container-check .=:
+  passed after copying the collector build script and protobuf source into the
+  builder. The existing non-fatal eBPF linker warning remains unchanged.

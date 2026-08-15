@@ -27,7 +27,7 @@ COPY blt-emitter/Cargo.toml ./blt-emitter/
 COPY blt-model/Cargo.toml ./blt-model/
 COPY blt-otel/Cargo.toml ./blt-otel/
 COPY blt-store/Cargo.toml ./blt-store/
-COPY boring-collector/Cargo.toml ./boring-collector/
+COPY boring-collector/Cargo.toml boring-collector/build.rs ./boring-collector/
 COPY boring-logtail/src ./boring-logtail/src
 COPY blt-abi/src ./blt-abi/src
 COPY blt-ebpf/src ./blt-ebpf/src
@@ -35,6 +35,7 @@ COPY blt-emitter/src ./blt-emitter/src
 COPY blt-model/src ./blt-model/src
 COPY blt-otel/src ./blt-otel/src
 COPY blt-store/src ./blt-store/src
+COPY boring-collector/proto ./boring-collector/proto
 COPY boring-collector/src ./boring-collector/src
 
 RUN cargo build --locked --package boring-logtail --package boring-collector --release

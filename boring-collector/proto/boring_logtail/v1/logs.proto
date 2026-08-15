@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+syntax = "proto3";
+
+package boring_logtail.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service LogService {
+  rpc StreamLogs(StreamLogsRequest) returns (stream StreamLogsResponse);
+}
+
+message StreamLogsRequest {
+  oneof selector {
+    string namespace = 1;
+    string workload = 2;
+    string pod = 3;
+  }
+
+  bool follow = 4;
+  uint32 tail_lines = 5;
+}
+
+message StreamLogsResponse {
+  google.protobuf.Timestamp timestamp = 1;
+  uint64 sequence = 2;
+  bytes line = 3;
+  string namespace = 4;
+  string workload_kind = 5;
+  string workload = 6;
+  string pod = 7;
+}

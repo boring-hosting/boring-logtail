@@ -14,9 +14,23 @@ run = [
   "sudo -E lldb-server gdbserver 127.0.0.1:1234 target/debug/boring-logtail",
 ]
 
-[tasks.push]
-description = "Build and push commit and latest images to GHCR"
-run = ["skaffold build --push=true", "skaffold build --push=true --tag latest"]
+[tasks.publish]
+description = "Build and push dated and latest images directly to GHCR"
+run = '''
+set -eu
+
+tag="$(date -u +%Y%m%d-%H%M)"
+logtail_image="ghcr.io/alfredosa/boring-logtail"
+collector_image="ghcr.io/alfredosa/boring-collector"
+
+docker build --target logtail --tag "${logtail_image}:${tag}" --tag "${logtail_image}:latest" .
+docker push "${logtail_image}:${tag}"
+docker push "${logtail_image}:latest"
+
+docker build --target collector --tag "${collector_image}:${tag}" --tag "${collector_image}:latest" .
+docker push "${collector_image}:${tag}"
+docker push "${collector_image}:latest"
+'''
 
 [tasks.fmt]
 description = "Format project"

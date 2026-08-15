@@ -4,7 +4,8 @@
 
 * Status
 
-Draft for maintainer approval. No external listener may be implemented yet.
+Superseded by =20260815-0636-collector-grpc-log-stream.org=. That spec chooses
+the first name-based gRPC stream and leaves authentication/TLS as later work.
 
 * Context
 

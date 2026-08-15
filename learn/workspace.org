@@ -8,7 +8,7 @@ about dependency direction, not collecting tiny directories for sport.
 
 The kernel reports pieces of successful writes as =WriteEvent=. Userspace
 reconstructs and frames those pieces into an immutable =LogRecord=. The store,
-event emitters, and future API all use that exact record.
+event emitters, and collector gRPC route all use that exact record.
 
 #+begin_example
 blt-ebpf -> blt-abi -> boring-logtail -> blt-model
@@ -17,8 +17,8 @@ blt-ebpf -> blt-abi -> boring-logtail -> blt-model
                                    |
                                    v
                            boring-collector
-                            /      |       \
-                     blt-store  blt-api  blt-emitter
+                              /          \
+                       blt-store      blt-emitter
 #+end_example
 
 Arrows mean “depends on.” =boring-logtail= is the node capture process;
@@ -52,13 +52,6 @@ opens a selector stream against that exact store. A stream yields retained
 matches and then matching inserts as one sequence. The bounded transport queue
 ends before the database; the store is not an actor or a command sender.
 
-** =blt-api=
-
-A transport-free read façade holding the same =Arc<LogStore>= as ingestion. It
-gives future HTTP, gRPC, or another transport a query and continuous-stream
-seam without choosing one prematurely. It opens no listener and currently
-makes no wire-compatibility or authentication claim.
-
 ** =blt-emitter=
 
 Bounded delivery actors. [[file:../blt-emitter/src/stdout.rs][stdout]] and
@@ -80,7 +73,8 @@ models, storage, emitters, Kubernetes clients, or the API.
 
 The node owns eBPF loading, write reconstruction, framing, Kubernetes
 enrichment, and bounded collector delivery. The collector owns retention,
-filtering, sampling, catchers, emitters, and the transport-free API façade.
+filtering, sampling, catchers, emitters, and its small Tonic log service. The
+gRPC route reads the same =Arc<LogStore>= that OTLP ingestion writes.
 
 * Where new code goes
 

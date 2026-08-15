@@ -1,0 +1,56 @@
+#+title: Publish dated images directly to GHCR
+#+date: 2026-08-15 07:47 UTC
+#+license: GFDL-1.3-or-later
+
+* Context
+
+The existing =mise push= task delegates image publication to Skaffold. Skaffold
+uses Git-derived tags, including =-dirty= tags, and couples a simple registry
+push to the deployment tool. Local Docker authentication is already sufficient.
+
+* Decision
+
+- Replace the Skaffold-backed publishing task with =mise publish=.
+- Build the =logtail= and =collector= Docker targets directly.
+- Tag each build with both =YYYYMMDD-HHMM= in UTC and =latest=, then push both.
+- Compute one timestamp per invocation so all four tags describe one publish.
+- Keep Skaffold for development and deployment; publishing does not invoke it.
+
+#+begin_example
+mise publish
+  -> docker build/push boring-logtail:{dated,latest}
+  -> docker build/push boring-collector:{dated,latest}
+#+end_example
+
+* Consequences
+
+Minute-level tags can collide when publishing more than once in a minute. That
+is acceptable for this local workflow. Publication requires an authenticated
+Docker client and intentionally mutates GHCR.
+
+* Acceptance checks
+
+- =mise tasks --json= discovers =publish= and no longer discovers =push=.
+- A dry inspection confirms both Docker targets receive the same dated tag and
+  =latest=.
+- Validation does not push images as a side effect.
+
+* TODO
+
+- [X] P1 Record and approve the direct publishing decision.
+- [X] P2 Add the mise task, update its terse README usage, and validate discovery.
+
+* Approval
+
+Approved by the maintainer on 2026-08-15. The maintainer selected minute-level
+UTC tags rather than tags containing seconds.
+
+* Validation
+
+- =mise tasks --json=: passed; =publish= is discovered and =push= is absent.
+- =mise task info publish=: passed; both targets use one UTC timestamp and each
+  receives the dated and =latest= tags.
+- =git diff --check=: passed.
+- The first real invocation correctly stopped before pushing when the collector
+  container build exposed missing gRPC build inputs. The fix is tracked as GL6
+  in =20260815-0636-collector-grpc-log-stream.org=.

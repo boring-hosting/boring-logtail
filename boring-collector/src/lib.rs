@@ -9,6 +9,8 @@
 
 mod policy;
 
+pub mod grpc;
+
 use std::{
     collections::{BTreeMap, HashSet},
     net::SocketAddr,
@@ -41,6 +43,7 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorConfig {
     pub listen: SocketAddr,
+    pub grpc_listen: SocketAddr,
     pub max_request_bytes: usize,
     pub store: StoreConfig,
     pub sampling: SamplingConfig,
@@ -54,6 +57,7 @@ impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:4318".parse().expect("static address is valid"),
+            grpc_listen: "0.0.0.0:50051".parse().expect("static address is valid"),
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             store: StoreConfig::default(),
             sampling: SamplingConfig::default(),
@@ -236,10 +240,7 @@ pub fn router(store: Arc<LogStore>, policy: Arc<Policy>, max_request_bytes: usiz
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/v1/logs", post(receive_logs))
         .layer(DefaultBodyLimit::max(max_request_bytes))
-        .with_state(ReceiverState {
-            store,
-            policy,
-        })
+        .with_state(ReceiverState { store, policy })
 }
 
 async fn receive_logs(State(state): State<ReceiverState>, body: Bytes) -> Response {
@@ -446,11 +447,12 @@ mod tests {
 
     fn config_keeps_retention_and_request_bounds_explicit() {
         let mut config: CollectorConfig = serde_yaml::from_str(
-            "listen: 127.0.0.1:4318\nmax_request_bytes: 2097152\nstore:\n  max_memory: 32MiB\n  max_logs: 99\n  retention: 15m\n",
+            "listen: 127.0.0.1:4318\ngrpc_listen: 127.0.0.1:50051\nmax_request_bytes: 2097152\nstore:\n  max_memory: 32MiB\n  max_logs: 99\n  retention: 15m\n",
         )
         .unwrap();
 
         assert!(config.validate().is_ok());
+        assert_eq!(config.grpc_listen, "127.0.0.1:50051".parse().unwrap());
     }
 
     #[tokio::test]

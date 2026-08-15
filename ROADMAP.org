@@ -14,9 +14,10 @@ and enriches them with Kubernetes identity.
 - [X] Share durable userspace facts through =blt-model=.
 - [X] Isolate the directly shared bounded database in =blt-store= and bounded
   destination actors in =blt-emitter=.
-- [X] Bootstrap a transport-free =blt-api= read façade over the shared store.
-- [ ] Specify transport, authentication, authorization, and wire compatibility
-  before exposing the store outside the process.
+- [X] Expose the first name-selected gRPC log stream directly from the
+  collector; avoid a speculative API façade crate.
+- [ ] Add authentication, authorization, and TLS before exposing the collector
+  stream outside trusted cluster wiring.
 
 * Node agent and cluster collector
 
@@ -24,12 +25,14 @@ and enriches them with Kubernetes identity.
   reconstruction, framing, enrichment, bounded batching, and OTLP export.
 - [X] Add one =boring-collector= process for OTLP ingestion,
   cluster-wide bounded retention, rich processing, and downstream export.
-- [X] Move =blt-store=, =blt-api=, event catchers, and =blt-emitter= ownership
+- [X] Move =blt-store=, event catchers, and =blt-emitter= ownership
   from the node agent to the collector composition root.
 - [X] Preserve raw record bytes while recognizing whole-record JSON in the
   collector and rendering structured bodies without double escaping.
-- [ ] Expose an authenticated collector replay/live API to authorized Pods;
+- [X] Add a tested collector gRPC stream for retained tail plus matching inserts;
   keep OTLP as ingestion rather than pretending it is a query protocol.
+- [ ] Replace the web backend's Kubernetes Pod-log adapter with the collector
+  client, then deploy the endpoint through the GitOps repository.
 - [ ] Specify persistence separately; phase one remains an authoritative but
   bounded in-memory database with no restart-durability claim.
 
@@ -117,6 +120,8 @@ See =spec/20260813-1812-node-agent-and-cluster-collector.org=.
 - [X] Share one =Arc<LogStore>= between ingestion and API readers; expose direct
   append, query, flush, and continuous selector-stream operations.
 - [X] Select replay by workload, Pod, or namespace identity.
+- [X] Select the collector RPC by exact namespace, workload, or Pod name and
+  verify retained tail plus follow behavior through a real gRPC client.
 - [X] Isolate slow streams with bounded insert notifications and explicit lag.
 - [X] Expire retained records individually by monotonic age with =Ns=, =Nm=,
   and =Nh= configuration.

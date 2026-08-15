@@ -30,13 +30,24 @@ workloads look unresolved, while metadata lag can produce the same outcome; one
 counter cannot diagnose both. See
 =spec/20260805-1655-declarative-capture-filters.org=.
 
-* TODO Implement the approved authenticated collector streaming protocol
+* TODO Authenticate and authorize the collector gRPC log stream
 
-Why: =blt-api= now exposes one bounded selector stream from the shared database;
-the approved transport, selectors, authorization, and wire backpressure still
-need implementation before Pods can consume it. See
-=spec/20260813-1942-authenticated-log-stream.org= and
-=spec/20260814-1722-direct-shared-log-store.org=.
+Why: the first name-selected stream is intentionally plaintext and unauthenticated;
+it must stay inside trusted wiring until TLS and caller scope are decided. See
+=spec/20260815-0636-collector-grpc-log-stream.org=.
+
+* TODO Swap the web backend from Kubernetes Pod logs to the collector
+
+Why: preserve its public =GameService.StreamLogs= and ownership check, but make
+its outbound =logStreamer= call the collector with the deterministic workload
+name instead of =Pods(...).GetLogs(...)=. See
+=spec/20260815-0636-collector-grpc-log-stream.org= and =../web-app=.
+
+* TODO Deploy the collector gRPC endpoint through the GitOps repository
+
+Why: once the web adapter proves the contract, expose port 50051 and service
+wiring in =../gitops= instead of extending the temporary Skaffold setup. See
+=spec/20260815-0636-collector-grpc-log-stream.org=.
 
 * TODO Add durable replay cursors only with persistence and acknowledgements
 
