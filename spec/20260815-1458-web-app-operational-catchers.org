@@ -1,0 +1,72 @@
+#+title: Catch actionable web-app failures
+#+date: 2026-08-15 14:58 UTC
+#+license: GFDL-1.3-or-later
+
+* Context
+
+The collector already watches =biomehub= and =biomehub-dev=. A bounded sample
+of their real backend logs showed stable Go =slog= lines for Stripe failures
+and rejected JWTs. The first live collector stream then exposed the frontend's
+stable =Failed to refresh Dex token= line. Broad matching on words such as
+=error= would also alert on unrelated workloads and ordinary log values.
+
+* Decision
+
+Add two configured catchers, without changing the catcher engine:
+
+- =web-app-error= matches the backend's fixed =ERROR= messages for startup,
+  shutdown, catalog, and Stripe webhook failures.
+- =web-app-auth-warning= matches backend =WARN jwtmiddleware error= and the
+  frontend's =Failed to refresh Dex token Error: Dex rejected the refresh
+  token= line. It does not match the following JavaScript stack frames.
+
+Both deliver to the existing Discord emitter. Match the standard =slog= text
+timestamp and level at the start of a complete framed record, then an explicit
+message allow-list. Do not add workload selectors or generic severity parsing.
+
+#+begin_example
+web backend log -> existing RegexSet -> existing Discord emitter
+#+end_example
+
+Routine missing =.env= warnings, normal startup/shutdown, ignored or unhandled
+Stripe events, arbitrary =error= fields, and other workloads' messages remain
+non-events.
+
+* Consequences
+
+The expressions follow stable source messages, so renaming one requires a
+configuration update. A JWT rejection can be user error as well as an issuer
+incident; it is a warning, not an error. Static event messages stay free of
+captured log interpolation.
+
+* Acceptance
+
+- Every selected backend =slog.Error= message matches =web-app-error=.
+- Real backend JWT rejection and frontend Dex-refresh lines match
+  =web-app-auth-warning=.
+- Routine warnings, informational Stripe lines, generic error text, malformed
+  prefixes, and near-miss messages do not match.
+- The checked-in example and Hetzner Blue GitOps config carry identical
+  expressions and block-style YAML.
+- Focused collector tests, formatting, and manifest rendering pass.
+
+* TODO
+
+- [X] WA1 Record the observed log shapes and approved narrow matching policy.
+- [X] WA2 Add the configured events and catchers to the checked-in deployment.
+- [X] WA3 Add positive and near-miss collector policy tests.
+- [X] WA4 Update the Hetzner Blue GitOps config and validate both manifests.
+
+* Approval
+
+Approved by the maintainer on 2026-08-15.
+
+* Validation
+
+- =cargo test -p boring-collector --lib=: passed; 7 tests passed.
+- =cargo fmt --all -- --check=: passed.
+- The checked-in YAML parses and the Hetzner Blue Kustomization renders.
+- Extracted source and GitOps catcher expressions compare byte-for-byte equal.
+- =git diff --check=: passed in both repositories.
+- Strict collector Clippy reaches unchanged =blt-model= blank-line lints and
+  stops there; the failures are outside this change.

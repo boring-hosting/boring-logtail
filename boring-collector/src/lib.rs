@@ -509,6 +509,115 @@ mod tests {
         assert_eq!(policy.stats().sampled, 1);
     }
 
+    #[test]
+
+    fn web_app_catchers_match_only_selected_operational_logs() {
+        let mut config: CollectorConfig = serde_yaml::from_str(
+            r#"
+events:
+  web-app-error:
+    type: error
+    message: The Biomehub backend reported an operational failure
+  web-app-auth-warning:
+    type: warning
+    message: The Biomehub backend rejected an OIDC token
+event_catchers:
+  - regex: '(?m)^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ERROR (?:configuration error|failed to initialize (?:storage|kubernetes client|auth middleware)|http server error|server shutdown error|ensure catalog entry|failed to (?:read webhook body|parse subscription event)|webhook signature verification failed|stripe event error)\b'
+    event: web-app-error
+    emitters:
+      - discord
+  - regex: '(?m)^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} WARN jwtmiddleware error\b|Failed to refresh Dex token Error: Dex rejected the refresh token\b)'
+    event: web-app-auth-warning
+    emitters:
+      - discord
+event_emitters:
+  discord:
+    channel_id: test-channel
+    secret_from_env: TEST_DISCORD_SECRET
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let senders = std::collections::BTreeMap::from([(
+            "discord".to_owned(),
+            blt_emitter::EmitterSender::new(sender),
+        )]);
+        let policy = Policy::compile(&config, &senders).unwrap();
+
+        let errors = [
+            "configuration error error=bad-config",
+            "failed to initialize storage error=unavailable",
+            "failed to initialize kubernetes client error=forbidden",
+            "failed to initialize auth middleware error=bad-issuer",
+            "http server error error=closed",
+            "server shutdown error error=timeout",
+            "ensure catalog entry server_type=FACTORIO error=failed",
+            "failed to read webhook body error=short-read",
+            "webhook signature verification failed error=bad-signature",
+            "stripe event error type=invoice.paid error=missing-server",
+            "failed to parse subscription event type=customer.subscription.updated error=bad-json",
+        ];
+
+        for message in errors {
+            let mut candidate = record();
+            candidate.bytes =
+                Arc::from(format!("2026/08/15 14:30:00 ERROR {message}\n").into_bytes());
+
+            policy.admit(candidate).unwrap();
+
+            assert_eq!(
+                receiver.try_recv().unwrap().definition.name.as_ref(),
+                "web-app-error"
+            );
+        }
+
+        let mut auth_warning = record();
+        auth_warning.bytes = Arc::from(
+            &b"2026/08/12 18:03:30 WARN jwtmiddleware error error=\"jwt invalid\" method=POST\n"[..],
+        );
+
+        policy.admit(auth_warning).unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap().definition.name.as_ref(),
+            "web-app-auth-warning"
+        );
+
+        let mut frontend_auth_warning = record();
+        frontend_auth_warning.bytes =
+            Arc::from(&b"Failed to refresh Dex token Error: Dex rejected the refresh token\n"[..]);
+
+        policy.admit(frontend_auth_warning).unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap().definition.name.as_ref(),
+            "web-app-auth-warning"
+        );
+
+        let ignored = [
+            "2026/08/11 17:59:37 WARN No .env file found, using environment variables path=/.env\n",
+            "2026/08/13 09:51:45 INFO unhandled stripe event type=invoice.upcoming\n",
+            "2026/08/11 19:35:03 INFO starting cmd/api HTTP server addr=:8080\n",
+            "2026/08/15 14:30:00 INFO request complete error=failed\n",
+            "prefix 2026/08/15 14:30:00 ERROR stripe event error type=invoice.paid\n",
+            "2026/08/15 14:30:00 ERROR stripe event errors type=invoice.paid\n",
+            "    at async fD (.next/server/chunks/ssr/example.js:1:2195)\n",
+        ];
+
+        for message in ignored {
+            let mut candidate = record();
+            candidate.bytes = Arc::from(message.as_bytes());
+
+            policy.admit(candidate).unwrap();
+        }
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(policy.stats().caught, errors.len() as u64 + 2);
+    }
+
     #[tokio::test]
 
     async fn agent_shutdown_flush_reaches_collector_replay() {

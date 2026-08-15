@@ -48,17 +48,36 @@ data:
       percent: 100
     filters:
       namespaces:
-        include: [auth, biomehub, biomehub-dev, factorio-dev, flux-system, game-servers]
+        include:
+          - auth
+          - biomehub
+          - biomehub-dev
+          - factorio-dev
+          - flux-system
+          - game-servers
     events:
-      joined: {type: info, message: "Someone has joined!"}
-      error: {type: error, message: "boring-logtail caught an operational failure"}
+      joined:
+        type: info
+        message: "Someone has joined!"
+      web-app-error:
+        type: error
+        message: "The Biomehub backend reported an operational failure"
+      web-app-auth-warning:
+        type: warning
+        message: "The Biomehub backend rejected an OIDC token"
     event_catchers:
       - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
         event: joined
-        emitters: [discord]
-      # - regex: '(?i)(?:"level"\s*:\s*"(?:error|fatal|panic)"|\b(?:error|failed|failure|reconciliation failed|reconciler error|panic|panicked|fatal|time(?:d)? out|timeout|permission denied|connection refused|unhealthy|crashloopbackoff|oomkilled)\b)'
-      #   event: error
-      #   emitters: [discord]
+        emitters:
+          - discord
+      - regex: '(?m)^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ERROR (?:configuration error|failed to initialize (?:storage|kubernetes client|auth middleware)|http server error|server shutdown error|ensure catalog entry|failed to (?:read webhook body|parse subscription event)|webhook signature verification failed|stripe event error)\b'
+        event: web-app-error
+        emitters:
+          - discord
+      - regex: '(?m)^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} WARN jwtmiddleware error\b|Failed to refresh Dex token Error: Dex rejected the refresh token\b)'
+        event: web-app-auth-warning
+        emitters:
+          - discord
     event_emitters:
       discord:
         channel_id: "1537166176331898890"
