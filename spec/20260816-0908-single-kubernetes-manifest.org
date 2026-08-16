@@ -1,0 +1,39 @@
+#+title: Single Kubernetes manifest for logtail and collector
+#+date: 2026-08-16 09:08 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Completed on 2026-08-16. All tasks satisfied.
+
+* Context
+
+During the CRI transition experiment, =k8s/boring-logtail-cri-dev.yaml= was created to test CRI file capture in a temporary namespace. Now that eBPF has been completely removed and CRI file capture is the sole ingestion path, maintaining two manifests (=boring-logtail.yaml= and =boring-logtail-cri-dev.yaml=) creates drift: the dev manifest lacked event catchers/emitters, while the main manifest lacked the gRPC port configuration and updated resource limits.
+
+* Decision
+
+Consolidate into a single active application manifest at =k8s/boring-logtail.yaml= using explicit =-dev= resource suffixes (in namespace =boring-logtail-dev=) to avoid collision with production releases. Move namespace creation to a separate file =k8s/dev-namespace.yaml= so Skaffold does not manage or overwrite the namespace (preserving sensitive mounted secrets). Delete =k8s/boring-logtail-cri-dev.yaml=.
+
+The merged =k8s/boring-logtail.yaml= manifest will contain:
+1. =boring-logtail-dev= ConfigMap (CRI root =/host/var/log/pods=, collector endpoint).
+2. =boring-collector-dev= ConfigMap (OTLP HTTP port 4318, gRPC port 50051, store retention, sampling, namespace filters, event definitions, event catchers, Discord emitter).
+3. =boring-collector-dev= Service (ports 4318 and 50051).
+4. =boring-collector-dev= Deployment (OTLP + gRPC container ports, health probes, Discord secret env, =imagePullSecrets= for =web-app-registry-pull-secret=).
+5. =boring-logtail-dev= ServiceAccount, ClusterRole, ClusterRoleBinding (Pod & ReplicaSet watch permissions).
+6. =boring-logtail-dev= DaemonSet (mounts =/var/log/pods= read-only, node-scoped fieldRef, glibc malloc tunables, lean CRI resource requests/limits, =imagePullSecrets= for =web-app-registry-pull-secret=).
+
+* Acceptance
+
+- =k8s/boring-logtail.yaml= contains the merged dev application manifest in =boring-logtail-dev=.
+- =k8s/dev-namespace.yaml= holds the standalone namespace manifest, excluded from automated Skaffold application deployment.
+- =k8s/boring-logtail-cri-dev.yaml= is removed.
+- =skaffold.yaml= references =k8s/boring-logtail.yaml=.
+- The merged manifest includes both gRPC (port 50051) and OTLP HTTP (port 4318) plus full event catcher/emitter configuration and =imagePullSecrets=.
+- Workspace tests, formatting, and manifest parsing pass.
+
+* TODO
+
+- [X] M1 Propose single Kubernetes manifest spec.
+- [X] M2 Create =k8s/dev-namespace.yaml=, merge all features into =k8s/boring-logtail.yaml= with explicit =-dev= names, and remove =k8s/boring-logtail-cri-dev.yaml=.
+- [X] M3 Update =skaffold.yaml= to point to =k8s/boring-logtail.yaml=.
+- [X] M4 Validate manifest parsing, tests, formatting, and skaffold config.

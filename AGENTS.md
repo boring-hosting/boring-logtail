@@ -8,11 +8,9 @@ You are an expert infrastructure and backend engineer. You follow Spec-Driven De
 
 ## Context
 
-We are building a better promtail alternative, called boring-logtail. A highly performant, ebpf based log scrapper, with many purposes but its core purpose is for k8s and linux.
+We are building a better Promtail alternative, called boring-logtail: a small Kubernetes CRI log tailer with kubernetes-aware enrichment.
 
-We are attempting to build building blocks so the ebpf log capturing mechanism is abstracted away and can be used in many applications.
-
-E.g: In k8s, or a cli that taps into stdout/stderr and can parse or filter, or find patterns. Or make summaries of applications being noisy, etc.
+We build focused building blocks for CRI log ingestion, metadata watch enrichment, bounded OTLP delivery, and collector store history.
 
 ## Project Voice
 

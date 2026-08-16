@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boring-logtail-dev
+  labels:
+    app.kubernetes.io/part-of: boring-logtail
+    # Pod Security treats hostPath as privileged. Keep that exception in
+    # this disposable dev namespace rather than broadening another namespace.
+    pod-security.kubernetes.io/enforce: privileged

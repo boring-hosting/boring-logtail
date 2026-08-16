@@ -23,11 +23,11 @@ tag="$(date -u +%Y%m%d-%H%M)"
 logtail_image="registry.gitlab.com/biomehub/boring-logtail/logtail"
 collector_image="registry.gitlab.com/biomehub/boring-logtail/collector"
 
-docker build --target logtail --tag "${logtail_image}:${tag}" --tag "${logtail_image}:latest" .
+docker buildx build --provenance=false --target logtail --tag "${logtail_image}:${tag}" --tag "${logtail_image}:latest" .
 docker push "${logtail_image}:${tag}"
 docker push "${logtail_image}:latest"
 
-docker build --target collector --tag "${collector_image}:${tag}" --tag "${collector_image}:latest" .
+docker buildx build --provenance=false --target collector --tag "${collector_image}:${tag}" --tag "${collector_image}:latest" .
 docker push "${collector_image}:${tag}"
 docker push "${collector_image}:latest"
 '''

@@ -463,30 +463,55 @@ impl CriFileSet {
 
 fn consume_file_bytes(
     tracked: &mut TrackedFile,
-    bytes: &[u8],
+    mut bytes: &[u8],
     max_line_bytes: usize,
     events: &mut Vec<CriFileEvent>,
 ) {
-    for byte in bytes {
+    while !bytes.is_empty() {
         if tracked.dropping_oversized {
-            if *byte == b'\n' {
+            if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
                 tracked.dropping_oversized = false;
+                bytes = &bytes[pos + 1..];
+            } else {
+                break;
             }
             continue;
         }
 
-        tracked.pending.push(*byte);
-        if *byte == b'\n' {
-            events.push(CriFileEvent::Line {
-                source: tracked.source.clone(),
-                bytes: std::mem::take(&mut tracked.pending),
-            });
-        } else if tracked.pending.len() == max_line_bytes {
-            tracked.pending.clear();
-            tracked.dropping_oversized = true;
-            events.push(CriFileEvent::OversizedLine {
-                source: tracked.source.clone(),
-            });
+        if let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
+            let line_chunk = &bytes[..=pos];
+            bytes = &bytes[pos + 1..];
+
+            let total_len = tracked.pending.len() + line_chunk.len();
+            if total_len > max_line_bytes {
+                tracked.pending.clear();
+                events.push(CriFileEvent::OversizedLine {
+                    source: tracked.source.clone(),
+                });
+            } else if tracked.pending.is_empty() {
+                events.push(CriFileEvent::Line {
+                    source: tracked.source.clone(),
+                    bytes: line_chunk.to_vec(),
+                });
+            } else {
+                tracked.pending.extend_from_slice(line_chunk);
+                events.push(CriFileEvent::Line {
+                    source: tracked.source.clone(),
+                    bytes: std::mem::take(&mut tracked.pending),
+                });
+            }
+        } else {
+            let total_len = tracked.pending.len() + bytes.len();
+            if total_len >= max_line_bytes {
+                tracked.pending.clear();
+                tracked.dropping_oversized = true;
+                events.push(CriFileEvent::OversizedLine {
+                    source: tracked.source.clone(),
+                });
+            } else {
+                tracked.pending.extend_from_slice(bytes);
+            }
+            break;
         }
     }
 }

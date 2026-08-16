@@ -1,0 +1,39 @@
+#+title: Tuning CRI logtail CPU and notification efficiency
+#+date: 2026-08-16 09:48 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Completed on 2026-08-16. All tasks satisfied.
+
+* Context
+
+Live measurements on Kubernetes nodes showed =boring-logtail= consuming 25--37m CPU while idling/processing low log volume (~1 record/sec). Profiling and analysis identified four hot spots:
+1. =files.reconcile()= full recursive directory traversal and =fs::metadata= syscalls fired every 500ms whenever inotify channel overflowed or requested reconciliation.
+2. Inotify events were received and processed one-by-one without event draining or path batching, waking Tokio on every filesystem touch.
+3. =consume_file_bytes= iterated over 8KB chunks byte-by-byte with scalar =Vec::push= and repeated capacity checks instead of slice-based newline discovery.
+4. Per-record heap allocations in =process_cri_events= (=pod_uid.clone()=, =container_name.clone()=, and =vec![Arc::new(log_record)]=).
+
+* Decision
+
+Tune the node capture loop and CRI ingestion path:
+1. **Debounce filesystem reconciliation**: Cooldown directory rescanning to a minimum of 5 seconds on bursts/overflows instead of re-scanning every 500ms.
+2. **Drain and batch inotify notifications**: Drain available inotify events from the channel before invoking file reads, aggregating changed paths into a single read pass.
+3. **Fast slice-based line consumption**: Rewrite =consume_file_bytes= to use slice scanning for =b'\n'=, appending line chunks directly to =pending= or taking them in one slice.
+4. **Zero-allocation identity lookup and direct export**: Index identities by borrowed keys or lookup without cloning, and pass =&LogRecord= directly to =publish_record= without =Vec= or =Arc= wrappers.
+
+* Acceptance
+
+- =consume_file_bytes= slices buffer chunks on newlines without byte-by-byte push loops.
+- Reconciliation on event bursts/overflow is rate-limited to at most once per 5 seconds.
+- Inotify events are batched across available channel items per tick.
+- Workspace unit tests and lint checks pass cleanly.
+- Measured node CPU drops significantly under live workloads.
+
+* TODO
+
+- [X] T1 Propose and approve CPU tuning spec.
+- [X] T2 Implement slice-based line consumption in =CriFileSet=.
+- [ ] T3 Batch inotify event draining and rate-limit reconciliation in =spawn_cri_loop=.
+- [ ] T4 Eliminate unnecessary string and vector allocations in =process_cri_events=.
+- [ ] T5 Pass workspace checks, image build, and verify live CPU reduction.

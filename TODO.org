@@ -24,11 +24,9 @@ its outbound =logStreamer= call the collector with the deterministic workload
 name instead of =Pods(...).GetLogs(...)=. See
 =spec/20260815-0636-collector-grpc-log-stream.org= and =../web-app=.
 
-* TODO Deploy the collector gRPC endpoint through the GitOps repository
-
-Why: once the web adapter proves the contract, expose port 50051 and service
-wiring in =../gitops= instead of extending the temporary Skaffold setup. See
-=spec/20260815-0636-collector-grpc-log-stream.org=.
+* DONE Deploy the collector gRPC endpoint through the GitOps repository
+  Why: exposed port 50051 and service wiring in =../gitops=. See
+  =spec/20260815-0636-collector-grpc-log-stream.org=.
 
 * TODO Add durable replay cursors only with persistence and acknowledgements
 

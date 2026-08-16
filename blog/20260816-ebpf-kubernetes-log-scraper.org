@@ -464,9 +464,8 @@ answers:
 - Self-observation can cross cgroups and become a distributed loop.
 - Every bounded queue or map has a loss mode, even when the happy path is fast.
 
-The eBPF code remains in the repository. It is useful as a Linux tracing tool
-and as a record of what we measured. It is no longer the Kubernetes capture
-path.
+The eBPF code remains preserved in Git history as a record of what was measured
+and learned. It is no longer in the active workspace.
 
 For Kubernetes, logtail now follows the files under =/var/log/pods=. The CRI
 record supplies the runtime timestamp, stream name, and partial/full marker.
@@ -478,11 +477,11 @@ That path is less exotic. It also captures the thing Kubernetes calls a log.
 
 * Source tour
 
-- [[file:../blt-ebpf/src/main.rs][The eBPF tracepoint programs and tail-call workers]]
-- [[file:../blt-abi/src/lib.rs][The fixed kernel/userspace event format and chunk math]]
-- [[file:../boring-logtail/src/pipeline.rs][Userspace write reconstruction]]
-- [[file:../boring-logtail/src/framing.rs][Byte-preserving newline framing]]
-- [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID resolution]]
+- Historical eBPF tracepoint programs and tail-call workers (see Git history)
+- Historical kernel/userspace event ABI (see Git history)
+- Historical userspace write reconstruction (see Git history)
+- Historical byte-preserving newline framing (see Git history)
+- Historical cgroup-to-container ID resolution (see Git history)
 - [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes enrichment]]
 - [[file:../spec/20260802-0928-userspace-registered-cri-log-tap.org][The rejected eBPF CRI-file tap]]
 - [[file:../spec/20260815-1726-userspace-cri-log-tailing.org][The userspace CRI-file decision]]

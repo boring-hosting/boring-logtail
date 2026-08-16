@@ -1,38 +1,25 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: boring-logtail
-  labels:
-    app.kubernetes.io/part-of: boring-logtail
-    pod-security.kubernetes.io/enforce: privileged
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: boring-logtail
-  namespace: boring-logtail
+  namespace: boring-logtail-dev
 data:
   config.yaml: |
     collector:
       endpoint: http://boring-collector:4318/v1/logs
-      queue_records: 1024
-      queue_bytes: 8388608
-      batch_records: 512
-      batch_bytes: 1048576
-      flush_interval_ms: 1000
-      retry_max_elapsed_ms: 30000
-      request_timeout_ms: 10000
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: boring-collector
-  namespace: boring-logtail
+  namespace: boring-logtail-dev
 data:
   config.yaml: |
     listen: 0.0.0.0:4318
+    grpc_listen: 0.0.0.0:50051
     max_request_bytes: 4194304
     store:
       max_memory: 128MiB
@@ -63,50 +50,53 @@ data:
       - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
         event: joined
         emitters:
-          - discord
+          - stdout
       - regex: '(?m)^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ERROR (?:configuration error|failed to initialize (?:storage|kubernetes client|auth middleware)|http server error|server shutdown error|ensure catalog entry|failed to (?:read webhook body|parse subscription event)|webhook signature verification failed|stripe event error)\b'
         event: web-app-error
         emitters:
-          - discord
+          - stdout
       - regex: '(?m)^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} WARN jwtmiddleware error\b|Failed to refresh Dex token Error: Dex rejected the refresh token\b)'
         event: web-app-auth-warning
         emitters:
-          - discord
+          - stdout
     event_emitters:
-      discord:
-        channel_id: "1537166176331898890"
-        secret_from_env: WOW_MY_DISCORD_SECRET
+      stdout: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: boring-collector
-  namespace: boring-logtail
+  namespace: boring-logtail-dev
 spec:
   selector:
-    app.kubernetes.io/name: boring-collector
+    app.kubernetes.io/name: boring-collector-cri-dev
   ports:
     - name: otlp-http
       port: 4318
       targetPort: otlp-http
+    - name: grpc
+      port: 50051
+      targetPort: grpc
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: boring-collector
-  namespace: boring-logtail
+  name: boring-collector-cri-dev
+  namespace: boring-logtail-dev
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: boring-collector
+      app.kubernetes.io/name: boring-collector-cri-dev
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: boring-collector
+        app.kubernetes.io/name: boring-collector-cri-dev
         app.kubernetes.io/component: collector
         app.kubernetes.io/part-of: boring-logtail
     spec:
+      imagePullSecrets:
+        - name: web-app-registry-pull-secret
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       containers:
@@ -115,113 +105,152 @@ spec:
           ports:
             - name: otlp-http
               containerPort: 4318
+            - name: grpc
+              containerPort: 50051
           env:
-            - {name: RUST_LOG, value: info}
-            - {name: BORING_COLLECTOR_CONFIG, value: /etc/boring-collector/config.yaml}
-            - name: WOW_MY_DISCORD_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: boring-logtail-discord
-                  key: bot-token
+            - name: RUST_LOG
+              value: info
+            - name: BORING_COLLECTOR_CONFIG
+              value: /etc/boring-collector/config.yaml
           readinessProbe:
-            httpGet: {path: /healthz, port: otlp-http}
+            httpGet:
+              path: /healthz
+              port: otlp-http
           livenessProbe:
-            httpGet: {path: /healthz, port: otlp-http}
+            httpGet:
+              path: /healthz
+              port: otlp-http
           resources:
-            requests: {cpu: 50m, memory: 160Mi}
-            limits: {memory: 256Mi}
+            requests:
+              cpu: 50m
+              memory: 160Mi
+            limits:
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             runAsNonRoot: true
-            capabilities: {drop: [ALL]}
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
-            - {name: config, mountPath: /etc/boring-collector, readOnly: true}
+            - name: config
+              mountPath: /etc/boring-collector
+              readOnly: true
       volumes:
         - name: config
-          configMap: {name: boring-collector}
+          configMap:
+            name: boring-collector
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: boring-logtail
-  namespace: boring-logtail
+  name: boring-logtail-cri-dev
+  namespace: boring-logtail-dev
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: boring-logtail-pod-reader
+  name: boring-logtail-cri-dev-pod-reader
 rules:
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch]
-  - apiGroups: [apps]
-    resources: [replicasets]
-    verbs: [get, list, watch]
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: boring-logtail-pod-reader
+  name: boring-logtail-cri-dev-pod-reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: boring-logtail-pod-reader
+  name: boring-logtail-cri-dev-pod-reader
 subjects:
-  - {kind: ServiceAccount, name: boring-logtail, namespace: boring-logtail}
+  - kind: ServiceAccount
+    name: boring-logtail-cri-dev
+    namespace: boring-logtail-dev
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: boring-logtail
-  namespace: boring-logtail
+  name: boring-logtail-cri-dev
+  namespace: boring-logtail-dev
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: boring-logtail
-      # Kept for an in-place upgrade: Deployment selectors are immutable and
-      # the original DaemonSet unfortunately called the node process collector.
-      app.kubernetes.io/component: collector
+      app.kubernetes.io/name: boring-logtail-cri-dev
   updateStrategy:
     type: RollingUpdate
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: boring-logtail
-        app.kubernetes.io/component: collector
+        app.kubernetes.io/name: boring-logtail-cri-dev
         app.kubernetes.io/part-of: boring-logtail
     spec:
-      serviceAccountName: boring-logtail
+      imagePullSecrets:
+        - name: web-app-registry-pull-secret
+      serviceAccountName: boring-logtail-cri-dev
       terminationGracePeriodSeconds: 30
       tolerations:
-        - {operator: Exists, effect: NoSchedule}
+        - operator: Exists
+          effect: NoSchedule
       containers:
         - name: boring-logtail
           image: registry.gitlab.com/biomehub/boring-logtail/logtail:latest
           env:
-            - {name: RUST_LOG, value: info}
-            # Capture bursts allocate on several Tokio workers. Bound glibc's
-            # per-thread arenas and return freed pages instead of pinning the
-            # burst high-water mark in every node agent.
-            - {name: GLIBC_TUNABLES, value: "glibc.malloc.arena_max=2:glibc.malloc.trim_threshold=131072"}
+            - name: RUST_LOG
+              value: info
+            - name: GLIBC_TUNABLES
+              value: "glibc.malloc.arena_max=2:glibc.malloc.trim_threshold=131072"
             - name: BORING_LOGTAIL_NODE_NAME
-              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: BORING_LOGTAIL_POD_NAME
-              valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            - {name: BORING_LOGTAIL_CRI_ROOT, value: /host/var/log/pods}
-            - {name: BORING_LOGTAIL_CONFIG, value: /etc/boring-logtail/config.yaml}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BORING_LOGTAIL_CRI_ROOT
+              value: /host/var/log/pods
+            - name: BORING_LOGTAIL_CONFIG
+              value: /etc/boring-logtail/config.yaml
           resources:
-            requests: {cpu: 50m, memory: 64Mi}
-            limits: {memory: 192Mi}
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: {drop: [ALL]}
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
-            - {name: pod-logs, mountPath: /host/var/log/pods, readOnly: true}
-            - {name: config, mountPath: /etc/boring-logtail, readOnly: true}
+            - name: pod-logs
+              mountPath: /host/var/log/pods
+              readOnly: true
+            - name: config
+              mountPath: /etc/boring-logtail
+              readOnly: true
       volumes:
         - name: pod-logs
-          hostPath: {path: /var/log/pods, type: Directory}
+          hostPath:
+            path: /var/log/pods
+            type: Directory
         - name: config
-          configMap: {name: boring-logtail}
+          configMap:
+            name: boring-logtail

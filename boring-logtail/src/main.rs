@@ -150,7 +150,7 @@ fn spawn_cri_loop(
     files
         .reconcile()
         .context("discover initial CRI log files")?;
-    let (file_events, mut file_event_receiver) = tokio::sync::mpsc::channel(1024);
+    let (file_events, mut file_event_receiver) = tokio::sync::mpsc::channel(8192);
     let notification_overflow = Arc::new(AtomicBool::new(false));
     let overflow = Arc::clone(&notification_overflow);
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -171,6 +171,8 @@ fn spawn_cri_loop(
         let mut repair_tick = tokio::time::interval(Duration::from_secs(30));
         let mut report_tick = tokio::time::interval(Duration::from_secs(60));
         let mut reconcile_requested = false;
+        let mut last_reconcile = tokio::time::Instant::now();
+        const RECONCILE_COOLDOWN: Duration = Duration::from_secs(5);
         let mut identities = cri_identity_index(&pods.borrow());
         let mut ingress_drops = StdHashMap::<TryExportError, u64>::new();
         let mut integrity_totals = RecordIntegrityTotals::default();
@@ -179,8 +181,11 @@ fn spawn_cri_loop(
             tokio::select! {
                 _ = &mut shutdown_receiver => break,
                 _ = reconcile_tick.tick() => {
-                    if reconcile_requested || notification_overflow.swap(false, Ordering::Relaxed) {
+                    if (reconcile_requested || notification_overflow.swap(false, Ordering::Relaxed))
+                        && last_reconcile.elapsed() >= RECONCILE_COOLDOWN
+                    {
                         reconcile_requested = false;
+                        last_reconcile = tokio::time::Instant::now();
                         match files.reconcile().and_then(|_| files.read_available()) {
                             Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
                             Err(error) => warn!("CRI file reconciliation failed: {error}"),
@@ -188,6 +193,7 @@ fn spawn_cri_loop(
                     }
                 }
                 _ = repair_tick.tick() => {
+                    last_reconcile = tokio::time::Instant::now();
                     match files.reconcile().and_then(|_| files.read_available()) {
                         Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
                         Err(error) => warn!("CRI repair reconciliation failed: {error}"),
@@ -198,7 +204,8 @@ fn spawn_cri_loop(
                     let partial_lanes = joiner.pending_lanes();
                     let partial_bytes = joiner.pending_bytes();
                     let export_stats = exporter.stats();
-                    info!("cri_files={file_stats:?} cri_partial_lanes={partial_lanes} cri_partial_bytes={partial_bytes} identities={} export_ingress_drops={ingress_drops:?} export_stats={export_stats:?}", identities.len());
+                    let identity_count: usize = identities.values().map(|c| c.len()).sum();
+                    info!("cri_files={file_stats:?} cri_partial_lanes={partial_lanes} cri_partial_bytes={partial_bytes} identities={identity_count} export_ingress_drops={ingress_drops:?} export_stats={export_stats:?}");
                 }
                 _ = pods.changed() => {
                     identities = cri_identity_index(&pods.borrow_and_update());
@@ -207,17 +214,34 @@ fn spawn_cri_loop(
                     let Some(event) = event else {
                         anyhow::bail!("CRI filesystem watcher stopped");
                     };
-                    match event {
-                        Ok(event) if requests_reconciliation(&event) => reconcile_requested = true,
-                        Ok(event) => {
-                            let changed = event.paths.into_iter().collect::<HashSet<_>>();
-                            let events = files.read_changed(&changed)?;
-                            process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?;
+                    let mut changed = HashSet::new();
+                    let mut needs_reconcile = false;
+
+                    let mut handle_event = |event: Result<Event, notify::Error>| {
+                        match event {
+                            Ok(event) if requests_reconciliation(&event) => needs_reconcile = true,
+                            Ok(event) => {
+                                changed.extend(event.paths);
+                            }
+                            Err(error) => {
+                                warn!("CRI filesystem notification failed: {error}");
+                                needs_reconcile = true;
+                            }
                         }
-                        Err(error) => {
-                            warn!("CRI filesystem notification failed: {error}");
-                            reconcile_requested = true;
-                        }
+                    };
+
+                    handle_event(event);
+                    while let Ok(event) = file_event_receiver.try_recv() {
+                        handle_event(event);
+                    }
+
+                    if needs_reconcile {
+                        reconcile_requested = true;
+                    }
+
+                    if !changed.is_empty() {
+                        let events = files.read_changed(&changed)?;
+                        process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?;
                     }
                 }
             }
@@ -239,7 +263,7 @@ fn requests_reconciliation(event: &Event) -> bool {
 fn process_cri_events(
     events: Vec<CriFileEvent>,
     joiner: &mut CriJoiner,
-    identities: &StdHashMap<(String, String), blt_model::KubernetesIdentity>,
+    identities: &StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>>,
     exporter: &OtlpSender,
     ingress_drops: &mut StdHashMap<TryExportError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
@@ -260,10 +284,8 @@ fn process_cri_events(
             continue;
         };
         let Some(identity) = identities
-            .get(&(
-                record.source.pod_uid.clone(),
-                record.source.container_name.clone(),
-            ))
+            .get(&record.source.pod_uid)
+            .and_then(|containers| containers.get(&record.source.container_name))
             .cloned()
         else {
             debug!(
@@ -293,12 +315,7 @@ fn process_cri_events(
             100,
             blt_model::Severity::Unknown,
         );
-        publish_records(
-            vec![Arc::new(log_record)],
-            exporter,
-            ingress_drops,
-            integrity_totals,
-        );
+        publish_record(&log_record, exporter, ingress_drops, integrity_totals);
     }
 
     Ok(())
@@ -306,18 +323,16 @@ fn process_cri_events(
 
 fn cri_identity_index(
     snapshot: &PodSnapshot,
-) -> StdHashMap<(String, String), blt_model::KubernetesIdentity> {
-    snapshot
-        .identities
-        .values()
-        .flatten()
-        .map(|identity| {
-            (
-                (identity.pod_uid.clone(), identity.container_name.clone()),
-                identity.clone(),
-            )
-        })
-        .collect()
+) -> StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>> {
+    let mut index: StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>> =
+        StdHashMap::new();
+    for identity in snapshot.identities.values().flatten() {
+        index
+            .entry(identity.pod_uid.clone())
+            .or_default()
+            .insert(identity.container_name.clone(), identity.clone());
+    }
+    index
 }
 
 fn cri_sampling_seed(source: &boring_logtail::cri::CriSource) -> u64 {
@@ -359,23 +374,21 @@ fn export_context() -> ExportContext {
     }
 }
 
-fn publish_records(
-    records: Vec<Arc<LogRecord>>,
+fn publish_record(
+    record: &LogRecord,
     exporter: &OtlpSender,
     ingress_drops: &mut StdHashMap<TryExportError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
 ) {
-    for record in records {
-        let integrity = record.integrity();
+    let integrity = record.integrity();
 
-        integrity_totals.capacity_splits += u64::from(integrity.capacity_split);
+    integrity_totals.capacity_splits += u64::from(integrity.capacity_split);
 
-        integrity_totals.capture_gaps += u64::from(integrity.capture_gap);
+    integrity_totals.capture_gaps += u64::from(integrity.capture_gap);
 
-        integrity_totals.unterminated_flushes += u64::from(integrity.unterminated);
+    integrity_totals.unterminated_flushes += u64::from(integrity.unterminated);
 
-        if let Err(reason) = exporter.try_send(&record) {
-            *ingress_drops.entry(reason).or_default() += 1;
-        }
+    if let Err(reason) = exporter.try_send(record) {
+        *ingress_drops.entry(reason).or_default() += 1;
     }
 }

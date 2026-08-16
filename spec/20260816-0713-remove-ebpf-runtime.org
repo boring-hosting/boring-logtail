@@ -4,7 +4,7 @@
 
 * Status
 
-Approved by the maintainer on 2026-08-16. Implementation in progress.
+Completed on 2026-08-16. All implementation and validation tasks satisfied.
 
 * Context
 
@@ -88,7 +88,7 @@ them.
   preserving CRI behavior.
 - [X] E4 Clean configuration, =learn/=, README, roadmap, TODO index, and
   superseded specs.
-- [ ] E5 Pass focused/workspace checks, image build, and guarded live
+- [X] E5 Pass focused/workspace checks, image build, and guarded live
   validation.
 
 * Validation log

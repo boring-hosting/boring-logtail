@@ -18,15 +18,10 @@ build:
         dockerfile: Dockerfile
         target: collector
   local:
-    useBuildkit: true
+    useBuildkit: false
     push: true
 manifests:
   rawYaml:
     - k8s/boring-logtail.yaml
 deploy:
   kubectl: {}
-profiles:
-  - name: cri-dev
-    manifests:
-      rawYaml:
-        - k8s/boring-logtail-cri-dev.yaml
