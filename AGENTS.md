@@ -21,7 +21,8 @@ This is a joyful hacker project, not corporate product collateral.
 - Write like a sharp human: terse, direct, playful when it fits, and technically honest.
 - Do not inflate simple ideas with enterprise, platform, solution, framework, or marketing language.
 - Do not sand away the author's personality, jokes, rough edges, or emphatic wording merely to sound professional.
-- Prefer the project's own description: "very fast and furious eBPF log scraper, with kubernetes aware enrichment."
+- Prefer the project's own description: "small Kubernetes CRI log tailer with
+  kubernetes-aware enrichment."
 - Keep README and user-facing copy small. Say what it does, show how to run it, then get out of the way.
 - Accuracy still wins: fun language must not make false portability, compatibility, performance, or completeness claims.
 
@@ -85,11 +86,10 @@ User primarily works on Emacs, we prefer emacs native functionality, like org-mo
 Stack:
 
 - Rust
-- EBPF (Rust bindings)
 - OpenTelemetry
 - Skaffold
-- Github
-- Github Actions for ci/cd
+- GitLab
+- GitLab CI/CD
 - mise for task coordination. Instead of Makefile.
 
 Rust Stack

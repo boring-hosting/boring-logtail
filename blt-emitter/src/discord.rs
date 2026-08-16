@@ -141,7 +141,6 @@ fn render(event: &CaughtEvent) -> DiscordMessage {
 
 /// Render structured application logs as structured text without changing the
 /// stored bytes. The fallback keeps arbitrary bytes exact and visible.
-
 fn render_log(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         let text = text.trim_end_matches(['\r', '\n']);
@@ -199,7 +198,6 @@ struct AllowedMentions {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use blt_model::{

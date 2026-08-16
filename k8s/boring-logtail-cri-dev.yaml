@@ -26,12 +26,6 @@ data:
       flush_interval_ms: 1000
       retry_max_elapsed_ms: 30000
       request_timeout_ms: 10000
-    capture:
-      assembly_operations: 1024
-      assembly_bytes: 4194304
-      framing_lanes: 64
-      framing_bytes: 8388608
-      max_record_bytes: 65536
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -85,7 +79,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: boring-collector
-          image: ghcr.io/alfredosa/boring-collector:latest
+          image: registry.gitlab.com/biomehub/boring-logtail/collector:latest
           env:
             - name: RUST_LOG
               value: info
@@ -188,12 +182,10 @@ spec:
           effect: NoSchedule
       containers:
         - name: boring-logtail
-          image: ghcr.io/alfredosa/boring-logtail:latest
+          image: registry.gitlab.com/biomehub/boring-logtail/logtail:latest
           env:
             - name: RUST_LOG
               value: info
-            - name: BORING_LOGTAIL_SOURCE
-              value: cri-files
             - name: BORING_LOGTAIL_CRI_ROOT
               value: /host/var/log/pods
             - name: BORING_LOGTAIL_NODE_NAME

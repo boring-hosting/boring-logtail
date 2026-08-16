@@ -1,80 +1,41 @@
 #+title: boring-logtail
 #+license: GFDL-1.3-or-later
 
-very fast and furious eBPF log scraper, with kubernetes aware enrichment
-
-The node agent grabs writes on the way through the Linux kernel, rebuilds log
-records, adds Kubernetes identity, and ships bounded OTLP batches. One
-=boring-collector= receives them, retains them, and owns policy and alerts.
+A small Kubernetes log tailer. It reads node-local CRI files, adds Kubernetes
+identity, and throws bounded OTLP batches at =boring-collector=. The collector
+keeps recent history, serves gRPC readers, and catches interesting events.
 
 #+begin_example
-application -> boring-logtail -> OTLP -> boring-collector -> store / alerts
-               every node                 once per cluster
+/var/log/pods -> boring-logtail -> OTLP -> boring-collector -> store / alerts
+                 every node               once per cluster
 #+end_example
 
-Very early. My goal is to replace Promtail. Get into Observability at root.
-
-New to the kernel-shaped rabbit hole? Start with the
-[[file:learn/README.org][friendly field guide]].
+Very early. The goal is still to replace Promtail. The eBPF version was a cool
+experiment; its machinery is preserved in Git history and explained in
+[[file:blog/20260816-ebpf-kubernetes-log-scraper.org][the retrospective]].
 
 * Build it
 
-You need stable Rust, nightly Rust with =rust-src=, and =bpf-linker=.
+You need stable Rust.
 
 #+begin_src shell
-rustup toolchain install stable
-rustup toolchain install nightly --component rust-src
-cargo install bpf-linker
 mise run build
+cargo test --workspace
 #+end_src
-
-Cross-compiling needs the matching =${ARCH}-unknown-linux-musl= Rust target and
-LLVM. On macOS, install =bpf-linker= with =--no-default-features=.
 
 * Run it
 
-Loading eBPF needs privileges. The mise task builds first and then gets loud:
+Point the agent at a CRI log tree and collector configuration:
 
 #+begin_src shell
+export BORING_LOGTAIL_CRI_ROOT=/var/log/pods
+export BORING_LOGTAIL_CONFIG=./logtail.yaml
+export BORING_LOGTAIL_NODE_NAME=my-node
 mise run run
 #+end_src
 
-Use =mise tasks= to see the rest. Normal =cargo check= and =cargo test= still
-work.
-
-* Throw it at kubernetes
-
-The agent is a privileged DaemonSet because kernels tend not to let random
-processes load eBPF programs. Your cluster must allow privileged workloads in
-the =boring-logtail= namespace. Identity enrichment watches only Pods assigned
-to the agent's node and joins their exact container IDs to the cgroup
-snapshot. It does not mount or call the container-runtime socket.
-
-Development images live at =ghcr.io/alfredosa/boring-logtail= and
-=ghcr.io/alfredosa/boring-collector=. Push both with:
-
-#+begin_src shell
-mise publish
-#+end_src
-
-This builds both Docker targets directly and publishes matching UTC
-=YYYYMMDD-HHMM= and =latest= tags. Pushing needs a local =docker login
-ghcr.io=. Once the GHCR package visibility is Public, pulling needs no login
-and kubernetes needs no registry Secret. Start the development loop with:
-
-#+begin_src shell
-skaffold dev
-#+end_src
-
-Skaffold builds the image, deploys =k8s/boring-logtail.yaml=, and rebuilds after
-source changes. Use =skaffold delete= to remove the development resources. On a
-cluster where log transport itself is noisy, avoid continuous log following:
-the transported collector output can create a cross-cgroup observer loop.
-
-Set =RUST_LOG= if you want something other than the default userspace =info=
-output. Make a process write to stdout or stderr and watch it go.
-
-The node configuration stays intentionally dull:
+The node configuration controls bounded collector delivery. Capture limits are
+deliberately internal constants.
 
 #+begin_src yaml
 collector:
@@ -86,91 +47,21 @@ collector:
   flush_interval_ms: 1000
   retry_max_elapsed_ms: 30000
   request_timeout_ms: 10000
-capture:
-  assembly_operations: 1024
-  assembly_bytes: 4194304
-  framing_lanes: 64
-  framing_bytes: 8388608
-  max_record_bytes: 65536
 #+end_src
 
-The collector gets retention and the interesting policy:
-
-#+begin_src yaml
-listen: 0.0.0.0:4318
-grpc_listen: 0.0.0.0:50051
-max_request_bytes: 4194304
-
-store:
-  max_memory: 128MiB
-  max_logs: 500
-  retention: 1h
-
-filters:
-  namespaces:
-    include:
-      - game-servers
-
-events:
-  joined:
-    type: info
-    message: "Someone has joined!"
-
-event_catchers:
-  - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
-    event: joined
-    emitters:
-      - stdout
-      - discord
-
-event_emitters:
-  stdout: {}
-  discord:
-    channel_id: "123456789"
-    secret_from_env: WOW_MY_DISCORD_SECRET
-#+end_src
-
-Point =BORING_LOGTAIL_CONFIG= at the node file and =BORING_COLLECTOR_CONFIG= at
-the collector file. Set the Discord token only on the collector:
+* Throw it at Kubernetes
 
 #+begin_src shell
-export BORING_COLLECTOR_CONFIG=./collector.yaml
-export WOW_MY_DISCORD_SECRET='your-discord-bot-token'
-cargo run --package boring-collector
+skaffold dev
 #+end_src
 
-The secret value comes from the named environment variable, never the YAML.
-Event matching uses a precompiled regex set and bounded emitter queues. The
-stdout emitter writes one escaped line such as
-=event="joined" type=info message="Someone has joined!" identity="k8s=game-servers/game-1/server ..." stream=Stdout ... log="peer connected: PeerId(123)"=.
-Discord receives a compact colored embed: the configured message, the actual
-caught log, namespace, Pod, container, stream, and one normal UTC timestamp.
-Valid JSON is rendered as JSON instead of a double-escaped blob, while raw
-stored bytes stay unchanged. Internal IDs and sampling machinery stay out of
-the alert.
-
-=store.retention= is collector configuration and accepts whole seconds,
-minutes, or hours such as =30s=,
-=15m=, and =2h=. Records age out individually; this is not a periodic
-everything-must-go button.
-
-* Cross-compile it
-
-#+begin_src shell
-cargo build --package boring-logtail --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
-#+end_src
-
-The binary lands at =target/${ARCH}-unknown-linux-musl/release/boring-logtail=.
-It still needs Linux to do the interesting part.
+The DaemonSet mounts =/var/log/pods= read-only and watches metadata only for its
+node. It does not load kernel programs or mount tracefs, cgroups, or a container
+runtime socket. Kubernetes classifies the hostPath as privileged namespace
+workload even though the container itself drops every capability.
 
 * License
 
-boring-logtail is free software. The code is licensed under the
-[[file:COPYING][GNU General Public License, version 3 or later]]. You can run it, read it,
-change it, share it, and sell it. Anyone passing it on must pass those freedoms
-on too. Nobody gets to distribute a proprietary fork. That is the deal.
-
-The documentation is licensed under the [[file:COPYING.DOC][GNU Free Documentation License,
-version 1.3 or later]], with no invariant sections.
+Program source is [[file:COPYING][GPL-3.0-or-later]]. Documentation is
+[[file:COPYING.DOC][GFDL-1.3-or-later]] with no invariant sections. Run it,
+study it, change it, and share it. Pass those freedoms on.

@@ -7,8 +7,8 @@ the version with machinery and caveats.
 * ABI
 
 An Application Binary Interface is the exact low-level agreement about calling,
-layout, registers, sizes, alignment, and meaning. Our kernel/userspace ABI is
-the =#[repr(C)] WriteEvent= layout plus its version and flags. See
+layout, registers, sizes, alignment, and meaning. The retired scraper used a
+=#[repr(C)] WriteEvent= layout plus its version and flags. See
 [[file:ebpf.org::*The ABI: a treaty between two worlds][the ABI treaty]].
 
 * Aya
@@ -18,9 +18,8 @@ programs. =aya-ebpf= serves kernel-side code; =aya= serves userspace.
 
 * backpressure
 
-What happens when a consumer cannot keep up with a producer. The current ring
-buffer can lose observations; it does not slow the application that called
-=write=. A real output pipeline needs an explicit policy.
+What happens when a consumer cannot keep up with a producer. Current capture
+keeps reading and counts records rejected by its bounded export queue.
 
 * BPF
 
@@ -37,8 +36,7 @@ a complete source-level type system.
 * byte
 
 Eight bits on supported Linux targets. Logs are bytes before they are UTF-8,
-JSON, lines, or meaning. boring-logtail keeps payloads as bytes through capture
-and write reconstruction.
+JSON, lines, or meaning. boring-logtail keeps CRI payloads as bytes.
 
 * cgroup
 
@@ -49,7 +47,7 @@ identity. Cgroup IDs are useful anchors but are not themselves Pod names. See
 * cgroup v2
 
 The unified cgroup hierarchy. Its process membership line has the form
-=0::$PATH=. boring-logtail requires it for namespace-safe self-exclusion.
+=0::$PATH=. The retired eBPF scraper used it for self-exclusion.
 
 * CgroupArray
 
@@ -58,9 +56,8 @@ eBPF helper can ask whether the current task is under an entry.
 
 * chunk
 
-One bounded portion of a larger write. Our chunk payload is at most 256 bytes.
-Chunks share an operation identity and carry offsets so userspace can rebuild
-the write.
+One bounded portion of a larger value. The retired eBPF ABI carried 256-byte
+write chunks; current CRI capture does not.
 
 * CO-RE
 
@@ -102,10 +99,9 @@ maps, arrays, program arrays, ring buffers, and cgroup arrays behave differently
 
 * enrichment
 
-Joining raw capture facts with useful context. Here that means turning a cgroup
-ID into node, namespace, Pod, and container identity through asynchronous
-node-local caches, without Kubernetes API calls or discovery I/O in the capture
-hot path.
+Joining raw capture facts with useful context. Here that means joining CRI Pod
+UID and container name to a node-local Kubernetes snapshot without API calls in
+the per-record path.
 
 * fd / file descriptor
 
@@ -115,11 +111,9 @@ can make them point elsewhere. See [[file:linux.org::*File descriptors and open 
 
 * framing
 
-Deciding where application records begin and end in a byte stream. Newline,
-multiline, JSON, and protocol-aware framing are userspace jobs. A write syscall
-boundary is not automatically a log-record boundary. boring-logtail currently
-joins newline-delimited bytes across writes and marks size, capacity, capture-gap,
-and shutdown splits explicitly.
+Deciding where records begin and end in a byte stream. Current boring-logtail
+uses CRI physical records and joins bounded =P= fragments through their =F=
+terminator.
 
 * GPL
 
@@ -129,13 +123,13 @@ freedoms and corresponding source under its terms.
 
 * hook
 
-The kernel event or path that causes an eBPF program to execute. boring-logtail
-uses syscall tracepoints as hooks.
+The kernel event or path that causes an eBPF program to execute. The retired
+scraper used syscall tracepoints as hooks.
 
 * integrity marker
 
-Metadata saying whether captured evidence is complete. =truncated= and
-=read_failed= are current markers. They turn uncertainty into a queryable fact.
+Metadata saying whether captured evidence is complete. Current CRI capture
+marks bounded-record truncation rather than hiding it.
 
 * kernel
 
@@ -190,8 +184,7 @@ stream identity than the integer descriptor.
 
 * operation ID
 
-The value joining chunks from one syscall. It currently uses the syscall-entry
-timestamp. Its uniqueness guarantee still needs formal definition.
+The value that joined chunks from one syscall in the retired eBPF transport.
 
 * partial write
 
@@ -225,8 +218,8 @@ An eBPF map whose values identify other eBPF programs. It powers tail calls.
 
 * ring buffer
 
-A bounded circular transport. eBPF reserves and submits =WriteEvent= records;
-userspace drains them. Full buffers mean observations can be lost. See
+A bounded circular transport. The retired eBPF scraper submitted =WriteEvent=
+records through one; full buffers could lose observations. See
 [[file:ebpf.org::*Ring buffers: kernel-to-userspace conveyor belt][ring buffers]].
 
 * replay watermark
@@ -245,15 +238,13 @@ retention rings live only in userspace and deliberately evict old history.
 
 * Rust
 
-The language used on both sides of this project. Shared source syntax does not
-erase the boundary: userspace gets =std= and Tokio; eBPF gets a constrained
-=no_std= target verified by Linux.
+The language used by this project. The retired kernel side used constrained
+=no_std= Rust; the active project is ordinary userspace Rust.
 
 * scraper
 
-The project's joyful shorthand. Technically boring-logtail captures writes at
-kernel hooks rather than polling log files, but “very fast and furious eBPF log
-scraper” is allowed to have a little fun.
+The project's joyful shorthand. Current boring-logtail tails CRI files; the
+“very fast and furious eBPF log scraper” now names the retired experiment.
 
 * stdout / stderr
 
@@ -263,8 +254,8 @@ duplicated.
 
 * syscall
 
-A controlled request from userspace to the kernel. =write(2)= is the syscall we
-currently capture. See [[file:linux.org::*Syscalls: asking the kernel to do the sharp thing][syscalls]].
+A controlled request from userspace to the kernel. The retired scraper captured
+=write(2)=. See [[file:linux.org::*Syscalls: asking the kernel to do the sharp thing][syscalls]].
 
 * tail call
 
@@ -299,13 +290,13 @@ architecture considerations.
 
 * truncation
 
-Deliberately capturing only a bounded prefix. Our current ceiling is 8192 bytes
-per write. A flag says the operation is incomplete.
+Deliberately capturing only a bounded prefix. Current CRI records have an
+internal 64 KiB ceiling and carry an integrity marker when truncated.
 
 * userspace
 
-The less-privileged world where ordinary applications run. boring-logtail's
-loader, assembler, future enrichment, and exporters live here.
+The less-privileged world where ordinary applications run. All current
+boring-logtail code lives here.
 
 * verifier
 

@@ -140,7 +140,6 @@ pub enum Enrichment {
 
 impl Enrichment {
     /// Renders a compact, truthful diagnostic description for humans.
-
     pub fn description(&self) -> String {
         match self {
             Self::Enriched(identity) => format!(
@@ -199,7 +198,6 @@ fn workload_description(identity: &KubernetesIdentity) -> String {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use super::*;

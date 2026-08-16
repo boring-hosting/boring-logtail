@@ -4,7 +4,7 @@
 //!
 //! Plain version: capture drops a notification into a small mailbox and keeps
 //! moving. A destination worker owns the slow stdout or HTTP work. If Discord
-//! stalls, it can fill only its own bounded queue; it cannot make eBPF capture
+//! stalls, it can fill only its own bounded queue; it cannot make log capture
 //! wait for the internet.
 //!
 //! Destination rendering lives in one file per emitter. Configuration parsing
@@ -72,13 +72,11 @@ pub struct EmitterSender {
 
 impl EmitterSender {
     /// Wraps a bounded channel when assembling or testing the catcher graph.
-
     pub fn new(sender: mpsc::Sender<CaughtEvent>) -> Self {
         Self { sender }
     }
 
     /// Attempts delivery immediately; it never awaits destination I/O.
-
     pub fn try_send(
         &self,
         event: CaughtEvent,
@@ -91,7 +89,6 @@ impl EmitterSender {
 ///
 /// `Debug` redacts the secret. Environment-variable lookup belongs to the host
 /// so this reusable crate never depends on the application's YAML shape.
-
 pub struct DiscordConfig {
     channel_id: String,
     secret: String,
@@ -108,7 +105,6 @@ impl DiscordConfig {
     }
 
     #[cfg(test)]
-
     fn with_api(mut self, api: impl Into<String>) -> Self {
         self.api = api.into();
 
@@ -136,7 +132,6 @@ pub struct EmittersConfig {
 }
 
 /// Owns destination workers and their shared delivery counters.
-
 pub struct EventEmitters {
     tasks: Vec<JoinHandle<()>>,
     stats: Arc<AtomicEmitterStats>,
@@ -144,7 +139,6 @@ pub struct EventEmitters {
 
 impl EventEmitters {
     /// Starts one bounded worker for each configured destination.
-
     pub fn spawn(config: EmittersConfig) -> (BTreeMap<String, EmitterSender>, Self) {
         let stats = Arc::new(AtomicEmitterStats::default());
 
@@ -172,13 +166,11 @@ impl EventEmitters {
     }
 
     /// Returns a relaxed, diagnostic snapshot of aggregate outcomes.
-
     pub fn stats(&self) -> EmitterStats {
         self.stats.snapshot()
     }
 
     /// Waits briefly for accepted events to drain, then abandons stuck workers.
-
     pub async fn shutdown(self) {
         for task in self.tasks {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await;

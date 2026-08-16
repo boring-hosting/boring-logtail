@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Small node-agent configuration: capture buffers and collector delivery.
+//! Small node-agent configuration for collector delivery.
 
 use std::{fs, path::Path, time::Duration};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-
 pub struct Config {
     pub collector: CollectorExportConfig,
-    pub capture: CaptureConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-
 pub struct CollectorExportConfig {
     pub endpoint: String,
     pub queue_records: usize,
@@ -40,30 +37,6 @@ impl Default for CollectorExportConfig {
             flush_interval_ms: 1_000,
             retry_max_elapsed_ms: 30_000,
             request_timeout_ms: 10_000,
-        }
-    }
-}
-
-/// Bounds for state that must remain on the node while reconstructing records.
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-
-pub struct CaptureConfig {
-    pub assembly_operations: usize,
-    pub assembly_bytes: usize,
-    pub framing_lanes: usize,
-    pub framing_bytes: usize,
-    pub max_record_bytes: usize,
-}
-
-impl Default for CaptureConfig {
-    fn default() -> Self {
-        Self {
-            assembly_operations: 1_024,
-            assembly_bytes: 4 * 1024 * 1024,
-            framing_lanes: 64,
-            framing_bytes: 8 * 1024 * 1024,
-            max_record_bytes: 64 * 1024,
         }
     }
 }
@@ -100,33 +73,19 @@ impl Config {
         .validate()
         .map_err(anyhow::Error::msg)?;
 
-        let capture = self.capture;
-
-        if capture.assembly_operations == 0
-            || capture.assembly_bytes == 0
-            || capture.framing_lanes == 0
-            || capture.max_record_bytes == 0
-            || capture.framing_bytes < capture.max_record_bytes
-        {
-            bail!("capture reconstruction and framing bounds must be non-zero and coherent");
-        }
-
         Ok(())
     }
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use super::*;
 
     #[test]
 
-    fn defaults_only_describe_capture_and_delivery() {
+    fn defaults_describe_delivery() {
         let config = Config::load(None).unwrap();
-
-        assert_eq!(config.capture.max_record_bytes, 64 * 1024);
 
         assert!(config.collector.endpoint.ends_with("/v1/logs"));
     }

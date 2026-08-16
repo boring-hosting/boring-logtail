@@ -4,7 +4,7 @@
 
 * Status
 
-Proposed. Awaiting maintainer approval.
+Superseded on 2026-08-16 by =20260816-0713-remove-ebpf-runtime.org=.
 
 * Context
 

@@ -5,30 +5,11 @@ This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
 =spec/=.
 
-* TODO Remove konnectivity packet tracing from ordinary cluster operation
-
-Why: both node agents run with =-v=8=; following boring-logtail through
-=kubectl logs= creates a cross-cgroup observer loop because konnectivity logs
-the traffic used to transport collector output.
-
-* TODO Design safe eBPF filter pushdown from positive exclusion evidence
-
-Why: absence from an included-namespace-only Pod cache may be cache lag, not an
-excluded workload; denying that cgroup would silently lose startup writes. See
-=spec/20260805-1655-declarative-capture-filters.org=.
-
 * TODO Give Kubernetes watcher tasks explicit application ownership
 
 Why: process exit currently tears down the detached tasks, but explicit handles
 would make graceful shutdown testable. See
-=spec/20260805-1655-declarative-capture-filters.org=.
-
-* TODO Separate scoped-filter exclusion from genuine identity-resolution loss
-
-Why: an included-namespace-only Pod cache intentionally makes excluded
-workloads look unresolved, while metadata lag can produce the same outcome; one
-counter cannot diagnose both. See
-=spec/20260805-1655-declarative-capture-filters.org=.
+=spec/20260816-0713-remove-ebpf-runtime.org=.
 
 * TODO Authenticate and authorize the collector gRPC log stream
 

@@ -3,9 +3,9 @@ description = "Build the release binary"
 run = "cargo build --release"
 
 [tasks.run]
-description = "Build and run boring-logtail with eBPF privileges"
+description = "Build and run boring-logtail"
 depends = ["build"]
-run = "sudo -E target/release/boring-logtail"
+run = "target/release/boring-logtail"
 
 [tasks.debug]
 description = "Build and expose boring-logtail to LLDB on port 1234"
@@ -15,13 +15,13 @@ run = [
 ]
 
 [tasks.publish]
-description = "Build and push dated and latest images directly to GHCR"
+description = "Build and push dated and latest images to the GitLab registry"
 run = '''
 set -eu
 
 tag="$(date -u +%Y%m%d-%H%M)"
-logtail_image="ghcr.io/alfredosa/boring-logtail"
-collector_image="ghcr.io/alfredosa/boring-collector"
+logtail_image="registry.gitlab.com/biomehub/boring-logtail/logtail"
+collector_image="registry.gitlab.com/biomehub/boring-logtail/collector"
 
 docker build --target logtail --tag "${logtail_image}:${tag}" --tag "${logtail_image}:latest" .
 docker push "${logtail_image}:${tag}"

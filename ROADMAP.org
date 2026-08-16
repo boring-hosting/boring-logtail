@@ -1,145 +1,46 @@
 #+title: boring-logtail roadmap
 #+license: GFDL-1.3-or-later
 
-The capture source of truth is the byte sequence that the kernel reports as
-successfully written to a container output stream. The eBPF transport emits
-versioned =WriteEvent= chunks; userspace reconstructs application log records
-and enriches them with Kubernetes identity.
+The capture source of truth is the CRI record committed below =/var/log/pods=.
+Logtail reads node-local files and ships bounded batches. The collector owns
+history, policy, alerts, and reads.
 
-* Workspace boundaries
+* Node capture
 
-- [X] Reserve =boring-logtail= for the host application and user-facing binary.
-- [X] Isolate the kernel/userspace contract in =blt-abi= and kernel programs in
-  =blt-ebpf=.
-- [X] Share durable userspace facts through =blt-model=.
-- [X] Isolate the directly shared bounded database in =blt-store= and bounded
-  destination actors in =blt-emitter=.
-- [X] Expose the first name-selected gRPC log stream directly from the
-  collector; avoid a speculative API façade crate.
-- [ ] Add authentication, authorization, and TLS before exposing the collector
-  stream outside trusted cluster wiring.
+- [X] Parse opaque CRI stdout/stderr records and bounded =P=/=F= partials.
+- [X] Start existing files at EOF, follow append, and handle inode rotation.
+- [X] Read notified files directly; debounce lifecycle reconciliation and keep
+  a slow repair scan.
+- [X] Enrich by exact Pod UID and container name from a node-scoped watch.
+- [ ] Measure long-running CPU, RSS, missed bytes, duplicates, notification
+  overflow, and reconciliation activity.
+- [ ] Add persisted offsets only if restart-loss measurements justify them.
 
-* Node agent and cluster collector
+* Delivery and collection
 
-- [X] Keep =boring-logtail= as the small per-node DaemonSet: eBPF capture,
-  reconstruction, framing, enrichment, bounded batching, and OTLP export.
-- [X] Add one =boring-collector= process for OTLP ingestion,
-  cluster-wide bounded retention, rich processing, and downstream export.
-- [X] Move =blt-store=, event catchers, and =blt-emitter= ownership
-  from the node agent to the collector composition root.
-- [X] Preserve raw record bytes while recognizing whole-record JSON in the
-  collector and rendering structured bodies without double escaping.
-- [X] Add a tested collector gRPC stream for retained tail plus matching inserts;
-  keep OTLP as ingestion rather than pretending it is a query protocol.
-- [ ] Replace the web backend's Kubernetes Pod-log adapter with the collector
-  client, then deploy the endpoint through the GitOps repository.
-- [ ] Specify persistence separately; phase one remains an authoritative but
-  bounded in-memory database with no restart-durability claim.
+- [X] Keep node delivery bounded by records, bytes, time, and retry duration.
+- [X] Share one collector =Arc<LogStore>= across ingestion and gRPC readers.
+- [X] Preserve opaque bytes and explicit integrity through OTLP.
+- [X] Run event catchers and bounded stdout/Discord emitters in the collector.
+- [ ] Reduce operator configuration to demonstrated product choices.
+- [ ] Specify persistence separately; the current store is bounded memory.
 
-See =spec/20260813-1812-node-agent-and-cluster-collector.org=.
+* Queries and consumers
 
-* Capture contract
-
-- [X] Name the kernel/userspace model =WriteEvent=.
-- [X] Keep payloads as opaque bytes; do not construct log or JSON objects in eBPF.
-- [X] Include ABI version, timestamp, cgroup ID, PID, TID, descriptor, syscall
-  kind, operation ID, chunk offset, requested length, result, and flags.
-- [X] Make truncation and read failure representable.
-- [X] Reject unsupported ABI versions in userspace.
-- [ ] Add loss counters for ring-buffer reservation and userspace eviction.
-- [ ] Define an ordering guarantee and operation-ID uniqueness across chunks.
-
-* Syscall coverage
-
-- [X] Pair =sys_enter_write= with =sys_exit_write=; publish only the bytes that
-  the syscall reports as written.
-- [ ] Capture and reconstruct writes larger than one chunk without silent loss.
-- [X] Pair and capture =writev=, including writes spanning multiple iovecs.
-- [ ] Measure =write=/=writev= coverage against representative Node, JVM, Go,
-  Python, Rust, and native workloads.
-- [ ] Investigate and measure =pwrite=/=pwritev= to redirected output streams.
-- [ ] Investigate and measure =sendfile=.
-- [ ] Investigate and measure =splice=/=vmsplice=.
-- [ ] Investigate and measure =io_uring= output operations.
-- [ ] Maintain fixtures for every supported syscall path and an explicit metric
-  for recognized-but-unsupported paths.
-
-* Stream identity coverage
-
-- [X] Initially recognize numeric descriptors 1 and 2.
-- [X] Exclude the collector's own writes reliably across PID namespaces and
-  prevent output feedback loops.
-- [ ] Observe =close=, =dup=, =dup2=, =dup3=, and =fcntl= descriptor duplication.
-- [ ] Track the underlying file/pipe identity of container stdout and stderr.
-- [ ] Capture writes through duplicated descriptors referring to those streams.
-- [ ] Distinguish fd 1/2 after they have been redirected to unrelated files.
-- [ ] Support multiple processes sharing one container output stream.
-- [ ] Test close, replacement, redirection, inheritance, PID reuse, and container
-  restart explicitly.
-- [ ] Prototype a VFS/file-write adapter filtered by userspace-injected
-  device/inode keys for node-local CRI logs.
-- [ ] Compare application-write capture with CRI-file capture for coverage,
-  framing, latency, overhead, rotation, and reuse as a generic Linux building block.
-
-* Reconstruction and Kubernetes identity
-
-- [X] Join chunks by operation identity and report captured gaps explicitly.
-- [X] Frame newline-delimited opaque-byte records in userspace.
-- [ ] Add semantic multiline and JSON framing only after their contracts are
-  measured and specified.
-- [X] Preserve raw bytes and integrity status even when decoding fails.
-- [X] Resolve cgroup ID to runtime container ID across measured containerd and
-  CRI-O layouts.
-- [X] Enrich through a node-scoped metadata cache with node, namespace, Pod name and
-  UID, container name and ID, stream, PID, and TID.
-- [ ] Retain deleted Pod identity long enough to classify late writes.
-- [X] Keep control-plane and filesystem lookups outside the capture hot path.
-- [X] Apply namespace include filters after enrichment and scope Pod
-  watches to the included namespaces on the current node.
-- [X] Compile event catchers once and hand matches to bounded Tokio emitter
-  actors without network backpressure on capture.
-- [X] Deliver static typed events to Discord with secrets sourced from the
-  environment.
-- [X] Render Discord alerts as compact colored embeds with the caught log,
-  useful Kubernetes identity, and one honest wall-clock timestamp.
-- [X] Deliver escaped one-line events to stdout through the same bounded actor
-  path.
-- [X] Share the exact final =LogRecord= across pipeline output, store, and event
-  emitters without lossy shadow payloads.
-- [ ] Add more key-selected emitters when a real use needs them.
-- [ ] Push filters into eBPF only when positive evidence can reject a write
-  without turning Pod-cache lag into silent loss.
-- [ ] Design atomic transition semantics before adding dynamic filter reload.
-
-* Bounded queries and streaming
-
-- [X] Frame immutable byte-preserving =LogRecord= values before storage.
-- [X] Retain namespace/workload/Pod record rings while preserving Pod identity
-  and enforcing the workload-wide history limit across replicas.
-- [X] Resolve UID-based workload ownership without guessing from names or labels.
-- [X] Share one =Arc<LogStore>= between ingestion and API readers; expose direct
-  append, query, flush, and continuous selector-stream operations.
-- [X] Select replay by workload, Pod, or namespace identity.
-- [X] Select the collector RPC by exact namespace, workload, or Pod name and
-  verify retained tail plus follow behavior through a real gRPC client.
-- [X] Isolate slow streams with bounded insert notifications and explicit lag.
-- [X] Expire retained records individually by monotonic age with =Ns=, =Nm=,
-  and =Nh= configuration.
-- [X] Benchmark ordinary allocation before considering a custom arena. See
-  =spec/20260809-1626-bounded-replay-log-store.org=.
+- [X] Stream retained tail followed by matching live inserts over gRPC.
+- [ ] Authenticate, authorize, and encrypt the collector stream before exposing
+  it outside trusted cluster wiring.
+- [ ] Replace the web backend's Kubernetes Pod-log adapter with the collector.
 
 * Release gates
 
-- [ ] No silent byte loss: every loss boundary has a counter or integrity marker.
-- [ ] Coverage is reported by syscall path and stream-identity scenario.
-- [ ] Sustained-throughput, burst, backpressure, agent-restart, and metadata-delay
-  tests pass at documented limits.
-- [ ] Unsupported behavior is documented from measurements rather than assumed.
-* Workload log history
+- [ ] Every loss boundary has a counter or integrity marker.
+- [ ] Sustained throughput, burst, backpressure, restart, rotation, and metadata
+  delay checks pass at documented bounds.
+- [ ] Ordinary builds and images require stable Rust only.
 
-The collector store is namespace/workload/Pod-owned: controller UID (or
-standalone Pod UID), with historical Pods kept distinct. Operators set one
-memory envelope plus a per-workload log ceiling and retention age. The
-record-size default is 64 KiB. The capture/transport queue remains outside the
-database. Query and stream reads share immutable records and never drain
-retained history. Severity stays =Unknown= without explicit evidence.
+* Retired experiment
+
+The eBPF =write=/=writev= scraper was removed from the active workspace after
+the CRI boundary passed live comparison. Its code remains in Git history and
+its lessons remain in =learn/ebpf.org= and the retrospective under =blog/=.

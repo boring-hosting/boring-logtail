@@ -53,7 +53,7 @@ to its architecture's syscall ABI, then executes a special instruction. Linux
 dispatches the request. On return, a non-negative result usually represents
 success; negative values encode errors at the raw kernel boundary.
 
-boring-logtail currently traces =write(2)=:
+The retired eBPF scraper traced =write(2)=:
 
 #+begin_src c
 ssize_t write(int fd, const void *buf, size_t count);
@@ -81,7 +81,7 @@ The caller owns retry logic. A negative result means none of the requested bytes
 became part of that write operation. The userspace buffer may also change after
 entry, so capture timing matters.
 
-*Why we care.* We remember entry arguments, wait for exit, and cap capture at the
+*Why we cared.* The eBPF experiment remembered entry arguments, waited for exit, and capped capture at the
 non-negative return value. =WriteEvent.requested_len= and =WriteEvent.result=
 remain separate facts.
 
@@ -106,9 +106,8 @@ Convention starts processes with:
 After =dup2= or shell redirection, a write using numeric fd 1 may reach the
 container's stderr pipe, a file, a socket, or nowhere useful.
 
-*Why we care.* We currently admit writes whose numeric descriptor is 1 or 2.
-That is an intentionally incomplete first filter. Durable stream identity needs
-tracking of =dup=, =close=, inheritance, and the underlying pipe/file object.
+*Why we cared.* The eBPF experiment admitted writes whose numeric descriptor
+was 1 or 2. CRI-file capture now gets stream identity from the runtime record.
 
 * Pipes and container logs
 
@@ -120,9 +119,8 @@ stdout and stderr to pipes or pseudoterminals, consume the bytes, frame them in
 a runtime log format, and store or forward them. Kubernetes asks the runtime for
 those logs; it does not magically own application stdout.
 
-*Why we care.* We want the bytes before runtime formatting and file scraping,
-but “a write to fd 1 or 2” is only an approximation of “a write to the container
-output pipe.”
+*Why we care.* That approximation is why current boring-logtail reads the CRI
+record after runtime formatting instead of guessing from numeric descriptors.
 
 * CRI log files: tap the runtime's structure
 
@@ -205,10 +203,8 @@ than bytes stored on disk.
 exposes tracing infrastructure, including tracepoint metadata. These are
 virtual filesystems with kernel-defined semantics.
 
-*Why we care.* Userspace reads =/proc/self/cgroup= to locate its exclusion
-cgroup. The privileged DaemonSet mounts tracefs so Aya can work with tracing
-facilities. Reading =/proc/<pid>/cmdline= is inherently racy because a process
-may exit or a PID may be reused.
+*Historical note.* The retired eBPF DaemonSet mounted tracefs and inspected its
+own cgroup. Current boring-logtail needs neither filesystem.
 
 * Tracepoints
 
@@ -220,8 +216,8 @@ defined event formats. We attach to =syscalls/sys_enter_write= and
 =syscalls/sys_exit_write=. Their argument layout is still architecture ABI
 specific; our current offsets describe the 64-bit ABI used by the target build.
 
-*Why we care.* Tracepoints let us observe every matching syscall on a node
-without patching each application or language runtime.
+*Why we cared.* Tracepoints let the retired experiment observe matching
+syscalls without patching each application or language runtime.
 
 * Go deeper
 

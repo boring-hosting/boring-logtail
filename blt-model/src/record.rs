@@ -135,7 +135,6 @@ pub struct LogRecord {
 // I really dislike getters and setters.
 impl LogRecord {
     #[allow(clippy::too_many_arguments)]
-
     pub fn new(
         observed_at: jiff::Timestamp,
         sampling_seed: u64,

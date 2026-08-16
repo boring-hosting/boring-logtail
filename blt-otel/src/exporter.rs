@@ -213,7 +213,6 @@ impl OtlpExporter {
     }
 
     /// Close admission and wait for the actor to flush all accepted records.
-
     pub async fn shutdown(mut self) -> ExportStats {
         let sender = self.sender.take().expect("exporter is running");
 

@@ -8,15 +8,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blt-abi = { path = "../blt-abi", features = ["user"] }
 blt-model = { path = "../blt-model" }
 blt-otel = { path = "../blt-otel" }
 
 anyhow = { workspace = true, default-features = true }
-aya = { workspace = true }
 env_logger = { workspace = true }
 futures = "0.3"
-libc = { workspace = true }
 log = { workspace = true }
 jiff = "0.2"
 k8s-openapi = { version = "0.28", features = ["latest"] }
@@ -34,24 +31,6 @@ tokio = { workspace = true, features = [
     "time",
     "test-util",
 ] }
-[build-dependencies]
-anyhow = { workspace = true }
-aya-build = { workspace = true }
-cargo_metadata = { workspace = true }
-# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
-# it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
-# script to build this, but we want to teach cargo about the dependency so that cache invalidation
-# works properly.
-#
-# Note also that https://github.com/rust-lang/cargo/issues/10593 occurs when `target = ...` is added
-# to an artifact dependency; it seems possible to work around that by setting `resolver = "1"` in
-# Cargo.toml in the workspace root.
-#
-# Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
-# workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
-# features.
-blt-ebpf = { path = "../blt-ebpf" }
-
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"

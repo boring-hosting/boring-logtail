@@ -1,6 +1,9 @@
 #+title: eBPF without magic
 #+license: GFDL-1.3-or-later
 
+This page is the field record of the retired eBPF scraper. Paths into removed
+source refer to Git history, not the current working tree.
+
 eBPF is often sold as magic kernel JavaScript. That description is catchy,
 wrong in several useful ways, and likely to annoy both kernels and JavaScript.
 
@@ -19,7 +22,7 @@ tracepoint, socket path, cgroup, XDP ingress point, or kprobe.
 do not have libc, arbitrary syscalls, an allocator, or an unconstrained stack.
 Their world is deliberately smaller.
 
-*Why we care.* Three tracepoint programs currently handle write entry, write
+*Why we cared.* Three tracepoint programs handled write entry, write
 exit, and chunk emission in [[file:../blt-ebpf/src/main.rs][the eBPF binary]].
 
 * The verifier: prove it before you run it

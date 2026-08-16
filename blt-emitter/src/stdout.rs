@@ -133,7 +133,6 @@ pub(super) fn quote_bytes(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use std::sync::Arc;

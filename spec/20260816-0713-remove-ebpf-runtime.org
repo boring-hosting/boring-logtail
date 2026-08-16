@@ -4,7 +4,7 @@
 
 * Status
 
-Proposed. Awaiting maintainer approval.
+Approved by the maintainer on 2026-08-16. Implementation in progress.
 
 * Context
 
@@ -81,15 +81,28 @@ them.
 
 * TODO
 
-- [ ] E1 Approve full eBPF removal and the CRI-only project boundary.
-- [ ] E2 Remove eBPF crates, ABI, dependencies, build machinery, and active
+- [X] E1 Approve full eBPF removal and the CRI-only project boundary.
+- [X] E2 Remove eBPF crates, ABI, dependencies, build machinery, and active
   runtime code.
-- [ ] E3 Delete obsolete capture reconstruction and privilege wiring while
+- [X] E3 Delete obsolete capture reconstruction and privilege wiring while
   preserving CRI behavior.
-- [ ] E4 Clean configuration, =learn/=, README, roadmap, TODO index, and
+- [X] E4 Clean configuration, =learn/=, README, roadmap, TODO index, and
   superseded specs.
 - [ ] E5 Pass focused/workspace checks, image build, and guarded live
   validation.
+
+* Validation log
+
+- =cargo test --package boring-logtail=: pass, 26 tests.
+- =cargo test --workspace=: pass, including local HTTP and gRPC fixtures.
+- =cargo clippy --workspace --all-targets -- -D warnings=: pass.
+- =cargo fmt --all -- --check= and =git diff --check=: pass.
+- Main and CRI-development Kubernetes YAML plus =skaffold.yaml= parse: pass.
+- Stable-Rust Docker builds for =logtail= and =collector=: pass without Aya,
+  nightly, LLVM, Clang, or =bpf-linker=.
+- The 2026-08-15 two-node CRI-O comparison in the superseded CRI-tail spec
+  remains the live boundary evidence. A guarded rollout of this final lean image
+  is still required before E5 can close.
 
 * Supersedes
 

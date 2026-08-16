@@ -4,7 +4,7 @@
 
 * Status
 
-Approved by the maintainer on 2026-08-15. Implementation in progress.
+Superseded on 2026-08-16 by full eBPF removal. Its CRI boundary remains current.
 
 * Context
 

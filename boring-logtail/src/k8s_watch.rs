@@ -244,7 +244,6 @@ fn snapshot_from_resources_with_history(
 }
 
 #[cfg(test)]
-
 fn merged_snapshot(
     node: &str,
     pod_states: &[WatchState<Pod>],
@@ -338,7 +337,7 @@ fn insert_status(
     status: ContainerStatus,
 ) {
     let Some(raw_id) = status.container_id else {
-        // A not-yet-started container has no CRI ID and cannot match a cgroup.
+        // A not-yet-started container has no CRI ID and cannot match a log file.
         // A later Pod status update will add it.
         return;
     };
@@ -534,7 +533,6 @@ fn partition_limit(total: usize, partitions: usize, index: usize) -> usize {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use serde_json::json;

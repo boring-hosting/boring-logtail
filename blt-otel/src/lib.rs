@@ -29,7 +29,6 @@ pub use exporter::{ExportConfig, ExportStats, OtlpExporter, OtlpSender, TryExpor
 ///
 /// OTLP itself is versioned upstream. This number covers meanings BLT owns,
 /// such as integrity and workload-resolution attributes.
-
 pub const BLT_OTLP_MAPPING_VERSION: i64 = 1;
 
 /// Agent facts that apply to every record in one exported request.
@@ -45,7 +44,6 @@ pub struct ExportContext {
 ///
 /// Batch grouping comes later. Returning the real request type now makes the
 /// mapping fixture usable by both the future exporter and receiver.
-
 pub fn export_request(record: &BltLogRecord, context: &ExportContext) -> ExportLogsServiceRequest {
     let resource = Resource {
         attributes: resource_attributes(record, context),
@@ -74,7 +72,6 @@ pub fn export_request(record: &BltLogRecord, context: &ExportContext) -> ExportL
 }
 
 /// Exact protobuf size used by future byte-bounded batches.
-
 pub fn encoded_len(request: &ExportLogsServiceRequest) -> usize {
     request.encoded_len()
 }
@@ -107,7 +104,6 @@ impl std::error::Error for DecodeError {}
 ///
 /// Generic OTLP records are not silently treated as BLT records. Required
 /// mapping and identity attributes make admission explicit and versioned.
-
 pub fn decode_record(resource: &Resource, log: &LogRecord) -> Result<BltLogRecord, DecodeError> {
     let resource = Attributes::new(&resource.attributes);
     let attributes = Attributes::new(&log.attributes);
@@ -401,8 +397,8 @@ fn log_record(record: &BltLogRecord) -> LogRecord {
     let (severity_number, severity_text) = severity(record.severity());
 
     LogRecord {
-        // The BPF timestamps are monotonic, not Unix time. Keep this empty until
-        // a source timestamp is parsed with an explicit clock-domain contract.
+        // Historical capture timestamps were monotonic, not Unix time. Keep
+        // this empty while old records remain readable during migration.
         time_unix_nano: 0,
         observed_time_unix_nano,
         severity_number,
@@ -519,7 +515,6 @@ fn key_value(key: &str, value: any_value::Value) -> KeyValue {
 }
 
 #[cfg(test)]
-
 mod tests {
 
     use std::{collections::HashMap, sync::Arc};

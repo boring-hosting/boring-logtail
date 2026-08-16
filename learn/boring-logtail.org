@@ -1,392 +1,72 @@
-#+title: How boring-logtail hears a write
+#+title: How boring-logtail hears a log
 #+license: GFDL-1.3-or-later
 
-This page describes the program that exists, not the finished creature from the
-roadmap. When code and this page disagree, that is a bug in one of them.
+This page describes the program that exists today.
 
 * The whole trip
 
 #+begin_example
-application thread
-  write(fd, buffer, count)
-       |
-       | sys_enter_write
-       v
-  remember WriteStart by PID+TID
-       |
-       | Linux performs the write
-       | sys_exit_write(result)
-       v
-  create WriteJob
-       |
-       | tail calls, one bounded copy each
-       v
-  WriteEvent + WriteEvent + ...
-       |
-       | BPF ring buffer
-       v
-  decode_event
-       |
-       v
-  WriteAssembler
-       |
-       v
-  WriteOperation { identity, result, integrity, bytes }
-       |
-       v
-  cgroup snapshot + node-filtered Pod snapshot
-       |
-       v
-  Kubernetes identity or an explicit unresolved reason
-       |
-       v
-  bounded OTLP batch -> boring-collector
-       |
-       v
-  policy -> retention / alerts
+/var/log/pods/NAMESPACE_POD_UID/CONTAINER/RESTART.log
+  -> changed-file notification
+  -> bounded physical-line read
+  -> CRI timestamp / stream / P-or-F parse
+  -> bounded partial join
+  + node-scoped Pod and ReplicaSet watch
+  -> LogRecord with exact workload identity
+  -> bounded OTLP queue and batch worker
+  -> boring-collector
 #+end_example
 
-The kernel side reports syscall facts and opaque bytes. Userspace reconstructs
-those facts. Kubernetes enrichment belongs after reconstruction.
+Kubelet and the container runtime already chose the Kubernetes log boundary.
+The agent reads that result instead of guessing from application syscalls.
 
-The accepted capture boundary is back at application =write= and =writev= on
-stdout/stderr. A registered CRI-file tap was tested and rejected: it attributed
-writes to the runtime, required descriptor discovery, and an inotify mistake
-created a three-core rescan feedback loop. See the rejected
-[[file:../spec/20260802-0928-userspace-registered-cri-log-tap.org][CRI log tap experiment]] and the accepted
-[[file:../spec/20260803-1858-direct-kubernetes-identity.org][direct Kubernetes identity spec]].
+* Files and rotation
 
-Identity is layered off the hot path. The cgroup resolver maps the kernel
-cgroup ID to a complete runtime container ID. One Kubernetes watch indexes Pods
-assigned to this node by that exact container ID. Both publish snapshots; an
-incoming event performs two memory lookups only. There is no CRI client,
-runtime-socket mount, kubelet-log scan, or metadata I/O per event.
+Existing files start at EOF so agent startup does not replay the node. A newly
+discovered file starts at zero. The reader keeps an old inode open through
+rotation and begins its replacement at zero.
 
-* 0. Refuse to hear ourselves
+File notifications mark only changed files readable. Creates, removes, and
+renames request one debounced reconciliation; they do not run a full tree scan
+inline. A slow repair scan covers missed notifications and overflow.
 
-*Plain version.* Before turning on the microphone, put the microphone's own
-room on the ignore list.
+This is live tailing, not durable ingestion. An agent restart can miss bytes
+written while it was down. Persisted offsets need their own evidence and spec.
 
-*Technical truth.* [[file:../boring-logtail/src/cgroup.rs][CollectorCgroup]] reads the cgroup-v2
-membership from =/proc/self/cgroup=, validates the path, and opens the matching
-directory below =/sys/fs/cgroup=. Userspace places that directory FD into slot
-zero of the =COLLECTOR_CGROUP= cgroup array.
+* CRI records
 
-The eBPF entry program calls =current_task_under_cgroup(0)=. A matching task or
-descendant is ignored. A helper error also means “do not capture this write.”
-This is fail-closed because a broken self-filter can amplify one output line
-forever.
+A physical record is =TIMESTAMP STREAM TAG PAYLOAD=. =STREAM= is =stdout= or
+=stderr=. =TAG= is =F= for a complete record or =P= for a partial record.
+Payload stays opaque bytes; JSON parsing belongs downstream.
 
-*Why cgroup, not PID?* PID values change across namespaces. The original code
-inserted container PID 1 while the tracepoint observed a host PID. Cgroup
-membership is evaluated by the kernel against an open cgroup object, so the
-namespace translation problem disappears.
+Partial lanes are separated by Pod UID, container, restart, and stream. Record
+bytes, physical lines, and simultaneous partial lanes are bounded. Truncation
+travels with the record instead of becoming invisible loss.
 
-* 1. Catch syscall entry
+* Kubernetes identity
 
-[[file:../blt-ebpf/src/main.rs][boring_logtail_enter]] runs at
-=syscalls/sys_enter_write=.
+The path supplies Pod UID and container name. One node-filtered Kubernetes
+watch supplies namespace, Pod, container ID, and workload ownership. ReplicaSet
+UIDs resolve Deployments without guessing from names. The capture loop reads an
+immutable snapshot; it performs no metadata I/O for each record.
 
-It reads:
+Records without current exact identity are skipped and reported. Choosing a
+plausible Pod would be worse than admitting uncertainty.
 
-- numeric file descriptor
-- userspace buffer address
-- requested byte count
-- current cgroup ID
-- PID and TID
-- monotonic timestamp
+* Delivery and queries
 
-It first admits only numeric fd 1 or 2. Then it inserts a =WriteStart= into
-=WRITE_STARTS= under the combined PID/TID key.
+The node exporter has bounded record and byte queues. One worker preserves
+batch order, retries for a bounded interval, and counts overload or delivery
+failure. A dead collector cannot grow node memory forever or stop file reads.
 
-Namespace filtering currently happens after enrichment in userspace. A watch
-limited to included namespaces cannot prove that a missing cgroup is excluded:
-the included Pod may simply be newer than its status cache entry. Kernel
-pushdown therefore remains deferred until exclusion can be established from
-positive evidence without dropping an included container's first writes.
+The collector shares one =Arc<LogStore>= between OTLP ingestion and gRPC
+readers. Selectors return retained matches followed by later inserts. This is
+connected-session truth, not durable exactly-once delivery.
 
-*Why remember instead of emit?* Entry only says what the application requested.
-We need syscall exit to know whether Linux accepted all, some, zero, or none of
-the bytes.
+* The old kernel path
 
-*Current sharp edge.* =WRITE_STARTS= has a fixed capacity. Insert failure drops
-this observation. We do not yet expose a loss counter.
-
-* 2. Pair syscall exit
-
-[[file:../blt-ebpf/src/main.rs][boring_logtail_exit]] runs at
-=syscalls/sys_exit_write=.
-
-It reads the signed result, looks up the matching entry state, and removes that
-state on every matched exit. It creates a =WriteJob= with chunk number zero,
-stores it in =WRITE_JOBS=, then tail-calls the chunk worker.
-
-An exit without entry state is ignored. That can happen when entry filtering or
-state insertion rejected the operation.
-
-* 3. Copy bounded chunks
-
-The chunk worker asks [[file:../blt-abi/src/lib.rs][next_write_chunk]] what piece comes
-next. Current limits are:
-
-#+begin_example
-WRITE_CHUNK_SIZE      = 256 bytes
-MAX_CHUNKS_PER_WRITE = 32
-MAX_BYTES_PER_WRITE  = 8192 bytes
-#+end_example
-
-For each chunk it reserves one ring-buffer record, fills the metadata, attempts
-=bpf_probe_read_user_buf()=, submits the event, increments the job, and
-tail-calls itself again if needed.
-
-The event says whether it is first, last, truncated, result-known, or affected
-by a read failure. A failed or zero-byte syscall still produces one empty event
-with the signed result. A write over 8192 bytes produces captured evidence with
-a truncation marker.
-
-*Important race.* The pointer came from syscall entry, but bytes are copied
-after syscall exit. Another thread could mutate that userspace memory. The
-current design reports what it managed to read, not a cryptographic snapshot of
-the exact bytes Linux copied internally.
-
-* 4. Cross the ring buffer
-
-=EVENTS= is a 256 KiB BPF ring buffer. Each record has the fixed =WriteEvent=
-layout defined in =blt-abi=.
-
-The userspace capture loop waits asynchronously for readability and drains all
-available records. =decode_event= rejects the wrong byte size or ABI version and
-performs an unaligned read into the shared C-layout type.
-
-*Current sharp edge.* Ring-buffer reservation failure has no counter. That is an
-explicit roadmap item, not an invisible promise.
-
-* 5. Rebuild one write
-
-[[file:../boring-logtail/src/pipeline.rs][WriteAssembler]] keys incomplete work by:
-
-#+begin_example
-(cgroup_id, pid, tid, operation_id)
-#+end_example
-
-It waits for a last or truncated chunk, then verifies:
-
-- first-chunk marker exists
-- all chunks belong to the same key
-- stable metadata agrees
-- byte offsets are contiguous
-- nothing follows the terminal chunk
-
-Success produces a =WriteOperation= containing timestamp, identity, syscall,
-descriptor, requested length, actual result, integrity flags, and reconstructed
-bytes.
-
-*Why not call it a log yet?* One write can hold half a log line, several lines,
-binary data, or a fragment of JSON. =WriteOperation= is one syscall, not one
-application record.
-
-*Current sharp edges.* Incomplete operations do not yet expire. Duplicate or
-missing chunks become an error only when a terminal chunk lets assembly run.
-=operation_id= currently reuses the entry timestamp; its collision guarantee is
-not yet formally defined.
-
-* 6. Frame and export
-
-After reconstruction, =Pipeline= joins the current in-memory Kubernetes
-identity snapshots, chooses an internal framing lane, and frames newline-delimited
-records. One write can finish zero, one, or many =LogRecord= values. The node
-does not apply cluster policy: it exports every honest framed result.
-
-The framer preserves opaque bytes across write boundaries. One record is capped
-at an internal 64 KiB safety bound. Container streams are
-internal framing lanes so bytes from different containers or descriptors are
-never joined. Aggregate pending bytes have explicit node capture bounds;
-pressure emits an integrity-marked fragment instead of silently
-growing or discarding it. Kernel read failures become explicit capture gaps, so
-bytes from opposite sides of missing evidence are never stitched into a fake
-complete line.
-
-Records enter a byte- and count-bounded OTLP queue without blocking eBPF
-ring-buffer drain. One task batches them by record count, encoded bytes, and
-time, then retries the collector endpoint for a bounded interval. Shutdown
-drains the framer and exporter in that order. Queue pressure and every delivery
-failure have counters.
-
-* Query and continuous stream
-
-The collector shares one =Arc<LogStore>= between OTLP ingestion and the API.
-The store directly owns namespace, workload, and Pod record rings behind one
-lock; there is no database actor or command queue. A selector names a workload,
-Pod, or namespace by exact Kubernetes name. =query= returns matching retained records, =flush=
-clears retention, and =stream= is one ordered feed of retained matches followed
-by later matching inserts.
-
-The collector exposes that operation as =LogService.StreamLogs= on its own gRPC
-port. A request chooses one name selector, a retained =tail_lines= count, and
-whether to follow later inserts. Responses keep raw bytes plus timestamp,
-sequence, namespace, workload kind/name, and Pod name. Workload and Pod names
-currently match cluster-wide; the returned identity makes collisions visible.
-
-Internally, =stream= opens its bounded insert-notification receiver before it
-reads the retained snapshot and watermark =N=. Notifications through =N= are
-duplicates of the snapshot and are skipped; later sequences continue the feed.
-An append cannot disappear between the two steps.
-
-This is connected-session truth, not durable exactly once. Sequences reset on
-restart, there are no acknowledgements or reconnect cursors, and retained
-history can already have been evicted. Reading a stream removes only the
-reader's shared reference; it never drains retained history. Slow readers never
-stall ingestion, and a bounded notification receiver reports lag explicitly.
-
-* What “valuable data” means today
-
-The live DaemonSet has already reconstructed:
-
-- structured Flux reconciliation JSON
-- GitLab Runner diagnostics
-- ExternalDNS status
-- controller-runtime warnings
-- a deliberate =BLT-42= checkout signal
-
-For each write we retain kernel cgroup identity, process/thread identity,
-descriptor, byte length, integrity status, and payload. The enrichment join adds
-exact node, namespace, Pod, and container identity when both snapshots know it,
-and states an explicit reason when they do not.
-
-* The Kubernetes enrichment boundary
-
-Enrichment consumes =WriteOperation= rather than reaching backward into eBPF:
-
-#+begin_example
-WriteOperation
-      |
-      +--> resolve cgroup ID -> runtime container ID
-      |
-      +--> join node-local Pod cache
-      |
-      v
-namespace, Pod, container, node + original capture facts
-#+end_example
-
-The userspace collector maintains two asynchronous snapshots. A host cgroup-v2
-scan maps the kernel cgroup ID to an exact runtime-qualified container ID. A
-node-filtered Kubernetes Pod watch maps that container ID to node, namespace,
-Pod UID/name, and container name. The write path only reads those snapshots; it
-never walks cgroupfs or calls Kubernetes while processing a write.
-
-The kernel cannot know human Kubernetes names because those are control-plane
-concepts, not Linux identities. The background cgroup scan and Pod watch are the
-bridge. If either snapshot lacks an exact match, the bytes remain visible with
-an unresolved reason instead of guessed metadata.
-
-The human-facing line starts with =incoming_log=. Its =source= is deliberately
-loud and exact:
-
-#+begin_example
-incoming_log source="k8s=payments/checkout-abc/checkout pod_uid=... node=worker-1 ..." ...
-incoming_log source="k8s=unresolved reason=cgroup-not-indexed" ...
-#+end_example
-
-The first form distinguishes the incoming write by namespace, Pod, and
-container. The second form keeps the bytes but refuses to fake attribution.
-=stdout-candidate= and =stderr-candidate= mean only “observed on fd 1 or 2”; fd
-tracking is still needed before those become durable stream identities.
-
-Node configuration contains only capture bounds and collector delivery. The
-collector owns namespace filtering and deterministic whole-record sampling.
-On the live cluster, following output through =kubectl logs=
-crosses konnectivity agents configured with =-v=8=. They log the transported
-packets; the collector sees those new writes; another rendered record causes
-more transport. Self-cgroup exclusion cannot stop that cross-cgroup cycle. A
-collector policy can make the loop subcritical, while lower transport verbosity
-is the real cure.
-
-Disappeared cgroup mappings stay in a bounded five-minute retention cache.
-Deleted Pods currently leave the Pod snapshot immediately; a late write is then
-explicitly unresolved. The cgroup path decoder supports the containerd layouts
-exercised on this project's hosts. It also recognizes CRI-O's standard
-=crio-<64-hex-id>.scope= systemd form; that is parser support, not a claim that
-we measured a CRI-O node.
-
-* Things we intentionally do not claim
-
-- We capture =write= and bounded =writev=, not every route bytes can take.
-- Numeric fd 1/2 is not durable stdout/stderr identity.
-- We frame newlines, but do not interpret semantic multiline or JSON documents.
-- Retained history is volatile and collector-local; restart forgets it.
-- A continuous stream is gap-free only while connected, not durable exactly once.
-- We do not yet quantify every loss boundary.
-- We do not map unsupported runtime or cgroup layouts to Kubernetes identity.
-- We do not promise every architecture or compatibility syscall ABI.
-
-The [[file:../ROADMAP.org][roadmap]] keeps those debts visible.
-
-* Source tour
-
-- [[file:workspace.org][Workspace crate map and dependency direction]]
-- [[file:../blt-abi/src/lib.rs][Shared kernel/userspace ABI and chunk math]]
-- [[file:../blt-ebpf/src/main.rs][Kernel-side capture programs]]
-- [[file:../boring-logtail/src/cgroup.rs][Collector cgroup discovery]]
-- [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID snapshot]]
-- [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes Pod snapshot]]
-- [[file:../boring-logtail/src/enrichment.rs][Exact identity join]]
-- [[file:../boring-logtail/src/pipeline.rs][Write reconstruction and per-event pipeline]]
-- [[file:../boring-logtail/src/framing.rs][Newline framing and record integrity]]
-- [[file:../blt-store/src/lib.rs][Direct shared database, queries, and streams]]
-- [[file:../boring-collector/src/grpc/stream_logs.rs][Collector gRPC log stream]]
-- [[file:../boring-collector/src/policy.rs][Collector filtering, sampling, and catching]]
-- [[file:../blt-emitter/src/lib.rs][Bounded asynchronous event delivery]]
-- [[file:../blt-emitter/src/stdout.rs][Escaped stdout delivery]]
-- [[file:../blt-emitter/src/discord.rs][Compact Discord delivery]]
-- [[file:../blt-otel/src/exporter.rs][Bounded OTLP batching and delivery]]
-- [[file:../boring-logtail/src/main.rs][Node-agent process wiring]]
-- [[file:../boring-collector/src/main.rs][Collector process wiring]]
-- [[file:../k8s/boring-logtail.yaml][Collector Deployment and agent DaemonSet]]
-- [[file:../spec/20260801-0854-capture-boundary-hardening.org][Self-capture hardening spec]]
-** Store identity and bounds
-
-Collector retention belongs to a resolved Kubernetes workload UID, not an FD or container
-stream. A standalone Pod uses its Pod UID as its workload UID. One workload ring
-interleaves all Pod replicas in store order; Pod metadata remains on each record.
-Unresolved owner chains are rejected rather than guessed. Operators configure
-only =max_memory=, =max_logs=, and =retention=. Retention accepts whole seconds,
-minutes, or hours and expires each record from its monotonic store-admission
-instant. Workload admission and the 64 KiB framing
-limit are safety bounds derived or owned internally. Framing, ingress, replay,
-and subscriber bounds are derived internally. Slow subscriber reads release only delivery references—they never
-drain retained history. Severity remains =Unknown= until a classifier has
-evidence; stdout/stderr is not evidence.
-
-** Event catching without clogging capture
-
-One collector-owned regex set sees complete, identity-accepted records after
-policy admission. A match clones a tiny typed event into a bounded Tokio channel with
-=try_send=. The Discord worker owns network I/O. If delivery slows down, its
-queue fills and notifications are counted and dropped; log capture never waits
-for the internet or a slow output stream. The stdout emitter renders one quoted,
-escaped physical line; Discord performs HTTP delivery. Event messages are
-static context, while every caught event shares the exact final =LogRecord=
-that matched. Emitters therefore retain identity, provenance, timestamps,
-integrity, severity, and bytes without maintaining a lossy shadow record.
-Invalid UTF-8 is rendered explicitly as hexadecimal escapes instead of being
-silently replaced.
-
-The kernel timestamp is monotonic time since boot, not wall time. Record
-finalization therefore adds one userspace UTC =observed_at= timestamp. Discord
-uses it in a compact colored embed with only the caught log, namespace, Pod,
-container, and stream. Internal IDs, sampling state, and the integrity debug
-dump stay out of alerts; stdout remains the detailed diagnostic rendering.
-* Node memory after the collector split
-
-Removing the node-local store removes retention ownership, not every userspace
-allocation. The agent still owns bounded write assembly, partial-line framing,
-OTLP queues, Kubernetes watch state, cgroup snapshots, TLS, and the Tokio
-runtime.
-
-On the two-node CRI-O smoke cluster, glibc also kept one malloc arena per busy
-worker near its burst high-water mark. Those freed pages still counted as RSS.
-Bounding glibc to two arenas and lowering its trim threshold reduced the node
-Pods from 55--58 MiB to 33--34 MiB under the same traffic. This is allocator
-retention, not retained log history. The manifest carries the tunable; a future
-heap profile must attribute the remaining anonymous memory before more knobs
-are guessed.
+The project once captured =write=/=writev= with eBPF, reconstructed chunks,
+resolved cgroups, and framed lines in userspace. It was fast and taught us a
+lot, but CRI files are the honest Kubernetes boundary. See
+[[file:ebpf.org][the historical eBPF guide]] and the
+[[file:../blog/20260816-ebpf-kubernetes-log-scraper.org][retrospective]].

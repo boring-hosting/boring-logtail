@@ -15,7 +15,6 @@ use crate::LogRecord;
 /// Configured meaning of an event, independent of captured stream severity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
-
 pub enum EventType {
     Info,
     Warning,
