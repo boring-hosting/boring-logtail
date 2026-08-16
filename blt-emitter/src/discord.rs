@@ -111,8 +111,12 @@ fn render(event: &CaughtEvent) -> DiscordMessage {
     fields.push(DiscordField::inline(
         "Stream",
         match record.stream() {
-            StreamFileDescriptor::Stdout => "stdout".to_owned(),
-            StreamFileDescriptor::Stderr => "stderr".to_owned(),
+            StreamFileDescriptor::Stdout | StreamFileDescriptor::RuntimeStdout => {
+                "stdout".to_owned()
+            }
+            StreamFileDescriptor::Stderr | StreamFileDescriptor::RuntimeStderr => {
+                "stderr".to_owned()
+            }
             StreamFileDescriptor::Other(fd) => format!("fd {fd}"),
             StreamFileDescriptor::Unknown => "unknown".to_owned(),
         },

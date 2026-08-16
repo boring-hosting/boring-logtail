@@ -25,3 +25,8 @@ manifests:
     - k8s/boring-logtail.yaml
 deploy:
   kubectl: {}
+profiles:
+  - name: cri-dev
+    manifests:
+      rawYaml:
+        - k8s/boring-logtail-cri-dev.yaml

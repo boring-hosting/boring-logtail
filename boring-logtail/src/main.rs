@@ -7,7 +7,15 @@
 //! records, then drain the exporter. The ordering is the difference between a
 //! clean final line and a mysteriously missing one.
 
-use std::{collections::HashMap as StdHashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap as StdHashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use aya::{
@@ -20,12 +28,14 @@ use blt_otel::{ExportConfig, ExportContext, OtlpExporter, OtlpSender, TryExportE
 use boring_logtail::{
     cgroup_resolver::{DEFAULT_HOST_CGROUP_ROOT, NATIVE_CGROUP_ROOT, spawn_cgroup_cache},
     config::Config,
+    cri::{CriFileEvent, CriFileSet, CriJoiner, CriStream, parse_record},
     decode_event,
     enrichment::{Enricher, PodSnapshot},
     k8s_watch::spawn_kubernetes_cache,
     pipeline::{Pipeline, PipelineDecision},
 };
 use log::{debug, info, warn};
+use notify::{Event, EventKind, RecursiveMode, Watcher as _, event::ModifyKind};
 use tokio::{
     signal::{self, unix::SignalKind},
     sync::{oneshot, watch},
@@ -38,7 +48,7 @@ use cgroup::CollectorCgroup;
 
 struct LogTailApplication {
     // Keeping Ebpf alive keeps its programs, links, and maps alive.
-    _ebpf: Ebpf,
+    _ebpf: Option<Ebpf>,
     // The task owns the ring buffer because tokio::spawn requires 'static data.
     event_task: Option<JoinHandle<anyhow::Result<()>>>,
     event_shutdown: Option<oneshot::Sender<()>>,
@@ -97,6 +107,27 @@ impl LogTailApplication {
 
         let exporter = OtlpExporter::spawn(export_config(&config), export_context());
 
+        if std::env::var("BORING_LOGTAIL_SOURCE").as_deref() == Ok("cri-files") {
+            let pods = pod_cache().await;
+            let root = std::env::var_os("BORING_LOGTAIL_CRI_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/log/pods"));
+            let (event_task, event_shutdown) = spawn_cri_loop(
+                root,
+                config.capture.max_record_bytes,
+                pods,
+                exporter.sender(),
+            )?;
+
+            info!("capture source is userspace CRI files");
+            return Ok(Self {
+                _ebpf: None,
+                event_task: Some(event_task),
+                event_shutdown: Some(event_shutdown),
+                exporter: Some(exporter),
+            });
+        }
+
         let collector_cgroup = CollectorCgroup::discover()?;
 
         let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -126,25 +157,7 @@ impl LogTailApplication {
 
         let cgroups = spawn_cgroup_cache(cgroup_root);
 
-        let pods = match std::env::var("BORING_LOGTAIL_NODE_NAME") {
-            Ok(node) if !node.is_empty() => match spawn_kubernetes_cache(node).await {
-                Ok(receiver) => receiver,
-                Err(error) => {
-                    warn!("Kubernetes Pod watch disabled: {error:#}");
-
-                    let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
-
-                    receiver
-                }
-            },
-            _ => {
-                warn!("node-local enrichment disabled: BORING_LOGTAIL_NODE_NAME is not set");
-
-                let (_, receiver) = watch::channel(Arc::new(PodSnapshot::default()));
-
-                receiver
-            }
-        };
+        let pods = pod_cache().await;
 
         attach_exit_program(&mut ebpf)?;
 
@@ -161,7 +174,7 @@ impl LogTailApplication {
         )?;
 
         Ok(Self {
-            _ebpf: ebpf,
+            _ebpf: Some(ebpf),
             event_task: Some(event_task),
             event_shutdown: Some(event_shutdown),
             exporter: Some(exporter),
@@ -187,6 +200,216 @@ impl LogTailApplication {
             info!("final OTLP export stats: {:?}", exporter.shutdown().await);
         }
     }
+}
+
+async fn pod_cache() -> watch::Receiver<Arc<PodSnapshot>> {
+    match std::env::var("BORING_LOGTAIL_NODE_NAME") {
+        Ok(node) if !node.is_empty() => match spawn_kubernetes_cache(node).await {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                warn!("Kubernetes Pod watch disabled: {error:#}");
+                watch::channel(Arc::new(PodSnapshot::default())).1
+            }
+        },
+        _ => {
+            warn!("node-local enrichment disabled: BORING_LOGTAIL_NODE_NAME is not set");
+            watch::channel(Arc::new(PodSnapshot::default())).1
+        }
+    }
+}
+
+fn spawn_cri_loop(
+    root: PathBuf,
+    max_record_bytes: usize,
+    mut pods: watch::Receiver<Arc<PodSnapshot>>,
+    exporter: OtlpSender,
+) -> anyhow::Result<(JoinHandle<anyhow::Result<()>>, oneshot::Sender<()>)> {
+    let mut files = CriFileSet::new(root, max_record_bytes + 1024);
+    files
+        .reconcile()
+        .context("discover initial CRI log files")?;
+    let (file_events, mut file_event_receiver) = tokio::sync::mpsc::channel(1024);
+    let notification_overflow = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::clone(&notification_overflow);
+    let mut watcher = notify::recommended_watcher(move |event| {
+        if file_events.try_send(event).is_err() {
+            overflow.store(true, Ordering::Relaxed);
+        }
+    })
+    .context("create CRI filesystem watcher")?;
+    watcher
+        .watch(files.root(), RecursiveMode::Recursive)
+        .context("watch CRI log directory")?;
+    let mut joiner = CriJoiner::new(max_record_bytes, 4096);
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let _watcher = watcher;
+        let mut reconcile_tick = tokio::time::interval(Duration::from_millis(500));
+        let mut repair_tick = tokio::time::interval(Duration::from_secs(30));
+        let mut report_tick = tokio::time::interval(Duration::from_secs(60));
+        let mut reconcile_requested = false;
+        let mut identities = cri_identity_index(&pods.borrow());
+        let mut ingress_drops = StdHashMap::<TryExportError, u64>::new();
+        let mut integrity_totals = RecordIntegrityTotals::default();
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_receiver => break,
+                _ = reconcile_tick.tick() => {
+                    if reconcile_requested || notification_overflow.swap(false, Ordering::Relaxed) {
+                        reconcile_requested = false;
+                        match files.reconcile().and_then(|_| files.read_available()) {
+                            Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
+                            Err(error) => warn!("CRI file reconciliation failed: {error}"),
+                        }
+                    }
+                }
+                _ = repair_tick.tick() => {
+                    match files.reconcile().and_then(|_| files.read_available()) {
+                        Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
+                        Err(error) => warn!("CRI repair reconciliation failed: {error}"),
+                    }
+                }
+                _ = report_tick.tick() => {
+                    let file_stats = files.stats();
+                    let partial_lanes = joiner.pending_lanes();
+                    let partial_bytes = joiner.pending_bytes();
+                    let export_stats = exporter.stats();
+                    info!("cri_files={file_stats:?} cri_partial_lanes={partial_lanes} cri_partial_bytes={partial_bytes} identities={} export_ingress_drops={ingress_drops:?} export_stats={export_stats:?}", identities.len());
+                }
+                _ = pods.changed() => {
+                    identities = cri_identity_index(&pods.borrow_and_update());
+                }
+                event = file_event_receiver.recv() => {
+                    let Some(event) = event else {
+                        anyhow::bail!("CRI filesystem watcher stopped");
+                    };
+                    match event {
+                        Ok(event) if requests_reconciliation(&event) => reconcile_requested = true,
+                        Ok(event) => {
+                            let changed = event.paths.into_iter().collect::<HashSet<_>>();
+                            let events = files.read_changed(&changed)?;
+                            process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?;
+                        }
+                        Err(error) => {
+                            warn!("CRI filesystem notification failed: {error}");
+                            reconcile_requested = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    Ok((task, shutdown))
+}
+
+fn requests_reconciliation(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
+fn process_cri_events(
+    events: Vec<CriFileEvent>,
+    joiner: &mut CriJoiner,
+    identities: &StdHashMap<(String, String), blt_model::KubernetesIdentity>,
+    exporter: &OtlpSender,
+    ingress_drops: &mut StdHashMap<TryExportError, u64>,
+    integrity_totals: &mut RecordIntegrityTotals,
+) -> anyhow::Result<()> {
+    for event in events {
+        let CriFileEvent::Line { source, bytes } = event else {
+            warn!("discarding oversized CRI physical record");
+            continue;
+        };
+        let fragment = match parse_record(&bytes) {
+            Ok(fragment) => fragment,
+            Err(error) => {
+                debug!("discarding malformed CRI record: {error}");
+                continue;
+            }
+        };
+        let Some(record) = joiner.accept(source, fragment)? else {
+            continue;
+        };
+        let Some(identity) = identities
+            .get(&(
+                record.source.pod_uid.clone(),
+                record.source.container_name.clone(),
+            ))
+            .cloned()
+        else {
+            debug!(
+                "CRI record has no current Pod identity: {}/{}",
+                record.source.namespace, record.source.pod_name
+            );
+            continue;
+        };
+        let stream = match record.stream {
+            CriStream::Stdout => blt_model::StreamFileDescriptor::RuntimeStdout,
+            CriStream::Stderr => blt_model::StreamFileDescriptor::RuntimeStderr,
+        };
+        let log_record = LogRecord::new(
+            record.timestamp,
+            cri_sampling_seed(&record.source),
+            stream,
+            blt_model::Enrichment::Enriched(identity),
+            0,
+            0,
+            0,
+            0,
+            record.bytes,
+            blt_model::RecordIntegrity {
+                capture_truncated: record.truncated,
+                ..Default::default()
+            },
+            100,
+            blt_model::Severity::Unknown,
+        );
+        publish_records(
+            vec![Arc::new(log_record)],
+            exporter,
+            ingress_drops,
+            integrity_totals,
+        );
+    }
+
+    Ok(())
+}
+
+fn cri_identity_index(
+    snapshot: &PodSnapshot,
+) -> StdHashMap<(String, String), blt_model::KubernetesIdentity> {
+    snapshot
+        .identities
+        .values()
+        .flatten()
+        .map(|identity| {
+            (
+                (identity.pod_uid.clone(), identity.container_name.clone()),
+                identity.clone(),
+            )
+        })
+        .collect()
+}
+
+fn cri_sampling_seed(source: &boring_logtail::cri::CriSource) -> u64 {
+    let mut state = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in source
+        .pod_uid
+        .bytes()
+        .chain(source.container_name.bytes())
+        .chain(source.restart.to_le_bytes())
+    {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    state
 }
 
 fn export_config(config: &Config) -> ExportConfig {

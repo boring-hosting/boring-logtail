@@ -8,6 +8,7 @@
 
 pub mod cgroup_resolver;
 pub mod config;
+pub mod cri;
 pub mod enrichment;
 mod framing;
 pub mod k8s_watch;

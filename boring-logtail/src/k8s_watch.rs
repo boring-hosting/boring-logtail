@@ -445,6 +445,8 @@ pub async fn spawn_kubernetes_cache(
         let mut last_workloads = HashMap::new();
 
         while let Some(update) = receiver_updates.recv().await {
+            let publish_snapshot = update_completes_snapshot(&update);
+
             match update {
                 WatchUpdate::PodEvent(index, event) => match *event {
                     watcher::Event::Apply(pod) | watcher::Event::InitApply(pod) => {
@@ -490,16 +492,35 @@ pub async fn spawn_kubernetes_cache(
                 }
             }
 
-            sender.send_replace(Arc::new(merged_snapshot_with_history(
-                &node,
-                &pod_states,
-                &replica_set_states,
-                &mut last_workloads,
-            )));
+            if publish_snapshot {
+                sender.send_replace(Arc::new(merged_snapshot_with_history(
+                    &node,
+                    &pod_states,
+                    &replica_set_states,
+                    &mut last_workloads,
+                )));
+            }
         }
     });
 
     Ok(receiver)
+}
+
+fn update_completes_snapshot(update: &WatchUpdate) -> bool {
+    match update {
+        WatchUpdate::PodEvent(_, event) => !matches!(
+            event.as_ref(),
+            watcher::Event::Init | watcher::Event::InitApply(_)
+        ),
+        WatchUpdate::ReplicaSetEvent(_, event) => !matches!(
+            event.as_ref(),
+            watcher::Event::Init | watcher::Event::InitApply(_)
+        ),
+        WatchUpdate::PodError(..)
+        | WatchUpdate::ReplicaSetError(..)
+        | WatchUpdate::PodStopped(_)
+        | WatchUpdate::ReplicaSetStopped(_) => true,
+    }
 }
 
 fn partition_limit(total: usize, partitions: usize, index: usize) -> usize {
@@ -519,6 +540,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn initial_list_items_do_not_publish_partial_snapshots() {
+        let pod = Box::new(watcher::Event::InitApply(Pod::default()));
+        let replica_set = Box::new(watcher::Event::InitApply(ReplicaSet::default()));
+
+        assert!(!update_completes_snapshot(&WatchUpdate::PodEvent(0, pod)));
+        assert!(!update_completes_snapshot(&WatchUpdate::ReplicaSetEvent(
+            0,
+            replica_set
+        )));
+        assert!(update_completes_snapshot(&WatchUpdate::PodEvent(
+            0,
+            Box::new(watcher::Event::InitDone)
+        )));
+    }
 
     fn pod(namespace: &str, uid: &str, id: char) -> Pod {
         serde_json::from_value(json!({

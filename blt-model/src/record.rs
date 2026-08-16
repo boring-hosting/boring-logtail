@@ -21,6 +21,8 @@ use crate::Enrichment;
 pub enum StreamFileDescriptor {
     Stdout,
     Stderr,
+    RuntimeStdout,
+    RuntimeStderr,
     Other(u32),
     Unknown,
 }
@@ -41,6 +43,8 @@ impl fmt::Display for StreamFileDescriptor {
         match self {
             Self::Stdout => formatter.write_str("stdout-candidate"),
             Self::Stderr => formatter.write_str("stderr-candidate"),
+            Self::RuntimeStdout => formatter.write_str("stdout"),
+            Self::RuntimeStderr => formatter.write_str("stderr"),
             Self::Other(fd) => write!(formatter, "fd-{fd}"),
             Self::Unknown => formatter.write_str("unknown-candidate"),
         }
@@ -52,6 +56,8 @@ impl StreamFileDescriptor {
         match self {
             Self::Stdout => [0, 0, 0, 0, 1],
             Self::Stderr => [0, 0, 0, 0, 2],
+            Self::RuntimeStdout => [0, 0, 0, 0, 3],
+            Self::RuntimeStderr => [0, 0, 0, 0, 4],
             Self::Other(fd) => {
                 let bytes = fd.to_le_bytes();
 

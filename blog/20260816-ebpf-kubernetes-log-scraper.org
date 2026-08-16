@@ -1,0 +1,488 @@
+#+title: We built a Kubernetes log scraper with eBPF
+#+date: 2026-08-16
+#+license: GFDL-1.3-or-later
+
+Ever since I learned about eBPF through the cilium project I was dying
+to get my hands on this. But there are not many usecases I could come up
+with that were not networking per se. 
+
+We built a Kubernetes log scraper by attaching eBPF programs to Linux
+=write(2)= and =writev(2)=. It worked. It was fast. It enriched bytes with the
+right Pod and workload. It also captured a password printed into a private
+shell pipe that Kubernetes never considered a log.
+
+That last part changed the project.
+
+This is the trip from a syscall, through cgroup v2 and a BPF ring buffer, into
+Kubernetes metadata. It is also an account of where the model stopped matching
+reality.
+
+* The first idea
+
+Container logs usually begin as bytes written to standard output or standard
+error. Linux calls those file descriptors 1 and 2 by convention. An eBPF
+tracepoint can observe the write syscall before the bytes leave the process.
+
+The first model looked almost offensively simple:
+
+#+begin_example
+application write(fd 1 or 2)
+  -> eBPF tracepoint
+  -> ring buffer
+  -> userspace
+  -> Kubernetes enrichment
+  -> collector
+#+end_example
+
+This avoids opening one Kubernetes log stream per Pod. That mattered on our
+cluster because the control plane runs through Kamaji. Asking the Kubernetes
+API server for many continuous log streams was exactly the load we wanted to
+remove.
+
+The kernel hook was cheap. In a live two-node comparison, the eBPF DaemonSet
+used about 3 millicores of CPU in total. The userspace CRI-file prototype later
+used about 11 millicores. The eBPF path was a neat little machine.
+
+The hard part was never attaching a tracepoint. The hard part was deciding what
+an observed write meant.
+
+* Entry is intent, exit is fact
+
+The =sys_enter_write= tracepoint gives us the file descriptor, userspace buffer
+address, and requested byte count. It does not tell us how many bytes Linux
+accepted.
+
+A write can:
+
+- succeed completely
+- write only part of the buffer
+- return zero
+- fail with a negative error code
+
+Copying =count= bytes at entry would report bytes that might never have been
+written. Waiting only for exit loses the buffer pointer because the exit
+tracepoint contains the result, not the original arguments.
+
+We paired the two events with the value returned by
+=bpf_get_current_pid_tgid()=. Its upper 32 bits are the process identifier
+(PID), and its lower 32 bits are the thread identifier (TID).
+
+At entry, the program saved a small value in a BPF hash map:
+
+#+begin_src rust
+struct WriteStart {
+    buffer: u64,
+    requested_len: u64,
+    cgroup_id: u64,
+    timestamp_ns: u64,
+    fd: u32,
+    pid: u32,
+    tid: u32,
+}
+#+end_src
+
+The real entry handler is mostly checked tracepoint reads followed by one map
+insert. This excerpt is shortened, but the control flow is unchanged:
+
+#+begin_src rust
+#[tracepoint]
+pub fn boring_logtail_enter(ctx: TracePointContext) -> u32 {
+    let fd: u32 = match unsafe { ctx.read_at(16) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+
+    if !admitted(fd) {
+        return 0;
+    }
+
+    let buffer: usize = match unsafe { ctx.read_at(24) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let requested_len: usize = match unsafe { ctx.read_at(32) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let pid_tgid = bpf_get_current_pid_tgid();
+
+    let _ = WRITE_STARTS.insert(pid_tgid, WriteStart {
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
+        cgroup_id: unsafe { bpf_get_current_cgroup_id() },
+        buffer: buffer as u64,
+        requested_len: requested_len as u64,
+        fd,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
+    }, 0);
+
+    0
+}
+#+end_src
+
+At exit, the program looked up that entry by PID and TID, removed it, read the
+signed syscall result, and created a bounded copy job.
+
+#+begin_src rust
+#[tracepoint]
+pub fn boring_logtail_exit(ctx: TracePointContext) -> u32 {
+    let result: i64 = match unsafe { ctx.read_at(16) } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(start) = (unsafe { WRITE_STARTS.get(pid_tgid).copied() }) else {
+        return 0;
+    };
+
+    let _ = WRITE_STARTS.remove(pid_tgid);
+    let _ = WRITE_JOBS.insert(pid_tgid, WriteJob {
+        start,
+        result,
+        chunk_number: 0,
+    }, 0);
+
+    unsafe { WRITE_WORKER.tail_call(&ctx, 0) };
+    0
+}
+#+end_src
+
+#+begin_example
+sys_enter_write                    sys_exit_write
+  save pointer + requested length    read actual result
+                  \                  /
+                   join by PID + TID
+                            |
+                            v
+                     copy accepted bytes
+#+end_example
+
+The distinction matters. Entry describes what the application asked for. Exit
+describes what Linux says happened.
+
+There is still a race. We copied from the userspace pointer after syscall exit.
+Another thread could mutate the buffer between the kernel's write and our
+copy. =bpf_probe_read_user_buf()= makes the read safe for the kernel. It does
+not make the buffer an immutable snapshot.
+
+* The verifier shaped the design
+
+An eBPF program cannot allocate a vector and copy an arbitrary write into it.
+The verifier needs bounded work, known memory access, and terminating paths.
+
+Our shared application binary interface used fixed 256-byte payloads. One
+write could emit at most 32 chunks, for a maximum captured size of 8192 bytes.
+Larger writes carried an explicit truncation flag.
+
+#+begin_example
+one successful 700-byte write
+
+chunk 0: offset   0, length 256, first
+chunk 1: offset 256, length 256
+chunk 2: offset 512, length 188, last
+#+end_example
+
+The eBPF worker copied one chunk, updated its job in a map, and tail-called
+itself for the next chunk. Tail calls kept each invocation small enough for the
+verifier. A program array held the worker target.
+
+#+begin_src rust
+let Some(chunk) = next_write_chunk(job.result, job.chunk_number) else {
+    let _ = WRITE_JOBS.remove(pid_tgid);
+    return 0;
+};
+
+emit_event(
+    &metadata,
+    (job.start.buffer + chunk.offset as u64) as *const u8,
+    chunk,
+);
+
+if chunk.is_complete || chunk.is_truncated {
+    let _ = WRITE_JOBS.remove(pid_tgid);
+    return 0;
+}
+
+job.chunk_number += 1;
+let _ = WRITE_JOBS.insert(pid_tgid, job, 0);
+unsafe { WRITE_WORKER.tail_call(&ctx, 0) };
+#+end_src
+
+Each chunk became one fixed-layout =WriteEvent= in a 256 KiB BPF ring buffer.
+The event carried:
+
+- cgroup ID
+- PID and TID
+- operation ID and syscall kind
+- descriptor number
+- requested and actual lengths
+- chunk offset and integrity flags
+- up to 256 bytes of payload
+
+Ring-buffer reservation can fail. Map insertion can fail. A userspace read can
+fail. Bounded kernel code is not the same thing as lossless kernel code. We
+added integrity markers where we could and kept missing counters on the
+roadmap instead of claiming perfect capture.
+
+* =writev= is not a larger =write=
+
+=write= receives one contiguous buffer. =writev= receives an array of
+=iovec= structures. Each entry points to a separate userspace buffer.
+
+Applications use it constantly. A runtime or standard library can assemble
+one logical output operation from a prefix, body, and newline without copying
+them into one temporary allocation.
+
+#+begin_example
+iovec[0] -> "level=info "
+iovec[1] -> "server started"
+iovec[2] -> "\n"
+#+end_example
+
+The syscall result is one byte count across the whole vector. If Linux returns
+18, reconstruction must walk the vectors in order, consume complete vectors,
+and stop partway through the vector containing byte 18. Empty vectors are
+legal. The array and its buffers live in userspace and every read can fail.
+
+The entry program copied a bounded description of the vector array. The exit
+program supplied the accepted byte count. A separate tail-call worker advanced
+through vectors and emitted the same fixed =WriteEvent= format used by scalar
+=write=.
+
+The vector walk had to read each =iovec= through a helper and add lengths with
+saturating arithmetic:
+
+#+begin_src rust
+let mut requested_len = 0u64;
+
+for index in 0..MAX_IOVECS_PER_WRITEV {
+    if index >= vector_count {
+        break;
+    }
+
+    let address = vectors + index * core::mem::size_of::<UserIovec>();
+    let vector = match unsafe {
+        bpf_probe_read_user(address as *const UserIovec)
+    } {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+
+    requested_len = requested_len.saturating_add(vector.len);
+}
+#+end_src
+
+Supporting =writev= doubled a surprising amount of kernel state. It needed its
+own entry map, completed-job map, tracepoints, and worker. Sharing too much code
+made verifier output worse and failure cleanup harder to reason about.
+
+And this still did not cover every way bytes can leave a process. Compatibility
+syscalls, =sendmsg=, memory-mapped files, and io_uring are different paths.
+
+* A syscall is not a log record
+
+Userspace drained the ring buffer and assembled chunks by:
+
+#+begin_example
+(cgroup_id, pid, tid, operation_id)
+#+end_example
+
+It rejected gaps, conflicting metadata, missing first chunks, and bytes after a
+terminal chunk. A complete assembly produced one =WriteOperation=.
+
+That was still not a log record.
+
+One write can contain three newline-delimited records. One record can be spread
+across ten writes. Pretty-printed JSON can contain several newlines while still
+being one semantic document. A panic can arrive as many writes from several
+threads.
+
+We implemented byte-preserving newline framing in userspace. Framing lanes were
+separated by container identity and descriptor candidate so bytes from two
+containers could never be joined. Pending bytes and lane counts were bounded.
+When pressure forced a split, the record carried an integrity marker.
+
+This produced honest newline records, not semantic multiline documents. That
+word matters. Reconstructing syscalls and reconstructing application messages
+are separate problems.
+
+* From cgroup v2 to a Pod
+
+The kernel does not know that a process belongs to
+=Deployment/boring-logtail=. Kubernetes names are control-plane data.
+
+At syscall entry we recorded =bpf_get_current_cgroup_id()=. A background
+userspace scanner walked the host cgroup-v2 tree and mapped cgroup inode IDs to
+runtime-qualified container IDs such as =crio://...= or =containerd://...=.
+
+A node-scoped Kubernetes watch built another snapshot from Pod status:
+
+#+begin_example
+cgroup ID
+  -> runtime container ID
+  -> Pod UID + container name
+  -> controller owner
+  -> workload identity
+#+end_example
+
+ReplicaSets needed one extra owner-reference hop to reach their Deployment.
+The join used exact container IDs and owner UIDs. It did not guess a Deployment
+by trimming a Pod name.
+
+The hot path performed memory lookups only. It did not walk cgroupfs, call the
+Kubernetes API, or contact the container runtime for each write. If either
+snapshot lacked a match, the record stayed explicitly unresolved.
+
+The final join was deliberately boring:
+
+#+begin_src rust
+let Some(containers) = cgroups.containers.get(&operation.cgroup_id) else {
+    return Enrichment::UnresolvedCgroup;
+};
+let [container] = containers.as_slice() else {
+    return Enrichment::AmbiguousCgroup;
+};
+
+let Some(identities) = pods.identities.get(container) else {
+    return Enrichment::UnresolvedContainer(container.clone());
+};
+let [identity] = identities.as_slice() else {
+    return Enrichment::AmbiguousContainer(container.clone());
+};
+
+Enrichment::Enriched(identity.clone())
+#+end_src
+
+PID alone could not do this job. A PID inside a container namespace is not the
+host PID observed at the tracepoint. PIDs are also reused. Kernel cgroup
+membership gave us a stable boundary without trying to translate namespace
+views of a process number.
+
+We used the same idea to stop the scraper from scraping itself. Userspace
+opened logtail's cgroup directory and placed it in a BPF cgroup array. The
+entry program rejected any task underneath that cgroup before reading payload
+bytes.
+
+That fixed local self-capture. It could not fix every observer loop. Following
+logs through =kubectl logs= crossed noisy konnectivity components, which logged
+the transport, which created more logs. The new writes came from other
+cgroups. A local cgroup exclusion cannot stop a distributed feedback loop.
+
+* The =printenv= moment
+
+The frontend displayed a strange line next to ordinary Palworld server logs:
+a credential-looking string by itself. Kubernetes logs did not show it.
+
+The source was an exec health check containing shell command substitution
+similar to this:
+
+#+begin_src shell
+curl --user "admin:$(printenv ADMIN_PASSWORD)" http://127.0.0.1/health
+#+end_src
+
+To implement =$(...)=, the shell creates a pipe and starts =printenv=. Inside
+that child process, fd 1 points to the shell's private command-substitution
+pipe. =printenv= writes the password to numeric fd 1. The parent shell reads
+the pipe and inserts the bytes into the =curl= argument.
+
+Our eBPF filter saw exactly what we asked it to see:
+
+#+begin_example
+process: printenv
+fd:      1
+bytes:   the environment variable value
+cgroup:  the application container
+#+end_example
+
+Every enrichment step was correct. The cgroup belonged to the Pod. The
+container ID matched. The Kubernetes owner was right. The bytes were real.
+
+They were not a Kubernetes log.
+
+The container runtime only records bytes sent through the container's stdout
+and stderr pipes. The shell had temporarily made fd 1 refer to another pipe
+inside the process tree. File descriptor numbers belong to each process table.
+They are handles, not durable identities for stdout and stderr.
+
+Redirection has the same property:
+
+#+begin_src shell
+printf 'this uses fd 1\n' > /tmp/not-a-container-log
+#+end_src
+
+The =write= syscall still uses descriptor 1 after the shell redirects it. Its
+underlying open file description now points to a regular file.
+
+To prove that fd 1 still names the container output pipe, we would need to
+track the underlying file or pipe across =dup=, =dup2=, =dup3=, =fcntl=,
+=close=, inheritance, redirection, process exit, and descriptor reuse. That is
+a real design, but it is no longer a small log scraper.
+
+Calling the streams =stdout-candidate= and =stderr-candidate= was technically
+honest. The leaked =printenv= output showed that the distinction was not merely
+pedantic.
+
+* We tried tapping the CRI writer too
+
+Before returning to ordinary file reads, we tried moving the eBPF hook to the
+other side of the runtime. The idea was to identify the CRI log files, find the
+runtime process descriptors open on those device and inode pairs, register the
+=(process, fd)= pairs in a BPF map, and capture writes made by the runtime.
+
+That moved capture closer to the Kubernetes log boundary, but descriptor
+discovery became its own small operating system project. Rotation, duplicated
+descriptors, close races, process restart, inode reuse, and runtime-specific
+write paths all mattered.
+
+Our first inotify implementation also listened too broadly. Log writes caused
+filesystem events. Each event caused a complete descriptor and directory
+rescan. The rescan caused more observable activity while logs kept arriving.
+The DaemonSet reached roughly 3000 millicores.
+
+The lesson was painfully specific: a filesystem data event may mark one file
+readable. It must not trigger a complete discovery scan. Lifecycle events can
+request one debounced reconciliation, and a slow scan can repair missed
+events.
+
+We rejected that eBPF CRI tap. The kernel machinery was solving a problem that
+=read(2)= plus filesystem notifications already solved with fewer identity
+hazards.
+
+* What we kept
+
+The experiment was not wasted code disguised as research. It gave us tested
+answers:
+
+- Syscall entry and exit carry different truths.
+- =writev= reconstruction needs ordered byte accounting across vectors.
+- Verifier-friendly chunking changes the transport protocol.
+- A cgroup ID can bridge kernel activity to a runtime container ID.
+- Kubernetes enrichment belongs in userspace snapshots, outside the capture
+  hot path.
+- Numeric fd 1 or 2 does not prove that bytes crossed the container log
+  boundary.
+- Self-observation can cross cgroups and become a distributed loop.
+- Every bounded queue or map has a loss mode, even when the happy path is fast.
+
+The eBPF code remains in the repository. It is useful as a Linux tracing tool
+and as a record of what we measured. It is no longer the Kubernetes capture
+path.
+
+For Kubernetes, logtail now follows the files under =/var/log/pods=. The CRI
+record supplies the runtime timestamp, stream name, and partial/full marker.
+The path supplies namespace, Pod UID, Pod name, container, and restart number.
+The node-scoped watch still resolves workload ownership. The collector still
+owns the in-memory history and gRPC stream.
+
+That path is less exotic. It also captures the thing Kubernetes calls a log.
+
+* Source tour
+
+- [[file:../blt-ebpf/src/main.rs][The eBPF tracepoint programs and tail-call workers]]
+- [[file:../blt-abi/src/lib.rs][The fixed kernel/userspace event format and chunk math]]
+- [[file:../boring-logtail/src/pipeline.rs][Userspace write reconstruction]]
+- [[file:../boring-logtail/src/framing.rs][Byte-preserving newline framing]]
+- [[file:../boring-logtail/src/cgroup_resolver.rs][Cgroup ID to container ID resolution]]
+- [[file:../boring-logtail/src/k8s_watch.rs][Node-scoped Kubernetes enrichment]]
+- [[file:../spec/20260802-0928-userspace-registered-cri-log-tap.org][The rejected eBPF CRI-file tap]]
+- [[file:../spec/20260815-1726-userspace-cri-log-tailing.org][The userspace CRI-file decision]]

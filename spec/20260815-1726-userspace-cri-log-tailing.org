@@ -1,0 +1,174 @@
+#+title: Tail Kubernetes CRI log files in userspace
+#+date: 2026-08-15 17:26 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Approved by the maintainer on 2026-08-15. Implementation in progress.
+
+* Context
+
+The Kubernetes node agent currently treats every application =write=/=writev=
+to numeric fd 1 or 2 as a container log candidate. That boundary is fast, but
+it is not the Kubernetes log boundary. An exec probe can write a secret through
+an internal fd 1 pipe and be captured even though CRI never records it.
+Redirected descriptors and unimplemented syscall paths create the opposite
+problem: fd numbers alone cannot prove complete Kubernetes log coverage.
+
+Kubelet and the runtime already commit Kubernetes logs below =/var/log/pods= in
+the CRI text format. Reading those files gives us the same boundary as
+=kubectl logs= without opening a log stream through the Kubernetes API server.
+This is especially useful with a shared Kamaji control plane: node-local file
+reads should not become control-plane traffic.
+
+The rejected 2026-08-02 experiment tapped runtime writes to these files with
+eBPF. It required descriptor discovery and produced a rescan feedback loop.
+This decision does not revive that mechanism. The agent reads the files
+normally in userspace.
+
+* Decision
+
+Use userspace CRI-file tailing as the Kubernetes capture source. Keep eBPF
+application-write capture for the Linux/CLI use cases where there is no CRI
+log boundary.
+
+#+begin_example
+each Kubernetes node                         once per cluster
+
+/var/log/pods (read-only)
+  -> CRI tail + partial join
+  + node-scoped Pod watch
+  -> enriched OTLP logs
+  ---------------------------> collector
+                                 -> policy + store + gRPC
+#+end_example
+
+Do not build a generalized source framework. The Kubernetes binary wiring
+chooses the CRI tailer; the existing Linux wiring chooses eBPF.
+
+** Node agent
+
+- Mount only =/var/log/pods= read-only. The requested path is not
+  =/var/logs=.
+- Discover files shaped as
+  =NAMESPACE_POD_UID/CONTAINER/RESTART.log= and reject malformed paths.
+- Parse =TIMESTAMP STREAM TAG PAYLOAD= where stream is =stdout= or =stderr=
+  and tag is =P= or =F=. Preserve payload bytes; do not parse JSON.
+- Join consecutive =P= fragments with their terminating =F= record per Pod
+  UID, container, restart, and stream. Keep the join byte-bounded and expose
+  truncation or malformed input rather than silently dropping it.
+- Use the CRI timestamp as the record timestamp.
+- On startup, begin existing files at EOF. New files begin at offset zero.
+  This avoids replay duplicates without inventing checkpoint persistence.
+- Follow an opened old file through rotation and start its replacement at zero.
+- Use file notifications to mark only the changed file readable. Lifecycle
+  events merely request one debounced reconciliation; they never perform a
+  complete scan inline. A slow periodic reconciliation repairs missed events.
+- Enrich by exact Pod UID and container name using the existing node-scoped Pod
+  watch. Keep the watch incremental and retain only the bounded identity
+  snapshot needed by the hot path.
+
+** Watch enrichment
+
+The CRI path does not contain workload ownership. Keep the existing node-local,
+node-scoped Pod watch and ReplicaSet ownership resolution. This is one initial
+list followed by incremental metadata events, not a Kubernetes log stream.
+Polling kubelet =/pods= was rejected after live inspection: it repeatedly
+returns a huge full PodList and still cannot resolve ReplicaSet to Deployment.
+
+* Consequences
+
+- Kubernetes captures what CRI recorded, including correct stdout/stderr,
+  runtime timestamps, partial markers, and writes through duplicated fds.
+- Probe command-substitution pipes and other process-internal fd 1/2 traffic no
+  longer masquerade as Kubernetes logs.
+- Log ingestion no longer creates Kubernetes API log streams. The small
+  node-scoped metadata watch remains because workload names are not on disk.
+- The node needs a read-only hostPath and permission to traverse it. This is
+  narrower than eBPF/kernel access but still incompatible with Kubernetes
+  Restricted Pod Security; isolate the node-agent namespace accordingly.
+- Agent restart can miss bytes written to files that already existed while the
+  agent was down. Durable offsets and backfill are separate work, justified only
+  if live evidence requires them.
+- eBPF stays valuable as the generic Linux/CLI capture building block; it is no
+  longer forced to impersonate CRI in Kubernetes.
+
+* Non-goals
+
+- Tailing =/var/log/containers= symlinks or every runtime layout immediately.
+- Persisted offsets, disk queues, historical backfill, or exactly-once delivery.
+- Semantic multiline or pretty-printed JSON reconstruction beyond CRI =P=/=F=.
+- Removing the eBPF crates or Linux capture mode.
+- Supporting workload selection without Kubernetes metadata.
+
+* Acceptance
+
+- Fixtures cover full and partial stdout/stderr records, opaque non-UTF-8,
+  malformed records, truncation, startup-at-EOF, append, and rotation.
+- A live CRI-O node matches =kubectl logs= for selected Pods without capturing
+  exec-probe command-substitution output.
+- The node opens no Kubernetes log streams and mounts no CRI socket or kernel
+  tracing filesystem in Kubernetes mode.
+- The bounded node-scoped metadata watch resolves Deployment, StatefulSet,
+  DaemonSet, Job, and standalone Pod ownership; outage behavior is explicit.
+- File notifications read only changed files. Lifecycle bursts coalesce into
+  reconciliation, with a slow periodic scan as repair.
+- Existing collector replay/live selectors and raw-byte round trips still pass.
+- CPU, RSS, missed bytes, duplicates, malformed records, and reconciliation
+  activity are measured on the live cluster before removing the old deployment
+  path.
+
+* Guarded live bridge
+
+The first live cut used a 100 ms read poll over every tracked descriptor and a
+one-second directory reconciliation poll. It proved the CRI boundary but is not
+the production loop. Replace it with per-file readiness notifications,
+debounced lifecycle reconciliation, and a slow repair scan. Do not recreate the
+rejected data-event feedback loop.
+
+* TODO
+
+- [X] C1 Approve the userspace CRI-tail boundary and watch enrichment.
+- [X] C2 Implement and fixture-test bounded CRI parsing, partial joins, file
+  discovery, startup offsets, and rotation.
+- [ ] C3 Keep bounded node-local watch enrichment; replace hot polling with
+  per-file notifications, debounced lifecycle reconciliation, and a slow repair
+  scan. Measure the 47 MiB RSS rise rather than assuming it is a leak.
+- [ ] C4 Update DaemonSet/collector RBAC and mounts, preserving the old manifest
+  path until the live gate passes.
+- [ ] C5 Update =learn/=, =ROADMAP.org=, and =TODO.org= for the measured boundary.
+- [ ] C6 Pass formatting, tests, lint, image builds, and a guarded live CRI-O
+  comparison; then remove obsolete Kubernetes eBPF wiring and privileges.
+
+* References
+
+- [[file:20260802-0928-userspace-registered-cri-log-tap.org][Rejected eBPF CRI-file tap experiment]]
+- [[file:20260802-1300-application-write-kubernetes-watch.org][Application-write Kubernetes capture]]
+- [[file:20260813-1812-node-agent-and-cluster-collector.org][Node agent and cluster collector split]]
+
+* Validation log
+
+- 2026-08-15: C2 parser/joiner/file-state slice has 10 passing focused tests.
+  They cover opaque bytes, malformed headers, bounded partials and physical
+  lines, startup-at-EOF, append, new-file-from-zero, and inode rotation.
+- Strict package Clippy currently stops in existing =blt-abi=, =blt-model=,
+  and =blt-ebpf/build.rs= blank-line lints before checking this slice. C2 stays
+  open until filesystem lifecycle orchestration and its full gate land.
+- 2026-08-15: Added an explicit =cri-files= runtime source and an isolated
+  Skaffold =cri-dev= profile. The dev namespace has its own collector/store and
+  mounts only =/var/log/pods= into the node agent. YAML parsing, client-side
+  resource construction, 50 node-agent tests, and 7 OTLP tests pass. Live
+  cluster comparison remains pending.
+- 2026-08-15: The two-node CRI-O live comparison passed. Both agents selected
+  =cri-files= and delivered Flux and game-server records through the isolated
+  collector's OTLP/store/gRPC path. Palworld output matched =kubectl logs=;
+  apparent close pairs existed in Kubernetes too. A harmless string written
+  through =kubectl exec= stdout did not enter the dev store. Agents used 5--6m
+  CPU and 26--28 MiB RSS; the collector used 1m CPU and 3 MiB. This proves the
+  source boundary, not final C3 ownership or long-duration loss behavior.
+- The existing two-node OpenTelemetry Collector DaemonSet measured 37m/94 MiB
+  and 48m/82 MiB. That is not a file-reader-only comparison: its live config
+  also receives OTLP logs/metrics/traces, scrapes kubelet metrics every 15s,
+  performs broad Kubernetes attribute extraction, persists file offsets,
+  batches signals, exposes Prometheus telemetry, and exports over TLS. Treat
+  85m CPU and 176 MiB as its whole pipeline cost, not =filelog= overhead.

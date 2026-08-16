@@ -1,0 +1,235 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boring-logtail-dev
+  labels:
+    app.kubernetes.io/part-of: boring-logtail
+    # Pod Security treats every hostPath as privileged. Keep that exception in
+    # this disposable test namespace rather than broadening another namespace.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boring-logtail
+  namespace: boring-logtail-dev
+data:
+  config.yaml: |
+    collector:
+      endpoint: http://boring-collector:4318/v1/logs
+      queue_records: 1024
+      queue_bytes: 8388608
+      batch_records: 512
+      batch_bytes: 1048576
+      flush_interval_ms: 1000
+      retry_max_elapsed_ms: 30000
+      request_timeout_ms: 10000
+    capture:
+      assembly_operations: 1024
+      assembly_bytes: 4194304
+      framing_lanes: 64
+      framing_bytes: 8388608
+      max_record_bytes: 65536
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boring-collector
+  namespace: boring-logtail-dev
+data:
+  config.yaml: |
+    listen: 0.0.0.0:4318
+    grpc_listen: 0.0.0.0:50051
+    max_request_bytes: 4194304
+    store:
+      max_memory: 128MiB
+      max_logs: 500
+      retention: 1h
+    sampling:
+      percent: 100
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boring-collector
+  namespace: boring-logtail-dev
+spec:
+  selector:
+    app.kubernetes.io/name: boring-collector-cri-dev
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boring-collector-cri-dev
+  namespace: boring-logtail-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: boring-collector-cri-dev
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: boring-collector-cri-dev
+        app.kubernetes.io/part-of: boring-logtail
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: boring-collector
+          image: ghcr.io/alfredosa/boring-collector:latest
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: BORING_COLLECTOR_CONFIG
+              value: /etc/boring-collector/config.yaml
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: otlp-http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: otlp-http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 160Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/boring-collector
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: boring-collector
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: boring-logtail-cri-dev
+  namespace: boring-logtail-dev
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: boring-logtail-cri-dev-pod-reader
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: boring-logtail-cri-dev-pod-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: boring-logtail-cri-dev-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: boring-logtail-cri-dev
+    namespace: boring-logtail-dev
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: boring-logtail-cri-dev
+  namespace: boring-logtail-dev
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: boring-logtail-cri-dev
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: boring-logtail-cri-dev
+        app.kubernetes.io/part-of: boring-logtail
+    spec:
+      serviceAccountName: boring-logtail-cri-dev
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: boring-logtail
+          image: ghcr.io/alfredosa/boring-logtail:latest
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: BORING_LOGTAIL_SOURCE
+              value: cri-files
+            - name: BORING_LOGTAIL_CRI_ROOT
+              value: /host/var/log/pods
+            - name: BORING_LOGTAIL_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: BORING_LOGTAIL_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BORING_LOGTAIL_CONFIG
+              value: /etc/boring-logtail/config.yaml
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: pod-logs
+              mountPath: /host/var/log/pods
+              readOnly: true
+            - name: config
+              mountPath: /etc/boring-logtail
+              readOnly: true
+      volumes:
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: config
+          configMap:
+            name: boring-logtail

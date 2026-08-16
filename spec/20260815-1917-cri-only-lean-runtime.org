@@ -1,0 +1,140 @@
+#+title: CRI-only lean runtime
+#+date: 2026-08-15 19:17 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Proposed. Awaiting maintainer approval.
+
+* Context
+
+The eBPF experiment proved useful things, but Kubernetes already defines its log
+boundary in CRI files. Keeping two capture architectures now leaks eBPF
+reconstruction, framing, queue, byte-budget, and retry machinery into ordinary
+operator configuration. Most knobs describe implementation accidents rather
+than choices anyone wants to make.
+
+The collector already owns the shared in-memory log database and gRPC readers.
+Do not move storage back into logtail.
+
+Use two names consistently:
+
+- *logtail* reads node-local CRI files, enriches records, and ships batches.
+- *collector* receives batches, owns the in-memory store, and serves gRPC.
+
+* Decision
+
+Make userspace CRI-file tailing the only wired Kubernetes capture path. Preserve
+the eBPF crates and history in the repository, but disconnect them from the
+default binary, image, manifests, and runtime configuration. Do not delete them
+in this change.
+
+#+begin_example
+/var/log/pods + node-scoped metadata watch
+  -> CRI records
+  -> batches of at most 100
+  -> collector -> Arc<LogStore> -> gRPC readers
+#+end_example
+
+Logtail configuration controls only export to the collector:
+
+#+begin_src yaml
+export:
+  endpoint: http://boring-collector:4318/v1/logs
+  max_log_batch: 100
+  flush_frequency: 1s
+#+end_src
+
+=max_log_batch= is a count ceiling. Reaching it flushes immediately.
+=flush_frequency= is the maximum time an accepted record waits in a partial
+batch before that batch is offered to the collector. It is not a periodic full
+queue drain and does not create overlapping requests.
+
+One delivery worker owns batch order. Capture hands it records through a
+bounded nonblocking channel derived from =max_log_batch=. The worker sends one
+batch at a time; retry/backoff remains bounded, and overload drops explicitly
+instead of growing memory or blocking file capture. Network timeout, retry
+policy, CRI physical-line limit, partial-join limit, and notification capacity
+are conservative implementation constants with counters; they are not YAML.
+
+Separately, collector configuration owns its small recent-history store:
+
+#+begin_src yaml
+store:
+  logs_per_workload: 500
+#+end_src
+
+This field never appears in the logtail ConfigMap. There is no retention clock:
+count eviction alone removes the oldest workload record. This preserves gRPC
+=tail_lines= replay without a second expiry mechanism. The store remains one
+shared =Arc<LogStore>= with direct append, query, clear,
+and stream operations. Retention is bounded by record count using internal hard
+limits for record size and workload count. Remove unused assembly, framing,
+ingress, actor-command, and percentage-partition concepts from =StoreLimits=.
+The configuration does not pretend to predict allocator RSS from byte charges.
+
+Keep the node-scoped Pod/ReplicaSet watch for enrichment. File notifications
+mark individual files readable; lifecycle bursts request one debounced scan;
+a slow scan repairs missed notifications. No event performs a full rescan.
+
+* Consequences
+
+- Logtail no longer needs eBPF, tracefs, cgroups, memlock, Aya,
+  or capture-source selection.
+- CRI mode does not construct eBPF assembly or newline-framing state.
+- Logtail knobs describe two real transport choices: batch size and maximum wait.
+  Collector configuration separately describes retained history per workload.
+- Bounds still exist, but changing an internal safety constant does not require
+  editing every deployment.
+- The preserved eBPF code may stop participating in the default image build. It
+  remains available for study or a future explicitly separate Linux tool.
+
+* Non-goals
+
+- Deleting eBPF source or rewriting its history.
+- Durable storage, exactly-once delivery, or disk-backed transport.
+- Making every internal constant dynamically configurable.
+- Semantic multiline reconstruction beyond CRI partial records.
+
+* Acceptance
+
+- Logtail YAML contains only export =endpoint=, =max_log_batch=, and
+  =flush_frequency=.
+- A batch flushes at 100 records and a quiet partial batch flushes on time.
+- A slow or unavailable collector cannot grow memory or block CRI-file reads;
+  overload is counted explicitly.
+- Transport failure stays bounded and reports dropped/retried batches.
+- The collector store exposes only =logs_per_workload=; query, tail replay, and
+  live stream behavior remain, while time-based expiry is deleted.
+- No dead assembly/framing/ingress budgets remain in the store.
+- The default binary and image do not build, load, or request eBPF facilities.
+- Notification-driven live capture matches =kubectl logs= across append and
+  rotation without event-triggered full scans.
+- Sustained live measurements cover CPU, RSS, queue drops, missed records, and
+  database retention before replacing production manifests.
+
+* TODO
+
+- [ ] S1 Approve the CRI-only boundary, logtail/collector ownership, two
+  transport knobs, and count-only collector history.
+- [ ] S2 Collapse node batching/configuration and test count/time flushing plus
+  bounded failure behavior.
+- [ ] S3 Simplify =LogStore= limits to retained records and remove dead memory
+  partitions without changing query/stream semantics.
+- [ ] S4 Disconnect eBPF from the default binary, image, and Kubernetes wiring;
+  preserve its source.
+- [ ] S5 Finish per-file notifications, debounced reconciliation, rotation, and
+  bounded watch enrichment.
+- [ ] S6 Update manifests, =learn/=, =TODO.org=, =ROADMAP.org=, and superseded
+  specs.
+- [ ] S7 Pass formatting, focused/workspace tests, image build, and guarded live
+  comparison before replacing production.
+
+* Supersedes
+
+- Operator configuration in
+  [[file:20260812-1405-lean-config-event-catchers.org][lean configuration and asynchronous event catchers]].
+- Memory-pool derivation in
+  [[file:20260809-1905-workload-store-product-contract.org][workload-oriented log-store product contract]].
+- The dual Kubernetes capture wiring in
+  [[file:20260815-1726-userspace-cri-log-tailing.org][userspace CRI log tailing]].

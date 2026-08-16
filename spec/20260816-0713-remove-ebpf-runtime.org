@@ -1,0 +1,101 @@
+#+title: Remove the eBPF runtime
+#+date: 2026-08-16 07:13 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Proposed. Awaiting maintainer approval.
+
+* Context
+
+The CRI-file experiment passed on two live CRI-O nodes with lower privileges,
+correct stdout/stderr identity, and output matching =kubectl logs=. Kubernetes
+already commits the log record we need below =/var/log/pods=.
+
+The remaining eBPF path is no longer a second useful product. It keeps Aya,
+nightly BPF builds, a kernel/userspace ABI, syscall reconstruction, cgroup
+resolution, tracefs mounts, and privileged deployment wiring alive. Preserving
+that machinery in the active workspace would make us maintain an unsupported
+capture path.
+
+Git history and the eBPF retrospective under =blog/= preserve the experiment
+better than dead crates do.
+
+* Decision
+
+Make CRI files the only capture boundary and remove eBPF from the active
+project. Delete =blt-ebpf= and the eBPF-only =blt-abi=. Remove Aya dependencies,
+the nested BPF build, syscall/cgroup reconstruction, and kernel privilege
+wiring. Do not create a generic capture-source abstraction or feature flag.
+
+#+begin_example
+/var/log/pods + node-scoped metadata watch
+  -> bounded CRI parse and partial join
+  -> enriched records
+  -> bounded OTLP batches
+  -> collector store and gRPC readers
+#+end_example
+
+Keep the retrospective and historical specs honest about what was built. Mark
+their decisions as historical or superseded where they otherwise describe the
+current architecture. Do not rewrite Git history.
+
+The CRI parser keeps only CRI-required framing: physical-line limits, =P=/=F=
+partial joining, rotation, and explicit integrity reporting. Remove generic
+write/writev chunk assembly and newline framing once no current consumer uses
+them.
+
+* Consequences
+
+- Stable Rust builds no longer invoke a BPF target or require =bpf-linker=.
+- The binary and image no longer contain an embedded kernel program or Aya.
+- The DaemonSet needs a read-only =/var/log/pods= mount, but no tracefs,
+  cgroup, memlock, =CAP_BPF=, or privileged eBPF setup.
+- The project stops claiming generic Linux stdout/stderr capture. A future
+  tracing tool must earn a new spec and can recover the experiment from Git.
+- =blt-model= remains the userspace record contract. Kernel-only event fields
+  disappear where the CRI path cannot truthfully populate them.
+
+* Non-goals
+
+- Rewriting or squashing repository history.
+- Deleting the retrospective merely because its implementation was removed.
+- Adding persisted offsets, disk queues, or semantic multiline parsing.
+- Generalizing capture sources for a hypothetical future Linux tool.
+
+* Acceptance
+
+- No active manifest, Rust target, Cargo dependency, build script, image stage,
+  mise task, README instruction, or runtime branch builds or loads eBPF.
+- =blt-ebpf= and eBPF-only =blt-abi= source are absent from the working tree;
+  their history remains recoverable with Git.
+- No syscall chunk assembly, cgroup-to-container resolver, tracefs mount, or
+  eBPF privilege remains without a current non-eBPF consumer.
+- CRI fixtures still cover opaque bytes, partial records, malformed input,
+  truncation, startup offsets, append, and rotation.
+- Logtail-to-collector delivery remains bounded and observable under failure.
+- Documentation describes CRI capture as current behavior and eBPF as a useful
+  completed experiment, not a supported runtime.
+- Formatting, focused tests, workspace tests and lint, and the ordinary image
+  build pass without a BPF toolchain.
+
+* TODO
+
+- [ ] E1 Approve full eBPF removal and the CRI-only project boundary.
+- [ ] E2 Remove eBPF crates, ABI, dependencies, build machinery, and active
+  runtime code.
+- [ ] E3 Delete obsolete capture reconstruction and privilege wiring while
+  preserving CRI behavior.
+- [ ] E4 Clean configuration, =learn/=, README, roadmap, TODO index, and
+  superseded specs.
+- [ ] E5 Pass focused/workspace checks, image build, and guarded live
+  validation.
+
+* Supersedes
+
+- The source-preservation decision in
+  [[file:20260815-1917-cri-only-lean-runtime.org][CRI-only lean runtime]].
+- The retained Linux/eBPF mode in
+  [[file:20260815-1726-userspace-cri-log-tailing.org][userspace CRI log tailing]].
+- Active eBPF workspace boundaries in
+  [[file:20260813-1540-workspace-crate-decomposition.org][workspace crate decomposition]].

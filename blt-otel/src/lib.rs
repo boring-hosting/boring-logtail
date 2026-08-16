@@ -238,6 +238,8 @@ fn decode_stream(value: &str) -> Result<StreamFileDescriptor, DecodeError> {
     match value {
         "stdout-candidate" => Ok(StreamFileDescriptor::Stdout),
         "stderr-candidate" => Ok(StreamFileDescriptor::Stderr),
+        "stdout" => Ok(StreamFileDescriptor::RuntimeStdout),
+        "stderr" => Ok(StreamFileDescriptor::RuntimeStderr),
         "unknown-candidate" => Ok(StreamFileDescriptor::Unknown),
         value if value.starts_with("fd-") => value[3..]
             .parse()
@@ -676,6 +678,21 @@ mod tests {
         let (resource, log) = parts(&request);
 
         assert_eq!(decode_record(resource, log).unwrap(), original);
+    }
+
+    #[test]
+    fn runtime_proven_streams_round_trip_without_candidate_spelling() {
+        for stream in [
+            StreamFileDescriptor::RuntimeStdout,
+            StreamFileDescriptor::RuntimeStderr,
+        ] {
+            let mut original = record(b"runtime\n");
+            original.stream = stream;
+            let request = export_request(&original, &context());
+            let (resource, log) = parts(&request);
+
+            assert_eq!(decode_record(resource, log).unwrap(), original);
+        }
     }
 
     #[test]

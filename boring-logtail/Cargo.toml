@@ -21,6 +21,7 @@ log = { workspace = true }
 jiff = "0.2"
 k8s-openapi = { version = "0.28", features = ["latest"] }
 kube = { version = "4.2", features = ["runtime"] }
+notify = "8.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { workspace = true, features = [
@@ -53,6 +54,7 @@ blt-ebpf = { path = "../blt-ebpf" }
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
 
 [[bin]]
 name = "boring-logtail"
