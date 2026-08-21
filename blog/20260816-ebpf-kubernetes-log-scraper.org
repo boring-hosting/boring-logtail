@@ -2,28 +2,25 @@
 #+date: 2026-08-16
 #+license: GFDL-1.3-or-later
 
+* Kubernetes eBPF log scrapper/collector
+
 Ever since I learned about eBPF through the cilium project I was dying
 to get my hands on this. But there are not many usecases I could come up
-with that were not networking per se. 
+with that were not networking per se. And voila, a cool opportunity
+presented itself, I suddenly had a cool project, that required a deep
+dive into kubernetes logging, I needed to reduce overwhelming the api server
+with requests, since cross-node and the architecture itself is a bit complicated.
 
-We built a Kubernetes log scraper by attaching eBPF programs to Linux
-=write(2)= and =writev(2)=. It worked. It was fast. It enriched bytes with the
-right Pod and workload. It also captured a password printed into a private
-shell pipe that Kubernetes never considered a log.
+And so, it seems that container logs usually begin as bytes written to standard output or standard
+error, and there it was. I can finally use eBPF!
 
-That last part changed the project.
+** The initial idea
 
-This is the trip from a syscall, through cgroup v2 and a BPF ring buffer, into
-Kubernetes metadata. It is also an account of where the model stopped matching
-reality.
-
-* The first idea
-
-Container logs usually begin as bytes written to standard output or standard
-error. Linux calls those file descriptors 1 and 2 by convention. An eBPF
+We would build a Kubernetes log scraper by attaching eBPF programs to Linux
+=write(2)= and =writev(2)=. Just tap directly into the source! An eBPF
 tracepoint can observe the write syscall before the bytes leave the process.
 
-The first model looked almost offensively simple:
+The first model looked almost dumb simple:
 
 #+begin_example
 application write(fd 1 or 2)
@@ -31,26 +28,49 @@ application write(fd 1 or 2)
   -> ring buffer
   -> userspace
   -> Kubernetes enrichment
-  -> collector
 #+end_example
 
-This avoids opening one Kubernetes log stream per Pod. That mattered on our
-cluster because the control plane runs through Kamaji. Asking the Kubernetes
-API server for many continuous log streams was exactly the load we wanted to
-remove.
+
+It worked. It was fast. It enriched bytes with the
+right Pod and workload. It also captured a password printed into a private
+shell pipe that Kubernetes never considered a log. 😁
+
+This is the trip from a syscall, through cgroup v2 and a BPF ring buffer, into
+Kubernetes metadata.
+
+#+BEGIN_QUOTE
+it is tempting, if the only tool you have is a hammer, to treat everything as if it were a nail. - Abraham Maslow
+#+END_QUOTE
+
+Cool quote too... But in the end, we will see why this is a perfect example!
+
+** The first version.
 
 The kernel hook was cheap. In a live two-node comparison, the eBPF DaemonSet
 used about 3 millicores of CPU in total. The userspace CRI-file prototype later
 used about 11 millicores. The eBPF path was a neat little machine.
 
 The hard part was never attaching a tracepoint. The hard part was deciding what
-an observed write meant.
+an observed write meant. And so the adventure begins...
 
 * Entry is intent, exit is fact
 
+When an application outputs a log into stdout, the mechanism is quite interesting (focusing on linux) typically lands into a buffer, associated with the respective
+file descriptor. That is usually 1 or 2. When that buffer is flushed, the application
+issues an interrupt to hand the data to the kernel. And here is where come in:
+
+** write
+
+write(fd, buffer, size): Used if the standard library has assembled the entire log message into a single, contiguous block of memory.
+
+** writev
+
+writev(fd, iov, iovcnt): Used for "scatter-gather" I/O. High-performance loggers often keep timestamps, log levels, and payloads in separate memory addresses. Instead of wasting CPU cycles concatenating them into one string, writev passes an array of pointers to the kernel, telling it to grab and write all those distinct chunks in sequence.
+
+
 The =sys_enter_write= tracepoint gives us the file descriptor, userspace buffer
 address, and requested byte count. It does not tell us how many bytes Linux
-accepted.
+accepted. 
 
 A write can:
 
@@ -63,9 +83,11 @@ Copying =count= bytes at entry would report bytes that might never have been
 written. Waiting only for exit loses the buffer pointer because the exit
 tracepoint contains the result, not the original arguments.
 
+:NOTE: Transfer to inline comments
 We paired the two events with the value returned by
 =bpf_get_current_pid_tgid()=. Its upper 32 bits are the process identifier
 (PID), and its lower 32 bits are the thread identifier (TID).
+:NOTEEND:
 
 At entry, the program saved a small value in a BPF hash map:
 
@@ -92,6 +114,10 @@ pub fn boring_logtail_enter(ctx: TracePointContext) -> u32 {
         Err(_) => return 0,
     };
 
+    // this is an important emission (We exclude ourselves)
+    // Otherwise we have a spiral recursion if we ever attempted
+    // to actually log anything related to the entries we just tried
+    // to capture...
     if !admitted(fd) {
         return 0;
     }
@@ -100,10 +126,12 @@ pub fn boring_logtail_enter(ctx: TracePointContext) -> u32 {
         Ok(value) => value,
         Err(_) => return 0,
     };
+    
     let requested_len: usize = match unsafe { ctx.read_at(32) } {
         Ok(value) => value,
         Err(_) => return 0,
     };
+
     let pid_tgid = bpf_get_current_pid_tgid();
 
     let _ = WRITE_STARTS.insert(pid_tgid, WriteStart {
@@ -225,6 +253,7 @@ added integrity markers where we could and kept missing counters on the
 roadmap instead of claiming perfect capture.
 
 * =writev= is not a larger =write=
+:NOTE: SIMPLIFY A LOT....
 
 =write= receives one contiguous buffer. =writev= receives an array of
 =iovec= structures. Each entry points to a separate userspace buffer.
@@ -278,32 +307,29 @@ made verifier output worse and failure cleanup harder to reason about.
 
 And this still did not cover every way bytes can leave a process. Compatibility
 syscalls, =sendmsg=, memory-mapped files, and io_uring are different paths.
+:NOTEEND:
 
 * A syscall is not a log record
-
-Userspace drained the ring buffer and assembled chunks by:
-
-#+begin_example
-(cgroup_id, pid, tid, operation_id)
-#+end_example
-
-It rejected gaps, conflicting metadata, missing first chunks, and bytes after a
-terminal chunk. A complete assembly produced one =WriteOperation=.
-
-That was still not a log record.
+This is truly when things started getting complicated...
 
 One write can contain three newline-delimited records. One record can be spread
 across ten writes. Pretty-printed JSON can contain several newlines while still
 being one semantic document. A panic can arrive as many writes from several
 threads.
 
+A new ringbuffer appeared, where we could track many writes across =write(1)= and =writev(2)=
+
+:NOTE: SIMPLIFY BY A LOT, WHAT DOES THAT EVEN MEAN...
 We implemented byte-preserving newline framing in userspace. Framing lanes were
 separated by container identity and descriptor candidate so bytes from two
 containers could never be joined. Pending bytes and lane counts were bounded.
 When pressure forced a split, the record carried an integrity marker.
 
 This produced honest newline records, not semantic multiline documents. That
-word matters. Reconstructing syscalls and reconstructing application messages
+word matters.
+:NOTEEND: 
+
+Reconstructing syscalls and reconstructing application messages
 are separate problems.
 
 * From cgroup v2 to a Pod
@@ -311,52 +337,76 @@ are separate problems.
 The kernel does not know that a process belongs to
 =Deployment/boring-logtail=. Kubernetes names are control-plane data.
 
-At syscall entry we recorded =bpf_get_current_cgroup_id()=. A background
-userspace scanner walked the host cgroup-v2 tree and mapped cgroup inode IDs to
-runtime-qualified container IDs such as =crio://...= or =containerd://...=.
+HOWEVER! Everything everything can be linked in some way. When we inspect
+a pod in fact, you can see in the Status some very interesting information:
 
-A node-scoped Kubernetes watch built another snapshot from Pod status:
+If you do kubectl describe pod x, you will see something similar to:
 
-#+begin_example
-cgroup ID
-  -> runtime container ID
-  -> Pod UID + container name
-  -> controller owner
-  -> workload identity
-#+end_example
+#+BEGIN_SRC yaml
+  Name:             boring-collector-76489c9b66-l5lcv
+  Namespace:        boring-logtail
+  Priority:         0
+  Service Account:  default
+  # .....
+  # stuff
+  # .....
+  Containers:
+    boring-collector:
+    Container ID:   cri-o://cacd896f51e0d576143b41d1e869c7a382f95dabfffd6bb3c4256d81ebe0b1be
+    Image:          ......./boring-logtail/collector:latest
+    Image ID:       .......
+    Ports:          4318/TCP (otlp-http), 50051/TCP (grpc)
+    Host Ports:     0/TCP (otlp-http), 0/TCP (grpc)
+    State:          Running
+    Started:      Sun, 16 Aug 2026 10:35:38 +0000
+#+END_SRC
 
-ReplicaSets needed one extra owner-reference hop to reach their Deployment.
-The join used exact container IDs and owner UIDs. It did not guess a Deployment
-by trimming a Pod name.
+  At syscall entry we recorded =bpf_get_current_cgroup_id()=. A background
+  userspace scanner walked the host cgroup-v2 tree and mapped cgroup inode IDs to
+  runtime-qualified container IDs such as =crio://...= or =containerd://...=.
 
-The hot path performed memory lookups only. It did not walk cgroupfs, call the
-Kubernetes API, or contact the container runtime for each write. If either
-snapshot lacked a match, the record stayed explicitly unresolved.
+  A node-scoped Kubernetes watch built another snapshot from Pod status:
 
-The final join was deliberately boring:
+  #+begin_example
+  cgroup ID
+    -> runtime container ID
+    -> Pod UID + container name
+    -> controller owner
+    -> workload identity
+  #+end_example
 
-#+begin_src rust
-let Some(containers) = cgroups.containers.get(&operation.cgroup_id) else {
-    return Enrichment::UnresolvedCgroup;
-};
-let [container] = containers.as_slice() else {
-    return Enrichment::AmbiguousCgroup;
-};
+  ReplicaSets needed one extra owner-reference hop to reach their Deployment.
+  The join used exact container IDs and owner UIDs. It did not guess a Deployment
+  by trimming a Pod name.
 
-let Some(identities) = pods.identities.get(container) else {
-    return Enrichment::UnresolvedContainer(container.clone());
-};
-let [identity] = identities.as_slice() else {
-    return Enrichment::AmbiguousContainer(container.clone());
-};
+  The hot path performed memory lookups only. It did not walk cgroupfs, call the
+  Kubernetes API, or contact the container runtime for each write. If either
+  snapshot lacked a match, the record stayed explicitly unresolved.
 
-Enrichment::Enriched(identity.clone())
+  The final join was deliberately boring:
+
+  #+begin_src rust
+    let Some(containers) = cgroups.containers.get(&operation.cgroup_id) else {
+        return Enrichment::UnresolvedCgroup;
+    };
+    
+    let [container] = containers.as_slice() else {
+        return Enrichment::AmbiguousCgroup;
+    };
+
+    let Some(identities) = pods.identities.get(container) else {
+        return Enrichment::UnresolvedContainer(container.clone());
+    };
+
+    let [identity] = identities.as_slice() else {
+        return Enrichment::AmbiguousContainer(container.clone());
+    };
+
+    Enrichment::Enriched(identity.clone())
 #+end_src
 
 PID alone could not do this job. A PID inside a container namespace is not the
-host PID observed at the tracepoint. PIDs are also reused. Kernel cgroup
-membership gave us a stable boundary without trying to translate namespace
-views of a process number.
+host PID observed at the tracepoint.
 
 We used the same idea to stop the scraper from scraping itself. Userspace
 opened logtail's cgroup directory and placed it in a BPF cgroup array. The
