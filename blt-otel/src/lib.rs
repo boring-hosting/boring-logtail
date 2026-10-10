@@ -328,6 +328,7 @@ fn add_kubernetes_resource(attributes: &mut Vec<KeyValue>, identity: &Kubernetes
     attributes.extend([
         string("k8s.node.name", &identity.node),
         string("k8s.namespace.name", &identity.namespace),
+        string("service.namespace", &identity.namespace),
         string("k8s.pod.name", &identity.pod_name),
         string("k8s.pod.uid", &identity.pod_uid),
         string("k8s.container.name", &identity.container_name),
@@ -337,6 +338,7 @@ fn add_kubernetes_resource(attributes: &mut Vec<KeyValue>, identity: &Kubernetes
 
     match &identity.workload {
         WorkloadResolution::Resolved(workload) => {
+            attributes.push(string("service.name", &workload.name));
             let semantic_key = match workload.kind.as_str() {
                 "Deployment" => Some("k8s.deployment.name"),
                 "ReplicaSet" => Some("k8s.replicaset.name"),
@@ -351,9 +353,10 @@ fn add_kubernetes_resource(attributes: &mut Vec<KeyValue>, identity: &Kubernetes
                 attributes.push(string(key, &workload.name));
             }
         }
-        WorkloadResolution::NoController
-        | WorkloadResolution::UnresolvedReplicaSet(_)
-        | WorkloadResolution::UnsupportedOwner(_) => {}
+        WorkloadResolution::NoController => {
+            attributes.push(string("service.name", &identity.pod_name));
+        }
+        WorkloadResolution::UnresolvedReplicaSet(_) | WorkloadResolution::UnsupportedOwner(_) => {}
     }
 }
 

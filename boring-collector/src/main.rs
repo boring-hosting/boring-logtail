@@ -2,79 +2,66 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use blt_emitter::{DiscordConfig, EmittersConfig, EventEmitters};
-use blt_store::LogStore;
-use boring_collector::{CollectorConfig, Policy, grpc, router};
+use blt_store::{LogReader, LogSink, LokiLogStore};
+use boring_collector::{CollectorConfig, grpc, health_router, otlp};
 use log::info;
+use tokio::{net::TcpListener, task::JoinSet};
 
 #[tokio::main]
-
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let path = std::env::var_os("BORING_COLLECTOR_CONFIG").map(PathBuf::from);
-
     let config = CollectorConfig::load(path.as_deref())?;
+    let store = Arc::new(LokiLogStore::new(config.loki_config()).map_err(anyhow::Error::msg)?);
+    let sink: Arc<dyn LogSink> = store.clone();
+    let reader: Arc<dyn LogReader> = store;
+    let otlp_listener = TcpListener::bind(config.otlp_grpc_listen).await?;
+    let reader_listener = TcpListener::bind(config.reader_grpc_listen).await?;
+    let health_listener = TcpListener::bind(config.health_listen).await?;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut tasks = JoinSet::new();
 
-    let discord = config
-        .event_emitters
-        .discord
-        .as_ref()
-        .map(|discord| {
-            let secret = std::env::var(&discord.secret_from_env)?;
-
-            if secret.is_empty() {
-                anyhow::bail!(
-                    "Discord secret environment variable {} is empty",
-                    discord.secret_from_env
-                );
-            }
-
-            Ok::<_, anyhow::Error>(DiscordConfig::new(&discord.channel_id, secret))
-        })
-        .transpose()?;
-
-    let (senders, emitters) = EventEmitters::spawn(EmittersConfig {
-        stdout: config.event_emitters.stdout.is_some(),
-        discord,
+    info!("OTLP/gRPC listening on {}", config.otlp_grpc_listen);
+    let otlp_stopped = stopped.clone();
+    tasks.spawn(async move {
+        otlp::serve(
+            otlp_listener,
+            sink,
+            config.max_request_bytes,
+            wait_for_stop(otlp_stopped),
+        )
+        .await
+        .map_err(anyhow::Error::from)
     });
 
-    let policy = Arc::new(Policy::compile(&config, &senders)?);
-    let store = Arc::new(LogStore::new(config.store.clone()));
-    let http_listener = tokio::net::TcpListener::bind(config.listen).await?;
-    let grpc_listener = tokio::net::TcpListener::bind(config.grpc_listen).await?;
-
-    info!("boring-collector OTLP/HTTP listening on {}", config.listen);
-    info!("boring-collector gRPC listening on {}", config.grpc_listen);
-
-    let (stop, stopped) = tokio::sync::watch::channel(false);
-    let http_router = router(store.clone(), policy.clone(), config.max_request_bytes);
-    let http_stopped = stopped.clone();
-    let http = async move {
-        axum::serve(http_listener, http_router)
-            .with_graceful_shutdown(wait_for_stop(http_stopped))
+    info!("reader gRPC listening on {}", config.reader_grpc_listen);
+    let reader_stopped = stopped.clone();
+    tasks.spawn(async move {
+        grpc::serve(reader_listener, reader, wait_for_stop(reader_stopped))
             .await
             .map_err(anyhow::Error::from)
-    };
-    let grpc = async move {
-        grpc::serve(grpc_listener, store, wait_for_stop(stopped))
+    });
+
+    info!("health listening on {}", config.health_listen);
+    tasks.spawn(async move {
+        axum::serve(health_listener, health_router())
+            .with_graceful_shutdown(wait_for_stop(stopped))
             .await
             .map_err(anyhow::Error::from)
-    };
-    tokio::pin!(http, grpc);
+    });
 
     tokio::select! {
-        result = &mut http => return result,
-        result = &mut grpc => return result,
-        () = shutdown_signal() => {}
+        _ = shutdown_signal() => {}
+        result = tasks.join_next() => {
+            result.ok_or_else(|| anyhow::anyhow!("collector server set is empty"))???;
+        }
     }
 
     let _ = stop.send(true);
-    let (_, _) = tokio::try_join!(http, grpc)?;
-
-    info!("final collector policy stats: {:?}", policy.stats());
-
-    emitters.shutdown().await;
+    while let Some(result) = tasks.join_next().await {
+        result??;
+    }
 
     Ok(())
 }
@@ -87,7 +74,6 @@ async fn wait_for_stop(mut stopped: tokio::sync::watch::Receiver<bool>) {
     if *stopped.borrow() {
         return;
     }
-
     while stopped.changed().await.is_ok() {
         if *stopped.borrow() {
             return;

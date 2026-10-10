@@ -11,8 +11,8 @@ blt-model = { path = "../blt-model" }
 jiff = "0.2"
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }
-reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tonic = { workspace = true, features = ["codegen", "transport"] }
 
 [lib]
 path = "src/lib.rs"

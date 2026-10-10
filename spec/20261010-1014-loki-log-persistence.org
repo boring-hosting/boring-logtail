@@ -1,0 +1,140 @@
+#+title: Replace collector memory history with Loki storage ports
+#+date: 2026-10-10 10:14 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-10.
+
+* Context
+
+=boring-collector= currently treats a concrete =Arc<LogStore>= as both its
+write path and its retained/live read path. The store is a bounded in-memory
+database: useful for proving the product, but duplicate storage now that the
+cluster runs Loki with seven-day retention. Its concrete coupling is not the
+storage seam the architecture intended.
+
+The collector remains valuable. It is the cluster-wide OTLP ingress which can
+scale independently, accept several sources, and later receive metrics or
+traces. Loki replaces its log database, not the collector. Do not add imagined
+signal pipelines now; standard OTLP leaves that door open without machinery.
+
+#+begin_example
+node agents / applications -> OTLP/gRPC :4317 -> boring-collector
+                                                   |
+                                                   +-> LogSink -> Loki OTLP/HTTP
+
+web backend -> custom gRPC :50051 -> LogReader -> Loki query/tail
+Grafana ------------------------------------------> Loki
+#+end_example
+
+* Decision
+
+** Storage seam
+
+Replace the concrete store dependency with two async, object-safe ports in
+=blt-store=:
+
+- =LogSink= exports one complete =ExportLogsServiceRequest= batch and returns
+  the OTLP export result or a typed delivery error.
+- =LogReader= opens one retained-then-live stream for a validated selector,
+  =tail_lines=, and =follow= choice. The returned stream yields timestamp and
+  opaque line bytes or a typed terminal read error.
+
+Keep bulk shape across =LogSink=. The collector must never turn one OTLP export
+request into per-record HTTP inserts. A production =LokiLogStore= implements
+both ports. A small private in-memory implementation exists only under tests;
+the current public retention database, configuration, statistics, eviction,
+sequence, flush, and broadcast machinery are removed.
+
+The collector composition root accepts =Arc<dyn LogSink>= and
+=Arc<dyn LogReader>=. OTLP ingress knows only =LogSink=; the existing custom
+=LogService= knows only =LogReader=. Tests cross the same ports as production.
+
+** Bulk export
+
+Serve standard OTLP Logs gRPC =Export= on =4317=. Pass each decoded protobuf
+request intact to =LogSink=. =LokiLogStore= protobuf-encodes the complete batch
+once and posts it to Loki's native =/otlp/v1/logs= endpoint. We own this small
+adapter on top of HTTP primitives; do not add a third-party Loki client.
+
+Bound request size and concurrent downstream requests. Do not add a second
+collector queue: node agents already own bounded batching and retry. When the
+concurrency bound is full, return a retryable OTLP/gRPC error. A successful
+collector response means Loki accepted the batch. Propagate Loki partial
+success; map timeouts, =429=, and =5xx= to retryable errors, and malformed or
+other non-retryable =4xx= responses to non-retryable errors without logging
+payload contents.
+
+The node agents migrate from historical OTLP/HTTP to OTLP/gRPC =4317=. HTTP on
+=13133= carries collector liveness/readiness only. Readiness does not depend on
+Loki, avoiding restart loops during storage outages.
+
+** Retained and live reads
+
+Keep =boring_logtail.v1.LogService/StreamLogs= on =50051= unchanged for the
+existing web backend. =LokiLogStore= implements retained reads with
+=/loki/api/v1/query_range= and following with =/loki/api/v1/tail=. It builds
+LogQL internally from typed namespace, workload, or Pod selectors; callers
+never provide raw LogQL.
+
+For =follow=true=, establish and buffer the WebSocket tail first, record the
+handoff time after connection, query retained history through that time, then
+emit only newer buffered/live entries. Surface Loki =dropped_entries= and a
+full local handoff buffer as terminal lag errors. For =follow=false=, perform
+only the bounded backward range query and return results oldest-first.
+
+Use Loki's normalized OTLP Kubernetes labels. The node mapping sets standard
+=service.name= and =service.namespace= from resolved workload identity, so
+workload reads use Loki's indexed =service_name= label. Namespace and Pod
+selectors use =k8s_namespace_name= and =k8s_pod_name=. Preserve the existing
+response timestamp and line contract. No arbitrary query proxy is introduced.
+
+** Deleted collector responsibilities
+
+Remove collector-side filtering, sampling, event definitions, regex catchers,
+stdout/Discord emitters, and their secrets. Full visibility is the current
+requirement; Loki/Grafana own later operational alerting. Remove =blt-emitter=
+from the workspace. Keep =blt-model= and =blt-otel= for CRI enrichment and
+bounded node delivery.
+
+* Consequences
+
+- Collector replicas are stateless and share one durable seven-day history.
+- Sources and the web backend retain stable protocols while storage changes.
+- Loki availability is now on the acknowledged log write path; agents provide
+  the bounded retry and loss accounting.
+- Retained/live ordering uses Loki timestamps rather than process-local store
+  sequences. Exactly-once delivery is not claimed.
+- Metrics and traces can add their standard OTLP services and explicit backend
+  ports later without changing log storage ports.
+
+* Acceptance
+
+- One multi-resource, multi-scope OTLP request causes exactly one Loki bulk
+  request and preserves every record and Kubernetes attribute.
+- Concurrent export capacity is bounded; overload and downstream failures
+  produce the documented retry classification and no successful early ack.
+- Namespace, workload, and Pod reads return the requested retained tail in
+  chronological order; follow has no handoff gap in deterministic tests.
+- Tail drops, handoff-buffer overflow, cancellation, malformed Loki responses,
+  and unavailable Loki terminate reads explicitly without collector crashes.
+- Existing =LogService= protocol tests pass against the private memory adapter
+  and focused Loki HTTP/WebSocket fixtures.
+- GitHub Actions replaces GitLab CI and publishes immutable logtail and
+  collector images to GHCR; no mutable deployment tag is used.
+- Stable formatting, workspace tests, strict Clippy, both images, and live
+  two-node Loki/Grafana queries pass.
+- GitOps exposes =4317=, =50051=, and =13133=, removes collector memory/catcher
+  configuration and Discord secret, and keeps Loki internal to the cluster.
+
+* TODO
+
+- [X] LP1 Approve the two storage ports, bulk acknowledgement contract,
+  retained/live handoff, and deletion of memory/catcher responsibilities.
+- [X] LP2 Add the ports, private test adapter, and focused contract tests.
+- [X] LP3 Implement the Loki bulk-export and query/tail adapter.
+- [X] LP4 Move collector ingestion to OTLP/gRPC and wire both ports.
+- [X] LP5 Remove the old store/emitter machinery and reconcile documentation.
+- [ ] LP6 Publish immutable images, update GitOps, and validate live ingestion,
+  history, following, overload, and Loki-outage behavior.

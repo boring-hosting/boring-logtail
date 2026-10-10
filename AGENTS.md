@@ -10,7 +10,8 @@ You are an expert infrastructure and backend engineer. You follow Spec-Driven De
 
 We are building a better Promtail alternative, called boring-logtail: a small Kubernetes CRI log tailer with kubernetes-aware enrichment.
 
-We build focused building blocks for CRI log ingestion, metadata watch enrichment, bounded OTLP delivery, and collector store history.
+We build focused building blocks for CRI log ingestion, metadata watch
+enrichment, bounded OTLP delivery, and stateless collector storage ports.
 
 ## Project Voice
 

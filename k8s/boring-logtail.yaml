@@ -9,7 +9,7 @@ metadata:
 data:
   config.yaml: |
     collector:
-      endpoint: http://boring-collector:4318/v1/logs
+      endpoint: http://boring-collector:4317
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -18,49 +18,15 @@ metadata:
   namespace: boring-logtail-dev
 data:
   config.yaml: |
-    listen: 0.0.0.0:4318
-    grpc_listen: 0.0.0.0:50051
+    otlp_grpc_listen: 0.0.0.0:4317
+    reader_grpc_listen: 0.0.0.0:50051
+    health_listen: 0.0.0.0:13133
     max_request_bytes: 4194304
-    store:
-      max_memory: 128MiB
-      max_logs: 500
-      retention: 1h
-    sampling:
-      percent: 100
-    filters:
-      namespaces:
-        include:
-          - auth
-          - biomehub
-          - biomehub-dev
-          - factorio-dev
-          - flux-system
-          - game-servers
-    events:
-      joined:
-        type: info
-        message: "Someone has joined!"
-      web-app-error:
-        type: error
-        message: "The Biomehub backend reported an operational failure"
-      web-app-auth-warning:
-        type: warning
-        message: "The Biomehub backend rejected an OIDC token"
-    event_catchers:
-      - regex: '(?i)\b(?:playfab )?peer connected:\s*PeerId\('
-        event: joined
-        emitters:
-          - stdout
-      - regex: '(?m)^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ERROR (?:configuration error|failed to initialize (?:storage|kubernetes client|auth middleware)|http server error|server shutdown error|ensure catalog entry|failed to (?:read webhook body|parse subscription event)|webhook signature verification failed|stripe event error)\b'
-        event: web-app-error
-        emitters:
-          - stdout
-      - regex: '(?m)^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} WARN jwtmiddleware error\b|Failed to refresh Dex token Error: Dex rejected the refresh token\b)'
-        event: web-app-auth-warning
-        emitters:
-          - stdout
-    event_emitters:
-      stdout: {}
+    loki:
+      endpoint: http://loki.observability.svc.cluster.local:3100
+      request_timeout_ms: 10000
+      max_concurrent_exports: 16
+      handoff_buffer: 1024
 ---
 apiVersion: v1
 kind: Service
@@ -71,12 +37,15 @@ spec:
   selector:
     app.kubernetes.io/name: boring-collector-cri-dev
   ports:
-    - name: otlp-http
-      port: 4318
-      targetPort: otlp-http
-    - name: grpc
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: reader-grpc
       port: 50051
-      targetPort: grpc
+      targetPort: reader-grpc
+    - name: health
+      port: 13133
+      targetPort: health
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -101,12 +70,14 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: boring-collector
-          image: registry.gitlab.com/biomehub/boring-logtail/collector:latest
+          image: ghcr.io/boring-hosting/boring-collector:dev
           ports:
-            - name: otlp-http
-              containerPort: 4318
-            - name: grpc
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: reader-grpc
               containerPort: 50051
+            - name: health
+              containerPort: 13133
           env:
             - name: RUST_LOG
               value: info
@@ -115,11 +86,11 @@ spec:
           readinessProbe:
             httpGet:
               path: /healthz
-              port: otlp-http
+              port: health
           livenessProbe:
             httpGet:
               path: /healthz
-              port: otlp-http
+              port: health
           resources:
             requests:
               cpu: 50m
@@ -209,7 +180,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: boring-logtail
-          image: registry.gitlab.com/biomehub/boring-logtail/logtail:latest
+          image: ghcr.io/boring-hosting/boring-logtail:dev
           env:
             - name: RUST_LOG
               value: info

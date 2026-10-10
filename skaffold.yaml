@@ -7,12 +7,12 @@ build:
     gitCommit:
       variant: AbbrevCommitSha
   artifacts:
-    - image: registry.gitlab.com/biomehub/boring-logtail/logtail
+    - image: ghcr.io/boring-hosting/boring-logtail
       context: .
       docker:
         dockerfile: Dockerfile
         target: logtail
-    - image: registry.gitlab.com/biomehub/boring-logtail/collector
+    - image: ghcr.io/boring-hosting/boring-collector
       context: .
       docker:
         dockerfile: Dockerfile

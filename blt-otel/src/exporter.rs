@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Bounded OTLP/HTTP batching kept away from the capture loop.
+//! Bounded OTLP/gRPC batching kept away from the capture loop.
 
 use std::{
     fmt,
@@ -13,14 +13,14 @@ use std::{
 
 use blt_model::LogRecord;
 use opentelemetry_proto::tonic::collector::logs::v1::{
-    ExportLogsServiceRequest, ExportLogsServiceResponse,
+    ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_client::LogsServiceClient,
 };
-use prost::Message as _;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
     time::Instant,
 };
+use tonic::{Code, Request, transport::Endpoint};
 
 use crate::{ExportContext, encoded_len, export_request};
 
@@ -40,6 +40,10 @@ impl ExportConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.endpoint.is_empty() {
             return Err("OTLP endpoint must not be empty");
+        }
+
+        if Endpoint::from_shared(self.endpoint.clone()).is_err() {
+            return Err("OTLP endpoint must be a valid gRPC URI");
         }
 
         if self.queue_records == 0
@@ -227,10 +231,11 @@ impl OtlpExporter {
 }
 
 async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Arc<AtomicStats>) {
-    let client = reqwest::Client::builder()
+    let channel = Endpoint::from_shared(config.endpoint.clone())
+        .expect("validated OTLP endpoint")
         .timeout(config.request_timeout)
-        .build()
-        .expect("static HTTP client configuration is valid");
+        .connect_lazy();
+    let mut client = LogsServiceClient::new(channel);
 
     let mut batch = Vec::new();
 
@@ -248,19 +253,19 @@ async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Ar
                     && (batch.len() == config.batch_records
                         || batch_bytes.saturating_add(item.bytes) > config.batch_bytes)
                 {
-                    flush(&client, &config, &stats, std::mem::take(&mut batch)).await;
+                    flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
                     batch_bytes = 0;
                 }
                 batch_bytes += item.bytes;
                 batch.push(item);
                 if batch.len() == config.batch_records || batch_bytes >= config.batch_bytes {
-                    flush(&client, &config, &stats, std::mem::take(&mut batch)).await;
+                    flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
                     batch_bytes = 0;
                 }
                 timer.as_mut().reset(Instant::now() + config.flush_interval);
             }
             () = &mut timer, if !batch.is_empty() => {
-                flush(&client, &config, &stats, std::mem::take(&mut batch)).await;
+                flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
                 batch_bytes = 0;
                 timer.as_mut().reset(Instant::now() + config.flush_interval);
             }
@@ -268,12 +273,12 @@ async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Ar
     }
 
     if !batch.is_empty() {
-        flush(&client, &config, &stats, batch).await;
+        flush(&mut client, &config, &stats, batch).await;
     }
 }
 
 async fn flush(
-    client: &reqwest::Client,
+    client: &mut LogsServiceClient<tonic::transport::Channel>,
     config: &ExportConfig,
     stats: &AtomicStats,
     items: Vec<Item>,
@@ -287,14 +292,12 @@ async fn flush(
             .collect(),
     };
 
-    let body = request.encode_to_vec();
-
     let started = Instant::now();
 
     let mut delay = Duration::from_millis(100);
 
     loop {
-        match send(client, &config.endpoint, body.clone()).await {
+        match send(client, request.clone(), config.request_timeout).await {
             SendResult::Accepted(rejected) => {
                 stats.exported_batches.fetch_add(1, Ordering::Relaxed);
 
@@ -336,40 +339,36 @@ enum SendResult {
     PermanentFailure,
 }
 
-async fn send(client: &reqwest::Client, endpoint: &str, body: Vec<u8>) -> SendResult {
-    let response = match client
-        .post(endpoint)
-        .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return SendResult::RetryableFailure,
-    };
+async fn send(
+    client: &mut LogsServiceClient<tonic::transport::Channel>,
+    batch: ExportLogsServiceRequest,
+    timeout: Duration,
+) -> SendResult {
+    let mut request = Request::new(batch);
+    request.set_timeout(timeout);
+    match client.export(request).await {
+        Ok(response) => {
+            let response: ExportLogsServiceResponse = response.into_inner();
+            let rejected = response
+                .partial_success
+                .map_or(0, |partial| partial.rejected_log_records.max(0) as u64);
 
-    let status = response.status();
-
-    if status.is_success() {
-        let Ok(bytes) = response.bytes().await else {
-            return SendResult::PermanentFailure;
-        };
-
-        let Ok(response) = ExportLogsServiceResponse::decode(bytes) else {
-            return SendResult::PermanentFailure;
-        };
-
-        let rejected = response
-            .partial_success
-            .map_or(0, |partial| partial.rejected_log_records.max(0) as u64);
-
-        return SendResult::Accepted(rejected);
-    }
-
-    if matches!(status.as_u16(), 429 | 502 | 503 | 504) {
-        SendResult::RetryableFailure
-    } else {
-        SendResult::PermanentFailure
+            SendResult::Accepted(rejected)
+        }
+        Err(status)
+            if matches!(
+                status.code(),
+                Code::Aborted
+                    | Code::Cancelled
+                    | Code::DeadlineExceeded
+                    | Code::ResourceExhausted
+                    | Code::Unavailable
+                    | Code::Unknown
+            ) =>
+        {
+            SendResult::RetryableFailure
+        }
+        Err(_) => SendResult::PermanentFailure,
     }
 }
 

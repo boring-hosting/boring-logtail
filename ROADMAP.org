@@ -3,7 +3,7 @@
 
 The capture source of truth is the CRI record committed below =/var/log/pods=.
 Logtail reads node-local files and ships bounded batches. The collector owns
-history, policy, alerts, and reads.
+stateless ingestion and typed reads; Loki owns seven-day history.
 
 * Node capture
 
@@ -19,11 +19,11 @@ history, policy, alerts, and reads.
 * Delivery and collection
 
 - [X] Keep node delivery bounded by records, bytes, time, and retry duration.
-- [X] Share one collector =Arc<LogStore>= across ingestion and gRPC readers.
+- [X] Put bulk writes and retained/live reads behind storage ports.
 - [X] Preserve opaque bytes and explicit integrity through OTLP.
-- [X] Run event catchers and bounded stdout/Discord emitters in the collector.
-- [ ] Reduce operator configuration to demonstrated product choices.
-- [ ] Specify persistence separately; the current store is bounded memory.
+- [X] Replace process-local history with the Loki storage adapter.
+- [X] Reduce operator configuration to demonstrated product choices.
+- [ ] Add another OTLP signal only when its backend and use are concrete.
 
 * Queries and consumers
 

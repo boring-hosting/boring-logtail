@@ -4,9 +4,9 @@
 BLT is two programs assembled from a few Rust crates. Arrows mean “depends on.”
 
 #+begin_example
-boring-logtail -> blt-model <- blt-otel -> boring-collector
-                                             /          \
-                                      blt-store      blt-emitter
+boring-logtail -> blt-model <- blt-otel
+          |                       |
+          +-- OTLP/gRPC --> boring-collector -> blt-store -> Loki
 #+end_example
 
 * =blt-model=
@@ -21,19 +21,15 @@ bounded batch and retry worker. OTLP is ingestion, not querying.
 
 * =blt-store=
 
-The collector's bounded in-memory log database. Ingestion appends immutable
-records while API readers query, clear, or follow the same shared store.
-
-* =blt-emitter=
-
-Bounded delivery actors for caught events. A slow destination can fill its own
-queue; it cannot apply network backpressure to capture.
+The small storage seam. =LogSink= accepts complete OTLP batches and =LogReader=
+opens typed retained/live reads. =LokiLogStore= implements both. The only
+in-memory implementation is private test machinery.
 
 * The binaries
 
 =boring-logtail= owns CRI-file lifecycle, partial joining, Kubernetes watches,
-and collector delivery. =boring-collector= owns retention, policy, catchers,
-emitters, and gRPC reads.
+and bounded collector delivery. =boring-collector= owns stateless OTLP ingress,
+bulk Loki delivery, health, and the trusted gRPC reader adapter.
 
 Put code with the facts or resource lifecycle it owns. Leave a moving boundary
 in its composition root until evidence earns another crate.

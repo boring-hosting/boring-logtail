@@ -29,7 +29,7 @@ pub struct CollectorExportConfig {
 impl Default for CollectorExportConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://boring-collector:4318/v1/logs".to_owned(),
+            endpoint: "http://boring-collector:4317".to_owned(),
             queue_records: 1_024,
             queue_bytes: 8 * 1024 * 1024,
             batch_records: 512,
@@ -87,7 +87,7 @@ mod tests {
     fn defaults_describe_delivery() {
         let config = Config::load(None).unwrap();
 
-        assert!(config.collector.endpoint.ends_with("/v1/logs"));
+        assert!(config.collector.endpoint.ends_with(":4317"));
     }
 
     #[test]

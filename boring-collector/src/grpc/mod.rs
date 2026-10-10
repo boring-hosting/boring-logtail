@@ -4,7 +4,7 @@ mod stream_logs;
 
 use std::{future::Future, sync::Arc};
 
-use blt_store::LogStore;
+use blt_store::LogReader;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -19,22 +19,20 @@ use proto::log_service_server::LogServiceServer;
 
 pub async fn serve(
     listener: TcpListener,
-    store: Arc<LogStore>,
+    reader: Arc<dyn LogReader>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     Server::builder()
-        .add_service(LogServiceServer::new(LogService::new(store)))
+        .add_service(LogServiceServer::new(LogService::new(reader)))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
 }
 
 #[cfg(test)]
 mod tests {
-    use blt_model::{
-        ContainerId, Enrichment, KubernetesIdentity, LogRecord, RecordIntegrity, Severity,
-        StreamFileDescriptor, WorkloadIdentity, WorkloadResolution,
-    };
-    use blt_store::StoreConfig;
+    use std::sync::Mutex;
+
+    use blt_store::{LogEntry, PortLogStream, ReadError, ReadRequest, ReadSelector};
 
     use super::{
         proto::{
@@ -44,82 +42,35 @@ mod tests {
         *,
     };
 
-    fn record(
-        namespace: &str,
-        workload_name: &str,
-        workload_uid: &str,
-        pod_name: &str,
-        body: &'static [u8],
-    ) -> LogRecord {
-        LogRecord {
-            observed_at: "2026-08-15T06:30:00.123456789Z".parse().unwrap(),
-            sampling_seed: 1,
-            stream: StreamFileDescriptor::Stdout,
-            enrichment: Enrichment::Enriched(KubernetesIdentity {
-                node: "node-1".into(),
-                namespace: namespace.into(),
-                pod_name: pod_name.into(),
-                pod_uid: format!("{pod_name}-uid"),
-                container_name: "game".into(),
-                container_id: ContainerId {
-                    runtime: "containerd".into(),
-                    id: "a".repeat(64),
-                },
-                workload: WorkloadResolution::Resolved(WorkloadIdentity {
-                    api_version: "apps/v1".into(),
-                    kind: "StatefulSet".into(),
-                    name: workload_name.into(),
-                    uid: workload_uid.into(),
-                }),
-            }),
-            first_timestamp_ns: 0,
-            last_timestamp_ns: 0,
-            first_operation_id: 0,
-            last_operation_id: 0,
-            bytes: body.into(),
-            integrity: RecordIntegrity::default(),
-            sample_percent: 100,
-            severity: Severity::Unknown,
+    #[derive(Default)]
+    struct MemoryReader {
+        requests: Mutex<Vec<ReadRequest>>,
+    }
+
+    #[tonic::async_trait]
+    impl LogReader for MemoryReader {
+        async fn stream(&self, request: ReadRequest) -> Result<PortLogStream, ReadError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(Box::pin(tokio_stream::iter([Ok(LogEntry {
+                timestamp_unix_nano: 1_234_567_890,
+                line: b"ready".to_vec(),
+                namespace: "games".into(),
+                workload_kind: "StatefulSet".into(),
+                workload: "valheim".into(),
+                pod: "valheim-0".into(),
+            })])))
         }
     }
 
     #[tokio::test]
-    async fn real_client_gets_retained_tail_then_matching_inserts() {
-        let store = Arc::new(LogStore::new(StoreConfig::default()));
-        store
-            .try_append(record(
-                "games",
-                "factorio-owner-server",
-                "workload-1",
-                "factorio-0",
-                b"old-one\n",
-            ))
-            .unwrap();
-        store
-            .try_append(record(
-                "other",
-                "noise",
-                "workload-2",
-                "noise-0",
-                b"ignore\n",
-            ))
-            .unwrap();
-        store
-            .try_append(record(
-                "games",
-                "factorio-owner-server",
-                "workload-1",
-                "factorio-1",
-                b"old-two\n",
-            ))
-            .unwrap();
-
+    async fn reader_protocol_is_stable_over_the_new_port() {
+        let reader = Arc::new(MemoryReader::default());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let server_store = Arc::clone(&store);
+        let server_reader: Arc<dyn LogReader> = reader.clone();
         let server = tokio::spawn(async move {
-            serve(listener, server_store, async move {
+            serve(listener, server_reader, async move {
                 while stopped.changed().await.is_ok() {
                     if *stopped.borrow() {
                         break;
@@ -133,60 +84,24 @@ mod tests {
             .unwrap();
         let mut stream = client
             .stream_logs(StreamLogsRequest {
-                selector: Some(ProtoSelector::Workload("factorio-owner-server".into())),
+                selector: Some(ProtoSelector::Workload("valheim".into())),
                 follow: true,
-                tail_lines: 1,
+                tail_lines: 100,
             })
             .await
             .unwrap()
             .into_inner();
 
-        let retained = stream.message().await.unwrap().unwrap();
-        assert_eq!(retained.sequence, 3);
-        assert_eq!(retained.line, b"old-two\n");
-        assert_eq!(retained.namespace, "games");
-        assert_eq!(retained.workload_kind, "StatefulSet");
-        assert_eq!(retained.workload, "factorio-owner-server");
-        assert_eq!(retained.pod, "factorio-1");
-        assert_eq!(retained.timestamp.unwrap().nanos, 123_456_789);
+        let response = stream.message().await.unwrap().unwrap();
+        assert_eq!(response.line, b"ready");
+        assert_eq!(response.sequence, 0);
+        assert_eq!(response.timestamp.unwrap().nanos, 234_567_890);
+        assert_eq!(
+            *reader.requests.lock().unwrap(),
+            vec![ReadRequest::new(ReadSelector::Workload("valheim".into()), true, 100).unwrap()]
+        );
 
-        store
-            .try_append(record(
-                "games",
-                "different",
-                "workload-3",
-                "different-0",
-                b"ignore-live\n",
-            ))
-            .unwrap();
-        store
-            .try_append(record(
-                "games",
-                "factorio-owner-server",
-                "workload-1",
-                "factorio-2",
-                b"new\xffline\n",
-            ))
-            .unwrap();
-
-        let live = stream.message().await.unwrap().unwrap();
-        assert_eq!(live.sequence, 5);
-        assert_eq!(live.line, b"new\xffline\n");
         drop(stream);
-
-        let mut finite = client
-            .stream_logs(StreamLogsRequest {
-                selector: Some(ProtoSelector::Pod("factorio-2".into())),
-                follow: false,
-                tail_lines: 1,
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(finite.message().await.unwrap().unwrap().sequence, 5);
-        assert!(finite.message().await.unwrap().is_none());
-
-        drop(finite);
         drop(client);
         stop.send(true).unwrap();
         server.await.unwrap().unwrap();

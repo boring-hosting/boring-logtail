@@ -28,18 +28,15 @@ name instead of =Pods(...).GetLogs(...)=. See
   Why: exposed port 50051 and service wiring in =../gitops=. See
   =spec/20260815-0636-collector-grpc-log-stream.org=.
 
-* TODO Add durable replay cursors only with persistence and acknowledgements
+* TODO Add durable replay cursors only when a consumer needs reconnects
 
-Why: process-local sequence numbers can make one connected replay/live handoff
-gap-free, but cannot provide exactly-once reconnects or survive agent restart.
-See =spec/20260809-1626-bounded-replay-log-store.org=.
+Why: Loki survives collector restarts, but the trusted reader still exposes no
+durable consumer cursor or exactly-once reconnect contract. See
+=spec/20261010-1014-loki-log-persistence.org=.
 
-* TODO Specify collector persistence and crash recovery
-
-Why: calling the collector a database does not make bounded RAM survive a
-restart; disk format, corruption handling, recovery, compaction, and cursor
-durability need evidence and their own contract. See
-=spec/20260813-1812-node-agent-and-cluster-collector.org=.
+* DONE Replace collector-owned persistence with Loki
+  Why: the collector is stateless; Loki owns seven-day retention and recovery.
+  See =spec/20261010-1014-loki-log-persistence.org=.
 
 * TODO Specify bounded semantic multiline framing
 
@@ -54,17 +51,6 @@ heap profile should attribute the remaining roughly 25 MiB anonymous RSS
 before further tuning. See
 =spec/20260813-1812-node-agent-and-cluster-collector.org=.
 
-* TODO Design event message capture interpolation
-
-Why: ={1}= looks tiny but needs honest missing-group, escaping, byte-to-text,
-and secret-leak semantics. Static messages ship first. See
-=spec/20260812-1405-lean-config-event-catchers.org=.
-
-* TODO Allow several destinations of one emitter kind
-
-Why: the lean key-selected configuration supports one stdout and one Discord
-destination today; do not invent nesting until a real second destination is
-needed. See =spec/20260812-1405-lean-config-event-catchers.org=.
 * DONE Replace source-oriented store controls with workload product contract
   See =spec/20260809-1905-workload-store-product-contract.org= W3-W5. Final RSS
   and full-workspace validation remains W6.

@@ -3,11 +3,11 @@
 
 A small Kubernetes log tailer. It reads node-local CRI files, adds Kubernetes
 identity, and throws bounded OTLP batches at =boring-collector=. The collector
-keeps recent history, serves gRPC readers, and catches interesting events.
+stores them in Loki and serves trusted gRPC readers from that shared history.
 
 #+begin_example
-/var/log/pods -> boring-logtail -> OTLP -> boring-collector -> store / alerts
-                 every node               once per cluster
+/var/log/pods -> boring-logtail -> OTLP/gRPC -> boring-collector -> Loki
+                 every node                  once per cluster
 #+end_example
 
 Very early. The goal is still to replace Promtail. The eBPF version was a cool
@@ -39,7 +39,7 @@ deliberately internal constants.
 
 #+begin_src yaml
 collector:
-  endpoint: http://boring-collector:4318/v1/logs
+  endpoint: http://boring-collector:4317
   queue_records: 1024
   queue_bytes: 8388608
   batch_records: 512
@@ -48,6 +48,10 @@ collector:
   retry_max_elapsed_ms: 30000
   request_timeout_ms: 10000
 #+end_src
+
+The collector receives whole OTLP batches on =4317=, writes each batch to Loki
+as one request, and keeps the existing trusted reader interface on =50051=.
+It owns no in-memory history.
 
 * Throw it at Kubernetes
 
