@@ -65,6 +65,7 @@ impl ReadRequest {
 }
 
 /// Why a complete OTLP batch was not accepted by the storage adapter.
+/// TODO: needs to be shared
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExportError {
     Retryable(String),

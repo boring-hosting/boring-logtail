@@ -22,6 +22,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["codegen", "router", "transport"] }
 tonic-prost = { workspace = true }
+tonic-reflection = "0.14.6"
 
 [build-dependencies]
 protoc-bin-vendored = "3"

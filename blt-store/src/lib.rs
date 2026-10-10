@@ -3,6 +3,7 @@
 //! Bulk log storage ports and the Loki adapter which implements them.
 
 mod loki;
+mod metrics;
 mod ports;
 
 pub use loki::{LokiConfig, LokiLogStore};
