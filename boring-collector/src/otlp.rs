@@ -88,7 +88,8 @@ pub async fn serve(
         .max_decoding_message_size(max_request_bytes);
 
     // TODO: evaluate wtf the options are.
-    let metrics_service = MetricsServiceServer::new(OtlpMetricsService {});
+    let metrics_service = MetricsServiceServer::new(OtlpMetricsService {})
+        .max_decoding_message_size(max_request_bytes);
 
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(OTLP_DESCRIPTOR_SET)
