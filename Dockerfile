@@ -40,4 +40,5 @@ ENTRYPOINT ["/usr/local/bin/boring-collector"]
 
 FROM runtime-base AS logtail
 COPY --from=builder /workspace/target/release/boring-logtail /usr/local/bin/boring-logtail
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/boring-logtail"]
