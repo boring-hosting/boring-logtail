@@ -136,5 +136,5 @@ bounded node delivery.
 - [X] LP3 Implement the Loki bulk-export and query/tail adapter.
 - [X] LP4 Move collector ingestion to OTLP/gRPC and wire both ports.
 - [X] LP5 Remove the old store/emitter machinery and reconcile documentation.
-- [ ] LP6 Publish immutable images, update GitOps, and validate live ingestion,
+- [X] LP6 Publish immutable images, update GitOps, and validate live ingestion,
   history, following, overload, and Loki-outage behavior.
