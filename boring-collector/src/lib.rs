@@ -4,12 +4,14 @@
 
 pub mod grpc;
 pub mod otlp;
+pub mod ports;
+pub mod stores;
 
 use std::{net::SocketAddr, path::Path, time::Duration};
 
 use axum::{Router, http::StatusCode, routing::get};
-use blt_store::{LokiConfig, LokiLogStore};
 use serde::Deserialize;
+use stores::{LokiConfig, LokiLogStore};
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 

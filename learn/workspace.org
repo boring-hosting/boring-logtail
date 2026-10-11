@@ -1,29 +1,23 @@
 #+title: The BLT crate map
 #+license: GFDL-1.3-or-later
 
-BLT is two programs assembled from a few Rust crates. Arrows mean “depends on.”
+BLT is two programs and two Cargo packages. OTLP/gRPC is their boundary.
 
 #+begin_example
-boring-logtail -> blt-model <- blt-otel
-          |                       |
-          +-- OTLP/gRPC --> boring-collector -> blt-store -> Loki
+boring-logtail -- OTLP/gRPC --> boring-collector --> Loki
+ node agent                         cluster service
 #+end_example
 
-* =blt-model=
+* Node agent modules
 
-Shared userspace facts: log records, integrity, Kubernetes identity, and caught
-events. It owns no watchers, queues, storage, regexes, or network clients.
+The =model/= module owns captured records and Kubernetes identity. The =otlp/=
+module maps those facts to OTLP Logs and owns bounded delivery and retry.
 
-* =blt-otel=
+* Collector modules
 
-The byte-preserving bridge between =LogRecord= and OTLP Logs, plus the node's
-bounded batch and retry worker. OTLP is ingestion, not querying.
-
-* =blt-store=
-
-The small storage seam. =LogSink= accepts complete OTLP batches and =LogReader=
-opens typed retained/live reads. =LokiLogStore= implements both. The only
-in-memory implementation is private test machinery.
+The =ports/= module owns complete OTLP writes and typed log reads. The =stores/=
+module contains the Loki production adapter and the small in-memory adapter for
+tests and local experiments.
 
 * The binaries
 

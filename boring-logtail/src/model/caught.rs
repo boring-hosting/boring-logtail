@@ -10,7 +10,7 @@ use std::{fmt, sync::Arc};
 
 use serde::Deserialize;
 
-use crate::LogRecord;
+use super::LogRecord;
 
 /// Configured meaning of an event, independent of captured stream severity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

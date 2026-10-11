@@ -2,8 +2,11 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use blt_store::{LogReader, LogSink, LokiLogStore};
-use boring_collector::{CollectorConfig, grpc, health_router, otlp};
+use boring_collector::{
+    CollectorConfig, grpc, health_router, otlp,
+    ports::{LogReader, LogSink},
+    stores::LokiLogStore,
+};
 use log::info;
 use tokio::{net::TcpListener, task::JoinSet};
 

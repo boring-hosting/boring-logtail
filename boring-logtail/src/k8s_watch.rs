@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use blt_model::{ContainerId, KubernetesIdentity, WorkloadIdentity, WorkloadResolution};
+use crate::model::{ContainerId, KubernetesIdentity, WorkloadIdentity, WorkloadResolution};
 use futures::StreamExt as _;
 use k8s_openapi::api::{
     apps::v1::ReplicaSet,

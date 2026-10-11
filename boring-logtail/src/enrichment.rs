@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use blt_model::{ContainerId, KubernetesIdentity};
+use crate::model::{ContainerId, KubernetesIdentity};
 
 #[derive(Clone, Debug, Default)]
 pub struct PodSnapshot {

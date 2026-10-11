@@ -212,60 +212,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "blt-model"
-version = "0.1.0"
-dependencies = [
- "jiff",
- "serde",
-]
-
-[[package]]
-name = "blt-otel"
-version = "0.1.0"
-dependencies = [
- "blt-model",
- "jiff",
- "opentelemetry-proto",
- "prost",
- "tokio",
- "tonic",
-]
-
-[[package]]
-name = "blt-store"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "futures-core",
- "futures-util",
- "opentelemetry-proto",
- "prost",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
-]
-
-[[package]]
 name = "boring-collector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
- "blt-store",
  "env_logger",
+ "futures-core",
+ "futures-util",
  "log",
  "opentelemetry-proto",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -277,8 +244,6 @@ name = "boring-logtail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blt-model",
- "blt-otel",
  "env_logger",
  "futures",
  "jiff",
@@ -286,11 +251,14 @@ dependencies = [
  "kube",
  "log",
  "notify",
+ "opentelemetry-proto",
+ "prost",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ stateless ingestion and typed reads; Loki owns seven-day history.
 - [X] Preserve opaque bytes and explicit integrity through OTLP.
 - [X] Replace process-local history with the Loki storage adapter.
 - [X] Reduce operator configuration to demonstrated product choices.
+- [X] Collapse single-consumer support crates into the two program packages.
 - [ ] Add another OTLP signal only when its backend and use are concrete.
 
 * Queries and consumers

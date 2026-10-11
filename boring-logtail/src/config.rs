@@ -60,7 +60,7 @@ impl Config {
     pub fn validate(&mut self) -> anyhow::Result<()> {
         self.collector.endpoint = self.collector.endpoint.trim().to_owned();
 
-        blt_otel::ExportConfig {
+        crate::otlp::ExportConfig {
             endpoint: self.collector.endpoint.clone(),
             queue_records: self.collector.queue_records,
             queue_bytes: self.collector.queue_bytes,

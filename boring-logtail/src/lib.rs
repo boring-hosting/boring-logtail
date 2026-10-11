@@ -6,3 +6,5 @@ pub mod config;
 pub mod cri;
 pub mod enrichment;
 pub mod k8s_watch;
+pub mod model;
+pub mod otlp;

@@ -9,7 +9,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::Enrichment;
+use super::Enrichment;
 
 /// Best-known meaning of the descriptor observed during capture.
 ///

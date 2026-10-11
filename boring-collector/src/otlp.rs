@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use blt_store::{ExportError, LogSink};
+use crate::ports::{ExportError, LogSink};
 use tonic_reflection::server::Builder as ReflectionBuilder;
 
 use opentelemetry_proto::tonic::{
@@ -80,11 +80,11 @@ impl LogsService for OtlpLogsService {
 
 pub async fn serve(
     listener: TcpListener,
-    sink: Arc<dyn LogSink>,
+    log_sink: Arc<dyn LogSink>,
     max_request_bytes: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
-    let service = LogsServiceServer::new(OtlpLogsService { sink })
+    let service = LogsServiceServer::new(OtlpLogsService { sink: log_sink })
         .max_decoding_message_size(max_request_bytes);
 
     // TODO: evaluate wtf the options are.

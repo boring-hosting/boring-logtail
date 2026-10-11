@@ -1,0 +1,6 @@
+#+title: Two-package workspace
+Keep only the node agent and collector packages; fold their single-consumer support crates into private modules without changing behavior.
+* TODO
+- [X] TW1 Fold =blt-model= and =blt-otel= into =boring-logtail=.
+- [X] TW2 Fold =blt-store= into =boring-collector=.
+- [X] TW3 Remove obsolete workspace configuration, update docs, and run full verification.

@@ -8,14 +8,8 @@ WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
 COPY boring-logtail/Cargo.toml ./boring-logtail/
-COPY blt-model/Cargo.toml ./blt-model/
-COPY blt-otel/Cargo.toml ./blt-otel/
-COPY blt-store/Cargo.toml ./blt-store/
 COPY boring-collector/Cargo.toml boring-collector/build.rs ./boring-collector/
 COPY boring-logtail/src ./boring-logtail/src
-COPY blt-model/src ./blt-model/src
-COPY blt-otel/src ./blt-otel/src
-COPY blt-store/src ./blt-store/src
 COPY boring-collector/proto ./boring-collector/proto
 COPY boring-collector/src ./boring-collector/src
 
