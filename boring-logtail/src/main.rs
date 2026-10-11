@@ -15,13 +15,15 @@ use std::{
 };
 
 use anyhow::Context as _;
-use blt_model::LogRecord;
-use blt_otel::{ExportConfig, ExportContext, OtlpExporter, OtlpSender, TryExportError};
 use boring_logtail::{
     config::Config,
     cri::{CriFileEvent, CriFileSet, CriJoiner, CriStream, parse_record},
     enrichment::PodSnapshot,
     k8s_watch::spawn_kubernetes_cache,
+    model::{
+        Enrichment, KubernetesIdentity, LogRecord, RecordIntegrity, Severity, StreamFileDescriptor,
+    },
+    otlp::{ExportConfig, ExportContext, OtlpExporter, OtlpSender, TryExportError},
 };
 use log::{debug, info, warn};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _, event::ModifyKind};
@@ -263,7 +265,7 @@ fn requests_reconciliation(event: &Event) -> bool {
 fn process_cri_events(
     events: Vec<CriFileEvent>,
     joiner: &mut CriJoiner,
-    identities: &StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>>,
+    identities: &StdHashMap<String, StdHashMap<String, KubernetesIdentity>>,
     exporter: &OtlpSender,
     ingress_drops: &mut StdHashMap<TryExportError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
@@ -295,25 +297,25 @@ fn process_cri_events(
             continue;
         };
         let stream = match record.stream {
-            CriStream::Stdout => blt_model::StreamFileDescriptor::RuntimeStdout,
-            CriStream::Stderr => blt_model::StreamFileDescriptor::RuntimeStderr,
+            CriStream::Stdout => StreamFileDescriptor::RuntimeStdout,
+            CriStream::Stderr => StreamFileDescriptor::RuntimeStderr,
         };
         let log_record = LogRecord::new(
             record.timestamp,
             cri_sampling_seed(&record.source),
             stream,
-            blt_model::Enrichment::Enriched(identity),
+            Enrichment::Enriched(identity),
             0,
             0,
             0,
             0,
             record.bytes,
-            blt_model::RecordIntegrity {
+            RecordIntegrity {
                 capture_truncated: record.truncated,
                 ..Default::default()
             },
             100,
-            blt_model::Severity::Unknown,
+            Severity::Unknown,
         );
         publish_record(&log_record, exporter, ingress_drops, integrity_totals);
     }
@@ -323,9 +325,8 @@ fn process_cri_events(
 
 fn cri_identity_index(
     snapshot: &PodSnapshot,
-) -> StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>> {
-    let mut index: StdHashMap<String, StdHashMap<String, blt_model::KubernetesIdentity>> =
-        StdHashMap::new();
+) -> StdHashMap<String, StdHashMap<String, KubernetesIdentity>> {
+    let mut index: StdHashMap<String, StdHashMap<String, KubernetesIdentity>> = StdHashMap::new();
     for identity in snapshot.identities.values().flatten() {
         index
             .entry(identity.pod_uid.clone())

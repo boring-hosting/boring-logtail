@@ -2,14 +2,14 @@
 
 //! The explicit boundary between BLT's loss-aware records and OTLP Logs.
 //!
-//! Plain version: [`blt_model::LogRecord`] describes what the node agent
-//! captured. OTLP describes how that fact travels to the collector. This crate
+//! Plain version: [`crate::model::LogRecord`] describes what the node agent
+//! captured. OTLP describes how that fact travels to the collector. This module
 //! performs that translation without teaching the model about protobuf or
 //! silently reinterpreting kernel monotonic timestamps as wall-clock time.
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
-use blt_model::{
+use crate::model::{
     ContainerId, Enrichment, KubernetesIdentity, LogRecord as BltLogRecord, RecordIntegrity,
     Severity, StreamFileDescriptor, WorkloadIdentity, WorkloadResolution,
 };
@@ -522,7 +522,7 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
-    use blt_model::{ContainerId, RecordIntegrity, StreamFileDescriptor, WorkloadIdentity};
+    use crate::model::{ContainerId, RecordIntegrity, StreamFileDescriptor, WorkloadIdentity};
 
     use super::*;
 

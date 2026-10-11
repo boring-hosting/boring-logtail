@@ -22,7 +22,7 @@ use tokio::{sync::Semaphore, task::JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage};
 
-use crate::{
+use crate::ports::{
     ExportError, LogEntry, LogReader, LogSink, PortLogStream, ReadError, ReadRequest, ReadSelector,
 };
 

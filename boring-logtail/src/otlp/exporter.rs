@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use blt_model::LogRecord;
+use crate::model::LogRecord;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_client::LogsServiceClient,
 };
@@ -22,7 +22,7 @@ use tokio::{
 };
 use tonic::{Code, Request, transport::Endpoint};
 
-use crate::{ExportContext, encoded_len, export_request};
+use super::{ExportContext, encoded_len, export_request};
 
 #[derive(Clone, Debug)]
 pub struct ExportConfig {

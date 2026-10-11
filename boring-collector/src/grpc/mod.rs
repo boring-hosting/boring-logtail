@@ -4,7 +4,7 @@ mod stream_logs;
 
 use std::{future::Future, sync::Arc};
 
-use blt_store::LogReader;
+use crate::ports::LogReader;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -32,7 +32,7 @@ pub async fn serve(
 mod tests {
     use std::sync::Mutex;
 
-    use blt_store::{LogEntry, PortLogStream, ReadError, ReadRequest, ReadSelector};
+    use crate::ports::{LogEntry, PortLogStream, ReadError, ReadRequest, ReadSelector};
 
     use super::{
         proto::{

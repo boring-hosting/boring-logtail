@@ -1,0 +1,4 @@
+#+title: OTLP gRPC reflection
+Expose OTLP Logs and Metrics descriptors through Tonic reflection on =:4317= so =grpcurl= works without local proto files.
+* TODO
+- [X] R1 Generate/register the descriptor set and verify service discovery plus a Metrics export.

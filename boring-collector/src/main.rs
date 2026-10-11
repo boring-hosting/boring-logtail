@@ -2,8 +2,11 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use blt_store::{LogReader, LogSink, LokiLogStore};
-use boring_collector::{CollectorConfig, grpc, health_router, otlp};
+use boring_collector::{
+    CollectorConfig, grpc, health_router, otlp,
+    ports::{LogReader, LogSink},
+    stores::LokiLogStore,
+};
 use log::info;
 use tokio::{net::TcpListener, task::JoinSet};
 
@@ -14,11 +17,13 @@ async fn main() -> anyhow::Result<()> {
     let path = std::env::var_os("BORING_COLLECTOR_CONFIG").map(PathBuf::from);
     let config = CollectorConfig::load(path.as_deref())?;
     let store = Arc::new(LokiLogStore::new(config.loki_config()).map_err(anyhow::Error::msg)?);
-    let sink: Arc<dyn LogSink> = store.clone();
+    let log_sink: Arc<dyn LogSink> = store.clone();
     let reader: Arc<dyn LogReader> = store;
     let otlp_listener = TcpListener::bind(config.otlp_grpc_listen).await?;
+
     let reader_listener = TcpListener::bind(config.reader_grpc_listen).await?;
     let health_listener = TcpListener::bind(config.health_listen).await?;
+
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut tasks = JoinSet::new();
 
@@ -27,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(async move {
         otlp::serve(
             otlp_listener,
-            sink,
+            log_sink,
             config.max_request_bytes,
             wait_for_stop(otlp_stopped),
         )

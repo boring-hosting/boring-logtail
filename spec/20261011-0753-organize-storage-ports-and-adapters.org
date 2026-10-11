@@ -1,0 +1,4 @@
+#+title: Organize storage ports and adapters
+Group log/metrics contracts under =ports/= and concrete Loki/in-memory adapters under =stores/= without changing behavior.
+* TODO
+- [X] SO1 Move modules, promote the reusable in-memory log store, preserve public imports, and run workspace checks.

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use blt_store::{LogEntry, LogReader, ReadError, ReadRequest, ReadSelector};
+use crate::ports::{LogEntry, LogReader, ReadError, ReadRequest, ReadSelector};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};

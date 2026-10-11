@@ -5,16 +5,10 @@ resolver = "2"
 members = [
     "boring-logtail",
     "boring-collector",
-    "blt-model",
-    "blt-otel",
-    "blt-store",
 ]
 default-members = [
     "boring-logtail",
     "boring-collector",
-    "blt-model",
-    "blt-otel",
-    "blt-store",
 ]
 
 [workspace.package]
@@ -24,14 +18,9 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = { version = "1", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-cargo_metadata = { version = "0.23.0", default-features = false }
-# `std` feature is currently required to build `clap`.
-#
-# See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
-clap = { version = "4.5.20", default-features = false, features = ["std"] }
 env_logger = { version = "0.11.5", default-features = false }
 log = { version = "0.4.22", default-features = false }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic", "logs"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic", "logs", "metrics"] }
 prost = { version = "0.14", default-features = false }
 prost-types = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
