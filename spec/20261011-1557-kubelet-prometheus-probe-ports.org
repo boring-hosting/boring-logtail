@@ -1,0 +1,50 @@
+#+title: Kubelet to Prometheus probe ports
+#+date: 2026-10-11 15:57 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-11.
+
+* Context
+
+=boring-probe= will read node, Pod, and container resource statistics through
+one adapter and push the resulting snapshot through another. This slice only
+establishes application-owned boundaries and data; kubelet and Prometheus are
+adapter choices, not port vocabulary.
+
+#+begin_example
+kubelet adapter -> StatsSource -> StatsSnapshot -> MetricsSink -> Prometheus adapter
+#+end_example
+
+* Decision
+
+Add two object-safe async ports under =boring-probe/src/ports/=:
+
+- =StatsSource= returns one =StatsSnapshot= in application vocabulary.
+- =MetricsSink= accepts that snapshot directly.
+
+Model only node, Pod, and container CPU and memory fields needed by the first
+probe. Optional measurements stay optional; the model does not invent zero
+values. Keep timestamps as =SystemTime= and resource identity as owned strings.
+
+Do not add HTTP clients, protobuf encoding, retries, queues, configuration,
+reconciliation, or runtime wiring in this slice.
+
+* Consequences
+
+- Kubelet JSON and Prometheus transport details remain in future adapters.
+- The application reconciler moves one domain snapshot between its ports.
+- Remote Write 1.0 is selected by
+  =20261011-1637-kubelet-prometheus-adapters.org=.
+
+* Acceptance
+
+- Both ports are object-safe, asynchronous, and independent of adapter types.
+- =StatsSnapshot= preserves missing CPU and memory measurements.
+- =MetricsSink::push= accepts =StatsSnapshot= without transport-shaped types.
+- The new library surface builds without changing probe runtime behavior.
+
+* TODO
+
+- [X] KP1 Add the two port traits, their owned data types, and compile checks.

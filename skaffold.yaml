@@ -17,6 +17,11 @@ build:
       docker:
         dockerfile: Dockerfile
         target: collector
+    - image: ghcr.io/boring-hosting/boring-probe
+      context: .
+      docker:
+        dockerfile: Dockerfile
+        target: probe
   local:
     useBuildkit: false
     push: true

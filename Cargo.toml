@@ -5,10 +5,12 @@ resolver = "2"
 members = [
     "boring-logtail",
     "boring-collector",
+    "boring-probe",
 ]
 default-members = [
     "boring-logtail",
     "boring-collector",
+    "boring-probe",
 ]
 
 [workspace.package]

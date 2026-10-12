@@ -29,6 +29,22 @@ data:
       handoff_buffer: 1024
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boring-probe
+  namespace: boring-logtail-dev
+data:
+  config.yaml: |
+    runtime:
+      interval: 15s
+    kubelet:
+      endpoint: https://{node_name}:10250/stats/summary
+      timeout: 5s
+    prometheus:
+      endpoint: http://prometheus-server.observability.svc.cluster.local/api/v1/write
+      timeout: 5s
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: boring-collector
@@ -225,3 +241,97 @@ spec:
         - name: config
           configMap:
             name: boring-logtail
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: boring-probe
+  namespace: boring-logtail-dev
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: boring-probe-dev-node-stats-reader
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/stats
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: boring-probe-dev-node-stats-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: boring-probe-dev-node-stats-reader
+subjects:
+  - kind: ServiceAccount
+    name: boring-probe
+    namespace: boring-logtail-dev
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: boring-probe
+  namespace: boring-logtail-dev
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: boring-probe
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: boring-probe
+        app.kubernetes.io/component: probe
+        app.kubernetes.io/part-of: boring-logtail
+    spec:
+      imagePullSecrets:
+        - name: web-app-registry-pull-secret
+      serviceAccountName: boring-probe
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: boring-probe
+          image: ghcr.io/boring-hosting/boring-probe:dev
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: BORING_PROBE_CONFIG
+              value: /etc/boring-probe/config.yaml
+            - name: BORING_PROBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 10m
+              memory: 24Mi
+            limits:
+              cpu: 100m
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/boring-probe
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: boring-probe

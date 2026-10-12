@@ -9,11 +9,13 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY boring-logtail/Cargo.toml ./boring-logtail/
 COPY boring-collector/Cargo.toml boring-collector/build.rs ./boring-collector/
+COPY boring-probe/Cargo.toml ./boring-probe/
 COPY boring-logtail/src ./boring-logtail/src
 COPY boring-collector/proto ./boring-collector/proto
 COPY boring-collector/src ./boring-collector/src
+COPY boring-probe/src ./boring-probe/src
 
-RUN cargo build --locked --package boring-logtail --package boring-collector --release
+RUN cargo build --locked --package boring-logtail --package boring-collector --package boring-probe --release
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
 
@@ -36,3 +38,8 @@ FROM runtime-base AS logtail
 COPY --from=builder /workspace/target/release/boring-logtail /usr/local/bin/boring-logtail
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/boring-logtail"]
+
+FROM runtime-base AS probe
+COPY --from=builder /workspace/target/release/boring-probe /usr/local/bin/boring-probe
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/boring-probe"]

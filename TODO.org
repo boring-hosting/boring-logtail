@@ -5,6 +5,12 @@ This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
 =spec/=.
 
+* DONE Choose the Prometheus ingestion protocol for boring-probe
+
+Remote Write 1.0 is the concrete sink protocol; the application port still
+owns only =StatsSnapshot=. See
+=spec/20261011-1637-kubelet-prometheus-adapters.org=.
+
 * TODO Give Kubernetes watcher tasks explicit application ownership
 
 Why: process exit currently tears down the detached tasks, but explicit handles

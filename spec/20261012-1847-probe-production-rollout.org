@@ -1,0 +1,119 @@
+#+title: Production rollout for boring-probe
+#+date: 2026-10-12 18:47 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-12.
+
+* Context
+
+=boring-probe= can translate kubelet Summary API snapshots into Prometheus
+Remote Write 1.0, but it is not yet an image or a Kubernetes workload.
+Production has two K3s nodes, Loki and Grafana, but no Prometheus. Node names
+resolve from the existing agent Pods and the Summary API is live. The current
+logtail service account cannot read =nodes/stats=, as intended.
+
+One shared DaemonSet ConfigMap cannot contain a different literal kubelet URL
+for each node. The Pod already knows =spec.nodeName= through the Downward API,
+so deployment configuration needs one small, explicit substitution boundary.
+
+#+begin_example
+kubelet on each node -> boring-probe DaemonSet -> Prometheus -> Grafana
+                            {node_name}          remote write
+#+end_example
+
+* Decision
+
+Productionize the existing probe as a third binary and image beside logtail
+and collector.
+
+At the composition root, replace exactly one ={node_name}= token in the
+configured kubelet endpoint with =BORING_PROBE_NODE_NAME= before configuration
+validation. Reject a missing environment value when the token is present and
+do not implement general environment or shell expansion. The production
+ConfigMap uses
+=https://{node_name}:10250/stats/summary=; the DaemonSet supplies
+=spec.nodeName=. Keep the existing mounted service-account CA and rotating
+token behavior.
+
+The reconcile loop runs immediately and then at the configured interval. A
+failed read or write is logged and the next interval remains live; shutdown is
+still graceful. Remove the false =reconcile unimplemented= error emitted after
+a successful push.
+
+Add a =probe= Docker target, CI build, immutable GHCR publication, and Skaffold
+artifact. All three images remain built from one commit. Do not publish mutable
+production tags.
+
+Deploy a small Prometheus Helm release in =boring-infra=, pinned to chart
+=prometheus= =29.36.1= from the Prometheus Community repository. Enable the
+remote-write receiver, disable Alertmanager, Pushgateway, node-exporter, and
+kube-state-metrics, retain seven days on one retained 10 GiB
+=hcloud-volumes= claim, and expose it only as ClusterIP. Scrape Prometheus
+itself. Discover only Service endpoints explicitly annotated with
+=prometheus.io/scrape: "true"=; do not also discover Pod targets. Give the
+Prometheus service account only the Service, EndpointSlice, and Pod reads that
+EndpointSlice discovery needs. Add Prometheus as a second, non-default Grafana
+data source.
+
+Deploy =boring-probe= in =boring-logtail-agent= as a non-root, read-only
+DaemonSet with its own service account and only =get= on =nodes/stats=. Mount a
+strict ConfigMap at =/etc/boring-probe/config.yaml= and use the existing agent
+registry secret. Start with a 15 second interval and conservative requests and
+limits. Do not add =hostNetwork=, host mounts, broad node access, retries,
+queues, or public Prometheus routing.
+
+Roll out by immutable digest through Flux. Bump collector and logtail to images
+from the same source commit as probe so the deployed trio is reproducible.
+
+* Consequences
+
+- A transient kubelet or Prometheus failure loses one snapshot but does not
+  kill the node probe.
+- Prometheus is a single retained instance; high availability and long-term
+  metrics storage remain out of scope for this first cluster test.
+- The Summary API remains the only metrics capture boundary. Prometheus does
+  not also scrape kubelets or install another node collector. Applications can
+  independently opt their own =/metrics= endpoint into collection at the
+  Service boundary.
+- Adding a node requires no ConfigMap edit if its Kubernetes node name resolves
+  from the agent namespace and its kubelet certificate accepts that name.
+
+* Acceptance
+
+- Formatting, workspace tests, strict Clippy, and all three image builds pass.
+- CI and publication matrices contain collector, logtail, and probe.
+- Rendered GitOps YAML contains the Prometheus release, Grafana data source,
+  narrow EndpointSlice discovery RBAC, probe ConfigMap, dedicated probe RBAC,
+  and one probe Pod per node.
+- The probe service account can =get nodes/stats= and has no wider node verbs.
+- Both probe Pods stay ready across multiple intervals and log successful
+  reconciliation without the placeholder error.
+- Prometheus accepts Remote Write samples for both nodes, and Grafana can query
+  =k8s_node_cpu_usage_cores=.
+- Prometheus reports its own =up= series and discovers an annotated test
+  Service without enabling direct Pod, kubelet, or cAdvisor jobs.
+- Collector-to-Loki ingestion remains healthy after the coordinated image bump.
+
+* TODO
+
+- [X] PR1 Harden probe configuration and reconciliation; add focused tests.
+- [X] PR2 Add the probe image to Docker, CI, publication, and Skaffold.
+- [X] PR3 Add Prometheus, its Grafana data source, and retained storage to GitOps.
+- [X] PR4 Add the probe ConfigMap, DaemonSet, service account, and narrow RBAC.
+- [X] PR5 Pass local checks and render/inspect all deployment YAML.
+- [ ] PR6 Publish immutable images, pin all three digests, and validate the live rollout.
+
+* Validation
+
+- =cargo test --workspace --locked=: passed, including loopback transport tests.
+- =cargo clippy --workspace --all-targets --locked -- -D warnings=: passed.
+- =cargo build --workspace --release --locked=: passed.
+- Collector, logtail, and probe Docker targets built as non-root arm64 images.
+- Prometheus chart =29.36.1= rendered only self and annotated Service endpoint
+  scrape jobs, with the Remote Write receiver and retained 10 GiB claim.
+- Observability and telemetry Kustomize builds passed. Kubernetes server-side
+  dry-run accepted all new resources; direct validation of encrypted registry
+  Secrets stops at their expected SOPS envelope because Flux decrypts them
+  before apply.

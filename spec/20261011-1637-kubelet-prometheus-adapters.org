@@ -1,0 +1,70 @@
+#+title: Configured kubelet and Prometheus adapters
+#+date: 2026-10-11 16:37 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-11.
+
+* Context
+
+The probe owns =StatsSource -> StatsSnapshot -> MetricsSink=. It now needs one
+concrete adapter on each side. Deployment choices belong in YAML; Kubernetes
+service-account credential paths and Prometheus wire rules do not.
+
+#+begin_src yaml
+runtime:
+  interval: 15s
+
+kubelet:
+  endpoint: https://node-name:10250/stats/summary
+  timeout: 5s
+
+prometheus:
+  endpoint: http://prometheus:9090/api/v1/write
+  timeout: 5s
+#+end_src
+
+* Decision
+
+Add a strict Serde configuration model for exactly the YAML above. Human-time
+durations must be non-zero and unknown keys fail. The composition root owns
+YAML/file loading; the model owns only deserialization shape and validation.
+
+The kubelet adapter reads the conventional mounted service-account CA and token,
+performs one authenticated GET against the configured endpoint, and translates
+the kubelet Summary JSON into =StatsSnapshot=. It reads the token for every
+request so projected-token rotation is observed. Missing measurements remain
+missing.
+
+The Prometheus adapter translates one snapshot into Prometheus Remote Write
+1.0 series, Snappy-compresses the protobuf request, and POSTs it to the exact
+configured endpoint. Each present CPU or memory value produces one sample.
+Use node, namespace, Pod UID/name, and container name labels as applicable.
+There is no adapter-owned queue, retry loop, batching actor, or configuration
+polymorphism.
+
+Do not wire the adapters into =main= in this slice.
+
+* Consequences
+
+- The Prometheus receiver must accept Remote Write 1.0 at the configured URL.
+- Retry and reconciliation policy remain application concerns.
+- Remote-write stale markers and removed-series tracking remain deferred until
+  live behavior demonstrates that requirement.
+
+* Acceptance
+
+- The exact YAML parses and invalid/unknown/zero-valued configuration fails.
+- A kubelet fixture maps node, Pod, and container CPU/memory into the domain.
+- A domain snapshot maps to sorted, valid Remote Write series and preserves
+  measurement timestamps in Unix milliseconds.
+- Adapter transport errors use the existing port error types.
+- Probe library formatting, tests, and strict Clippy pass.
+
+* TODO
+
+- [X] KA1 Add the strict YAML configuration model.
+- [X] KA2 Add the kubelet Summary API adapter and fixture mapping.
+- [X] KA3 Add the Prometheus Remote Write 1.0 adapter and mapping tests.
+- [X] KA4 Reconcile documentation and pass focused checks.
