@@ -279,7 +279,7 @@ impl CriJoiner {
     pub fn pending_bytes(&self) -> usize {
         self.partials
             .values()
-            .map(|pending| pending.bytes.capacity())
+            .map(|pending| pending.bytes.len())
             .sum()
     }
 }
@@ -414,7 +414,7 @@ impl CriFileSet {
             pending_bytes: self
                 .files
                 .values()
-                .map(|tracked| tracked.pending.capacity())
+                .map(|tracked| tracked.pending.len())
                 .sum(),
         }
     }
@@ -621,12 +621,14 @@ mod tests {
         let final_part = parse_record(b"2026-08-15T17:03:01Z stdout F json\n").unwrap();
 
         assert_eq!(joiner.accept(source("server"), first).unwrap(), None);
+        assert_eq!(joiner.pending_bytes(), b"pretty ".len());
         let record = joiner
             .accept(source("server"), final_part)
             .unwrap()
             .unwrap();
 
         assert_eq!(&*record.bytes, b"pretty json\n");
+        assert_eq!(joiner.pending_bytes(), 0);
         assert_eq!(record.timestamp.to_string(), "2026-08-15T17:03:00Z");
         assert!(!record.truncated);
     }

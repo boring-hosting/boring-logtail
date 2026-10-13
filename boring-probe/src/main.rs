@@ -5,6 +5,7 @@ use boring_probe::{
     adapters::{KubeletStatsAdapter, PrometheusRemoteWriteAdapter},
     config::Config,
     ports::{MetricsSink, StatsSource},
+    runtime_metrics::RuntimeMetrics,
 };
 use log::{error, info};
 use tokio::{
@@ -34,19 +35,43 @@ async fn main() -> anyhow::Result<()> {
     let kubelet = KubeletStatsAdapter::new(&config.kubelet)?;
     let prometheus = PrometheusRemoteWriteAdapter::new(&config.prometheus);
 
-    let (task, shutdown) = run(config.runtime.interval, kubelet, prometheus).await?;
+    let metrics = RuntimeMetrics::new();
+    let listener = tokio::net::TcpListener::bind(config.http_listen)
+        .await
+        .with_context(|| format!("bind runtime HTTP listener {}", config.http_listen))?;
+    let (task, shutdown) = run_observed(
+        config.runtime.interval,
+        kubelet,
+        prometheus,
+        metrics.clone(),
+    )
+    .await?;
+    let (http_shutdown, http_stopped) = oneshot::channel();
+    let router = metrics.router();
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = http_stopped.await;
+            })
+            .await
+    });
+    metrics.set_ready(true);
 
     info!("capture is live; waiting for a shutdown signal");
 
     shutdown_signal().await?;
     info!("shutting down");
 
+    metrics.set_ready(false);
     let _ = shutdown.send(());
     task.await?;
+    let _ = http_shutdown.send(());
+    http_task.await??;
 
     Ok(())
 }
 
+#[cfg(test)]
 async fn run<S, P>(
     interval: Duration,
     stats_source: S,
@@ -56,10 +81,32 @@ where
     S: StatsSource + 'static,
     P: MetricsSink + 'static,
 {
+    run_observed(interval, stats_source, metrics_sink, RuntimeMetrics::new()).await
+}
+
+async fn run_observed<S, P>(
+    interval: Duration,
+    stats_source: S,
+    metrics_sink: P,
+    metrics: RuntimeMetrics,
+) -> Result<(JoinHandle<()>, oneshot::Sender<()>)>
+where
+    S: StatsSource + 'static,
+    P: MetricsSink + 'static,
+{
     let (shutdown, mut shutdown_receiver) = oneshot::channel();
     let mut reconcile_tick = tokio::time::interval(interval);
 
     let task = tokio::spawn(async move {
+        struct CriticalTask(RuntimeMetrics, bool);
+        impl Drop for CriticalTask {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.critical_task_stopped();
+                }
+            }
+        }
+        let mut critical_task = CriticalTask(metrics.clone(), true);
         info!("running application");
 
         loop {
@@ -68,23 +115,47 @@ where
                     break;
                 }
                 _ = reconcile_tick.tick() => {
-                    if let Err(err) = reconcile(&stats_source, &metrics_sink).await {
+                    if let Err(err) = reconcile(&stats_source, &metrics_sink, &metrics).await {
                         error!("failed to reconcile: {err}");
                     }
                 }
             }
         }
 
+        critical_task.1 = false;
         info!("application stopped");
     });
 
     Ok((task, shutdown))
 }
 
-async fn reconcile<T: StatsSource, P: MetricsSink>(kubelet: &T, prom: &P) -> anyhow::Result<()> {
-    let snapshot = kubelet.snapshot().await?;
+async fn reconcile<T: StatsSource, P: MetricsSink>(
+    kubelet: &T,
+    prom: &P,
+    metrics: &RuntimeMetrics,
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let snapshot = match kubelet.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            metrics.read_duration(started.elapsed().as_secs_f64());
+            metrics.result("read_error");
+            return Err(error.into());
+        }
+    };
+    metrics.read_duration(started.elapsed().as_secs_f64());
+    let pods = snapshot.pods.len();
+    let containers = snapshot.pods.iter().map(|pod| pod.containers.len()).sum();
+    metrics.snapshot(pods, containers);
 
-    prom.push(snapshot).await?;
+    let started = std::time::Instant::now();
+    if let Err(error) = prom.push(snapshot).await {
+        metrics.push_duration(started.elapsed().as_secs_f64());
+        metrics.result("push_error");
+        return Err(error.into());
+    }
+    metrics.push_duration(started.elapsed().as_secs_f64());
+    metrics.successful();
 
     info!("snapshot pushed");
     Ok(())

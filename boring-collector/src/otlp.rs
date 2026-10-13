@@ -2,7 +2,10 @@
 
 use std::{future::Future, sync::Arc};
 
-use crate::ports::{ExportError, LogSink};
+use crate::{
+    ports::{ExportError, LogSink},
+    runtime_metrics::RuntimeMetrics,
+};
 use tonic_reflection::server::Builder as ReflectionBuilder;
 
 use opentelemetry_proto::tonic::{
@@ -27,6 +30,7 @@ const OTLP_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("otlp_des
 #[derive(Clone)]
 struct OtlpLogsService {
     sink: Arc<dyn LogSink>,
+    metrics: RuntimeMetrics,
 }
 
 #[derive(Clone)]
@@ -70,11 +74,28 @@ impl LogsService for OtlpLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        self.sink
-            .export(request.into_inner())
-            .await
-            .map(Response::new)
-            .map_err(export_status)
+        let request = request.into_inner();
+        let records = request
+            .resource_logs
+            .iter()
+            .flat_map(|resource| &resource.scope_logs)
+            .map(|scope| scope.log_records.len())
+            .sum();
+        match self.sink.export(request).await {
+            Ok(response) => {
+                self.metrics.otlp_result("accepted", records);
+                Ok(Response::new(response))
+            }
+            Err(error) => {
+                let result = if error.is_retryable() {
+                    "retryable"
+                } else {
+                    "rejected"
+                };
+                self.metrics.otlp_result(result, records);
+                Err(export_status(error))
+            }
+        }
     }
 }
 
@@ -84,8 +105,28 @@ pub async fn serve(
     max_request_bytes: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
-    let service = LogsServiceServer::new(OtlpLogsService { sink: log_sink })
-        .max_decoding_message_size(max_request_bytes);
+    serve_observed(
+        listener,
+        log_sink,
+        max_request_bytes,
+        RuntimeMetrics::new(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_observed(
+    listener: TcpListener,
+    log_sink: Arc<dyn LogSink>,
+    max_request_bytes: usize,
+    metrics: RuntimeMetrics,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), tonic::transport::Error> {
+    let service = LogsServiceServer::new(OtlpLogsService {
+        sink: log_sink,
+        metrics,
+    })
+    .max_decoding_message_size(max_request_bytes);
 
     // TODO: evaluate wtf the options are.
     let metrics_service = MetricsServiceServer::new(OtlpMetricsService {})

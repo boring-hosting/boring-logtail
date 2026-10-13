@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::model::LogRecord;
+use crate::{model::LogRecord, runtime_metrics::RuntimeMetrics};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse, logs_service_client::LogsServiceClient,
 };
@@ -109,6 +109,13 @@ struct Item {
     request: ExportLogsServiceRequest,
     bytes: usize,
     _permit: OwnedSemaphorePermit,
+    metrics: RuntimeMetrics,
+}
+
+impl Drop for Item {
+    fn drop(&mut self) {
+        self.metrics.queue_remove(1, self.bytes);
+    }
 }
 
 #[derive(Clone)]
@@ -118,6 +125,7 @@ pub struct OtlpSender {
     max_bytes: usize,
     context: Arc<ExportContext>,
     stats: Arc<AtomicStats>,
+    metrics: RuntimeMetrics,
 }
 
 impl OtlpSender {
@@ -141,11 +149,14 @@ impl OtlpSender {
                 TryExportError::QueueByteLimit
             })?;
 
+        self.metrics.queue_add(1, bytes);
+
         self.sender
             .try_send(Item {
                 request,
                 bytes,
                 _permit: permit,
+                metrics: self.metrics.clone(),
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
@@ -157,7 +168,6 @@ impl OtlpSender {
             })?;
 
         self.stats.queued_records.fetch_add(1, Ordering::Relaxed);
-
         Ok(())
     }
 
@@ -182,6 +192,14 @@ pub struct OtlpExporter {
 
 impl OtlpExporter {
     pub fn spawn(config: ExportConfig, context: ExportContext) -> Self {
+        Self::spawn_observed(config, context, RuntimeMetrics::new())
+    }
+
+    pub fn spawn_observed(
+        config: ExportConfig,
+        context: ExportContext,
+        metrics: RuntimeMetrics,
+    ) -> Self {
         config
             .validate()
             .expect("invalid OTLP export configuration");
@@ -198,9 +216,10 @@ impl OtlpExporter {
             max_bytes: config.queue_bytes,
             context: Arc::new(context),
             stats: stats.clone(),
+            metrics: metrics.clone(),
         };
 
-        let task = tokio::spawn(run(config, receiver, stats));
+        let task = tokio::spawn(run(config, receiver, stats, metrics));
 
         Self {
             sender: Some(sender),
@@ -230,7 +249,12 @@ impl OtlpExporter {
     }
 }
 
-async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Arc<AtomicStats>) {
+async fn run(
+    config: ExportConfig,
+    mut receiver: mpsc::Receiver<Item>,
+    stats: Arc<AtomicStats>,
+    metrics: RuntimeMetrics,
+) {
     let channel = Endpoint::from_shared(config.endpoint.clone())
         .expect("validated OTLP endpoint")
         .timeout(config.request_timeout)
@@ -253,19 +277,19 @@ async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Ar
                     && (batch.len() == config.batch_records
                         || batch_bytes.saturating_add(item.bytes) > config.batch_bytes)
                 {
-                    flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
+                    flush(&mut client, &config, &stats, &metrics, std::mem::take(&mut batch)).await;
                     batch_bytes = 0;
                 }
                 batch_bytes += item.bytes;
                 batch.push(item);
                 if batch.len() == config.batch_records || batch_bytes >= config.batch_bytes {
-                    flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
+                    flush(&mut client, &config, &stats, &metrics, std::mem::take(&mut batch)).await;
                     batch_bytes = 0;
                 }
                 timer.as_mut().reset(Instant::now() + config.flush_interval);
             }
             () = &mut timer, if !batch.is_empty() => {
-                flush(&mut client, &config, &stats, std::mem::take(&mut batch)).await;
+                flush(&mut client, &config, &stats, &metrics, std::mem::take(&mut batch)).await;
                 batch_bytes = 0;
                 timer.as_mut().reset(Instant::now() + config.flush_interval);
             }
@@ -273,7 +297,7 @@ async fn run(config: ExportConfig, mut receiver: mpsc::Receiver<Item>, stats: Ar
     }
 
     if !batch.is_empty() {
-        flush(&mut client, &config, &stats, batch).await;
+        flush(&mut client, &config, &stats, &metrics, batch).await;
     }
 }
 
@@ -281,6 +305,7 @@ async fn flush(
     client: &mut LogsServiceClient<tonic::transport::Channel>,
     config: &ExportConfig,
     stats: &AtomicStats,
+    metrics: &RuntimeMetrics,
     items: Vec<Item>,
 ) {
     let record_count = items.len() as u64;
@@ -309,10 +334,16 @@ async fn flush(
                     .rejected_records
                     .fetch_add(rejected, Ordering::Relaxed);
 
+                metrics.exported(record_count - rejected.min(record_count));
+                metrics.observe_export(started.elapsed().as_secs_f64());
+
                 return;
             }
             SendResult::PermanentFailure => {
                 stats.failed_batches.fetch_add(1, Ordering::Relaxed);
+
+                metrics.export_failure();
+                metrics.observe_export(started.elapsed().as_secs_f64());
 
                 return;
             }
@@ -320,10 +351,14 @@ async fn flush(
                 if started.elapsed().saturating_add(delay) > config.retry_max_elapsed {
                     stats.failed_batches.fetch_add(1, Ordering::Relaxed);
 
+                    metrics.export_failure();
+                    metrics.observe_export(started.elapsed().as_secs_f64());
+
                     return;
                 }
 
                 stats.retries.fetch_add(1, Ordering::Relaxed);
+                metrics.export_retry();
 
                 tokio::time::sleep(delay).await;
 

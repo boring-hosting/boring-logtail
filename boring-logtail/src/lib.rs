@@ -8,3 +8,4 @@ pub mod enrichment;
 pub mod k8s_watch;
 pub mod model;
 pub mod otlp;
+pub mod runtime_metrics;

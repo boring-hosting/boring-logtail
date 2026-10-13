@@ -5,11 +5,11 @@
 pub mod grpc;
 pub mod otlp;
 pub mod ports;
+pub mod runtime_metrics;
 pub mod stores;
 
 use std::{net::SocketAddr, path::Path, time::Duration};
 
-use axum::{Router, http::StatusCode, routing::get};
 use serde::Deserialize;
 use stores::{LokiConfig, LokiLogStore};
 
@@ -84,10 +84,6 @@ impl Default for LokiStoreConfig {
             handoff_buffer: 1_024,
         }
     }
-}
-
-pub fn health_router() -> Router {
-    Router::new().route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
 }
 
 #[cfg(test)]

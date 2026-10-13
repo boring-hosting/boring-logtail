@@ -24,6 +24,7 @@ use boring_logtail::{
         Enrichment, KubernetesIdentity, LogRecord, RecordIntegrity, Severity, StreamFileDescriptor,
     },
     otlp::{ExportConfig, ExportContext, OtlpExporter, OtlpSender, TryExportError},
+    runtime_metrics::RuntimeMetrics,
 };
 use log::{debug, info, warn};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _, event::ModifyKind};
@@ -39,6 +40,9 @@ struct LogTailApplication {
     event_task: Option<JoinHandle<anyhow::Result<()>>>,
     event_shutdown: Option<oneshot::Sender<()>>,
     exporter: Option<OtlpExporter>,
+    http_task: Option<JoinHandle<std::io::Result<()>>>,
+    http_shutdown: Option<oneshot::Sender<()>>,
+    metrics: RuntimeMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -89,14 +93,35 @@ impl LogTailApplication {
             config.collector.endpoint,
         );
 
-        let exporter = OtlpExporter::spawn(export_config(&config), export_context());
+        let metrics = RuntimeMetrics::new();
+        let exporter =
+            OtlpExporter::spawn_observed(export_config(&config), export_context(), metrics.clone());
 
         let pods = pod_cache().await;
         let root = std::env::var_os("BORING_LOGTAIL_CRI_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/log/pods"));
-        let (event_task, event_shutdown) =
-            spawn_cri_loop(root, MAX_RECORD_BYTES, pods, exporter.sender())?;
+        let (event_task, event_shutdown) = spawn_cri_loop(
+            root,
+            MAX_RECORD_BYTES,
+            pods,
+            exporter.sender(),
+            metrics.clone(),
+        )?;
+
+        let http_listener = tokio::net::TcpListener::bind(config.http_listen)
+            .await
+            .with_context(|| format!("bind runtime HTTP listener {}", config.http_listen))?;
+        let (http_shutdown, http_stopped) = oneshot::channel();
+        let http_router = metrics.router();
+        let http_task = tokio::spawn(async move {
+            axum::serve(http_listener, http_router)
+                .with_graceful_shutdown(async move {
+                    let _ = http_stopped.await;
+                })
+                .await
+        });
+        metrics.set_ready(true);
 
         info!("capture source is userspace CRI files");
 
@@ -104,10 +129,14 @@ impl LogTailApplication {
             event_task: Some(event_task),
             event_shutdown: Some(event_shutdown),
             exporter: Some(exporter),
+            http_task: Some(http_task),
+            http_shutdown: Some(http_shutdown),
+            metrics,
         })
     }
 
     async fn shutdown(mut self) {
+        self.metrics.set_ready(false);
         if let Some(event_shutdown) = self.event_shutdown.take() {
             let _ = event_shutdown.send(());
         }
@@ -122,6 +151,17 @@ impl LogTailApplication {
 
         if let Some(exporter) = self.exporter.take() {
             info!("final OTLP export stats: {:?}", exporter.shutdown().await);
+        }
+
+        if let Some(http_shutdown) = self.http_shutdown.take() {
+            let _ = http_shutdown.send(());
+        }
+        if let Some(http_task) = self.http_task.take() {
+            match http_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("runtime HTTP server failed: {error}"),
+                Err(error) => warn!("runtime HTTP task failed: {error}"),
+            }
         }
     }
 }
@@ -147,6 +187,7 @@ fn spawn_cri_loop(
     max_record_bytes: usize,
     mut pods: watch::Receiver<Arc<PodSnapshot>>,
     exporter: OtlpSender,
+    metrics: RuntimeMetrics,
 ) -> anyhow::Result<(JoinHandle<anyhow::Result<()>>, oneshot::Sender<()>)> {
     let mut files = CriFileSet::new(root, max_record_bytes + 1024);
     files
@@ -168,6 +209,15 @@ fn spawn_cri_loop(
     let (shutdown, mut shutdown_receiver) = oneshot::channel();
 
     let task = tokio::spawn(async move {
+        struct CriticalTask(RuntimeMetrics, bool);
+        impl Drop for CriticalTask {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.critical_task_stopped();
+                }
+            }
+        }
+        let mut critical_task = CriticalTask(metrics.clone(), true);
         let _watcher = watcher;
         let mut reconcile_tick = tokio::time::interval(Duration::from_millis(500));
         let mut repair_tick = tokio::time::interval(Duration::from_secs(30));
@@ -183,23 +233,29 @@ fn spawn_cri_loop(
             tokio::select! {
                 _ = &mut shutdown_receiver => break,
                 _ = reconcile_tick.tick() => {
-                    if (reconcile_requested || notification_overflow.swap(false, Ordering::Relaxed))
+                    let overflowed = notification_overflow.swap(false, Ordering::Relaxed);
+                    if overflowed { metrics.watcher_overflow(); }
+                    if (reconcile_requested || overflowed)
                         && last_reconcile.elapsed() >= RECONCILE_COOLDOWN
                     {
                         reconcile_requested = false;
                         last_reconcile = tokio::time::Instant::now();
+                        let started = std::time::Instant::now();
                         match files.reconcile().and_then(|_| files.read_available()) {
-                            Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
+                            Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &metrics, &mut ingress_drops, &mut integrity_totals)?,
                             Err(error) => warn!("CRI file reconciliation failed: {error}"),
                         }
+                        metrics.observe_reconcile(started.elapsed().as_secs_f64());
                     }
                 }
                 _ = repair_tick.tick() => {
                     last_reconcile = tokio::time::Instant::now();
+                    let started = std::time::Instant::now();
                     match files.reconcile().and_then(|_| files.read_available()) {
-                        Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?,
+                        Ok(events) => process_cri_events(events, &mut joiner, &identities, &exporter, &metrics, &mut ingress_drops, &mut integrity_totals)?,
                         Err(error) => warn!("CRI repair reconciliation failed: {error}"),
                     }
+                    metrics.observe_reconcile(started.elapsed().as_secs_f64());
                 }
                 _ = report_tick.tick() => {
                     let file_stats = files.stats();
@@ -243,12 +299,22 @@ fn spawn_cri_loop(
 
                     if !changed.is_empty() {
                         let events = files.read_changed(&changed)?;
-                        process_cri_events(events, &mut joiner, &identities, &exporter, &mut ingress_drops, &mut integrity_totals)?;
+                        process_cri_events(events, &mut joiner, &identities, &exporter, &metrics, &mut ingress_drops, &mut integrity_totals)?;
                     }
                 }
             }
+            let file_stats = files.stats();
+            let identity_count = identities.values().map(|containers| containers.len()).sum();
+            metrics.observe_capture_state(
+                file_stats.tracked_files,
+                file_stats.pending_bytes,
+                joiner.pending_lanes(),
+                joiner.pending_bytes(),
+                identity_count,
+            );
         }
 
+        critical_task.1 = false;
         Ok(())
     });
 
@@ -267,18 +333,21 @@ fn process_cri_events(
     joiner: &mut CriJoiner,
     identities: &StdHashMap<String, StdHashMap<String, KubernetesIdentity>>,
     exporter: &OtlpSender,
+    metrics: &RuntimeMetrics,
     ingress_drops: &mut StdHashMap<TryExportError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
 ) -> anyhow::Result<()> {
     for event in events {
         let CriFileEvent::Line { source, bytes } = event else {
             warn!("discarding oversized CRI physical record");
+            metrics.dropped("oversized_physical_record");
             continue;
         };
         let fragment = match parse_record(&bytes) {
             Ok(fragment) => fragment,
             Err(error) => {
                 debug!("discarding malformed CRI record: {error}");
+                metrics.dropped("malformed_cri");
                 continue;
             }
         };
@@ -294,6 +363,7 @@ fn process_cri_events(
                 "CRI record has no current Pod identity: {}/{}",
                 record.source.namespace, record.source.pod_name
             );
+            metrics.dropped("identity_missing");
             continue;
         };
         let stream = match record.stream {
@@ -317,7 +387,14 @@ fn process_cri_events(
             100,
             Severity::Unknown,
         );
-        publish_record(&log_record, exporter, ingress_drops, integrity_totals);
+        metrics.captured();
+        publish_record(
+            &log_record,
+            exporter,
+            metrics,
+            ingress_drops,
+            integrity_totals,
+        );
     }
 
     Ok(())
@@ -378,18 +455,37 @@ fn export_context() -> ExportContext {
 fn publish_record(
     record: &LogRecord,
     exporter: &OtlpSender,
+    metrics: &RuntimeMetrics,
     ingress_drops: &mut StdHashMap<TryExportError, u64>,
     integrity_totals: &mut RecordIntegrityTotals,
 ) {
     let integrity = record.integrity();
 
     integrity_totals.capacity_splits += u64::from(integrity.capacity_split);
+    if integrity.capacity_split {
+        metrics.integrity("capacity_split");
+    }
 
     integrity_totals.capture_gaps += u64::from(integrity.capture_gap);
+    if integrity.capture_gap {
+        metrics.integrity("capture_gap");
+    }
 
     integrity_totals.unterminated_flushes += u64::from(integrity.unterminated);
+    if integrity.unterminated {
+        metrics.integrity("unterminated");
+    }
+    if integrity.capture_truncated {
+        metrics.integrity("capture_truncated");
+    }
 
     if let Err(reason) = exporter.try_send(record) {
+        metrics.dropped(match reason {
+            TryExportError::RecordTooLarge => "record_too_large",
+            TryExportError::QueueByteLimit => "queue_byte_limit",
+            TryExportError::QueueFull => "queue_full",
+            TryExportError::Closed => "exporter_closed",
+        });
         *ingress_drops.entry(reason).or_default() += 1;
     }
 }

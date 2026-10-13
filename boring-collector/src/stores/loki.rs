@@ -25,6 +25,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage}
 use crate::ports::{
     ExportError, LogEntry, LogReader, LogSink, PortLogStream, ReadError, ReadRequest, ReadSelector,
 };
+use crate::runtime_metrics::RuntimeMetrics;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_EXPORTS: usize = 16;
@@ -76,10 +77,15 @@ pub struct LokiLogStore {
     client: reqwest::Client,
     export_slots: Semaphore,
     handoff_buffer: usize,
+    metrics: RuntimeMetrics,
 }
 
 impl LokiLogStore {
     pub fn new(config: LokiConfig) -> Result<Self, &'static str> {
+        Self::with_metrics(config, RuntimeMetrics::new())
+    }
+
+    pub fn with_metrics(config: LokiConfig, metrics: RuntimeMetrics) -> Result<Self, &'static str> {
         let endpoint = config.validate()?;
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
@@ -91,7 +97,51 @@ impl LokiLogStore {
             client,
             export_slots: Semaphore::new(config.max_concurrent_exports),
             handoff_buffer: config.handoff_buffer,
+            metrics,
         })
+    }
+
+    async fn export_to_loki(
+        &self,
+        batch: ExportLogsServiceRequest,
+    ) -> Result<ExportLogsServiceResponse, ExportError> {
+        let response = self
+            .client
+            .post(self.url("/otlp/v1/logs"))
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .body(batch.encode_to_vec())
+            .send()
+            .await
+            .map_err(|error| ExportError::retryable(format!("export to Loki: {error}")))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let message = format!("Loki export returned HTTP {status}");
+            return if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                Err(ExportError::retryable(message))
+            } else {
+                Err(ExportError::rejected(message))
+            };
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|size| size as usize > MAX_RESPONSE_BYTES)
+        {
+            return Err(ExportError::retryable("Loki export response is too large"));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| ExportError::retryable(format!("read Loki response: {error}")))?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(ExportError::retryable("Loki export response is too large"));
+        }
+        if body.is_empty() {
+            return Ok(ExportLogsServiceResponse::default());
+        }
+        ExportLogsServiceResponse::decode(body)
+            .map_err(|error| ExportError::retryable(format!("decode Loki response: {error}")))
     }
 
     fn url(&self, path: &str) -> Url {
@@ -188,48 +238,25 @@ impl LogSink for LokiLogStore {
         &self,
         batch: ExportLogsServiceRequest,
     ) -> Result<ExportLogsServiceResponse, ExportError> {
-        let _slot = self
-            .export_slots
-            .try_acquire()
-            .map_err(|_| ExportError::retryable("Loki export concurrency is full"))?;
-        let response = self
-            .client
-            .post(self.url("/otlp/v1/logs"))
-            .header(header::CONTENT_TYPE, "application/x-protobuf")
-            .body(batch.encode_to_vec())
-            .send()
-            .await
-            .map_err(|error| ExportError::retryable(format!("export to Loki: {error}")))?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let message = format!("Loki export returned HTTP {status}");
-            return if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                Err(ExportError::retryable(message))
+        let _slot = match self.export_slots.try_acquire() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.metrics.loki_saturated();
+                return Err(ExportError::retryable("Loki export concurrency is full"));
+            }
+        };
+        self.metrics.loki_started();
+        let started = std::time::Instant::now();
+        let result = self.export_to_loki(batch).await;
+        self.metrics.loki_finished(started.elapsed().as_secs_f64());
+        if let Err(error) = &result {
+            self.metrics.loki_failed(if error.is_retryable() {
+                "retryable"
             } else {
-                Err(ExportError::rejected(message))
-            };
+                "rejected"
+            });
         }
-
-        if response
-            .content_length()
-            .is_some_and(|size| size as usize > MAX_RESPONSE_BYTES)
-        {
-            return Err(ExportError::retryable("Loki export response is too large"));
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| ExportError::retryable(format!("read Loki response: {error}")))?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(ExportError::retryable("Loki export response is too large"));
-        }
-        if body.is_empty() {
-            return Ok(ExportLogsServiceResponse::default());
-        }
-
-        ExportLogsServiceResponse::decode(body)
-            .map_err(|error| ExportError::retryable(format!("decode Loki response: {error}")))
+        result
     }
 }
 

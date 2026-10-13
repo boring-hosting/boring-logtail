@@ -2,15 +2,25 @@
 
 //! Small node-agent configuration for collector delivery.
 
-use std::{fs, path::Path, time::Duration};
+use std::{fs, net::SocketAddr, path::Path, time::Duration};
 
 use anyhow::Context as _;
 use serde::Deserialize;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub http_listen: SocketAddr,
     pub collector: CollectorExportConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            http_listen: "0.0.0.0:9090".parse().expect("static address is valid"),
+            collector: CollectorExportConfig::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +98,7 @@ mod tests {
         let config = Config::load(None).unwrap();
 
         assert!(config.collector.endpoint.ends_with(":4317"));
+        assert_eq!(config.http_listen.port(), 9090);
     }
 
     #[test]

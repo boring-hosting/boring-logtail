@@ -3,8 +3,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use boring_collector::{
-    CollectorConfig, grpc, health_router, otlp,
+    CollectorConfig, grpc, otlp,
     ports::{LogReader, LogSink},
+    runtime_metrics::RuntimeMetrics,
     stores::LokiLogStore,
 };
 use log::info;
@@ -16,7 +17,11 @@ async fn main() -> anyhow::Result<()> {
 
     let path = std::env::var_os("BORING_COLLECTOR_CONFIG").map(PathBuf::from);
     let config = CollectorConfig::load(path.as_deref())?;
-    let store = Arc::new(LokiLogStore::new(config.loki_config()).map_err(anyhow::Error::msg)?);
+    let metrics = RuntimeMetrics::new();
+    let store = Arc::new(
+        LokiLogStore::with_metrics(config.loki_config(), metrics.clone())
+            .map_err(anyhow::Error::msg)?,
+    );
     let log_sink: Arc<dyn LogSink> = store.clone();
     let reader: Arc<dyn LogReader> = store;
     let otlp_listener = TcpListener::bind(config.otlp_grpc_listen).await?;
@@ -29,11 +34,13 @@ async fn main() -> anyhow::Result<()> {
 
     info!("OTLP/gRPC listening on {}", config.otlp_grpc_listen);
     let otlp_stopped = stopped.clone();
+    let otlp_metrics = metrics.clone();
     tasks.spawn(async move {
-        otlp::serve(
+        otlp::serve_observed(
             otlp_listener,
             log_sink,
             config.max_request_bytes,
+            otlp_metrics,
             wait_for_stop(otlp_stopped),
         )
         .await
@@ -49,20 +56,25 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("health listening on {}", config.health_listen);
+    let health_metrics = metrics.clone();
     tasks.spawn(async move {
-        axum::serve(health_listener, health_router())
+        axum::serve(health_listener, health_metrics.router())
             .with_graceful_shutdown(wait_for_stop(stopped))
             .await
             .map_err(anyhow::Error::from)
     });
 
+    metrics.set_ready(true);
+
     tokio::select! {
         _ = shutdown_signal() => {}
         result = tasks.join_next() => {
+            metrics.critical_task_stopped();
             result.ok_or_else(|| anyhow::anyhow!("collector server set is empty"))???;
         }
     }
 
+    metrics.set_ready(false);
     let _ = stop.send(true);
     while let Some(result) = tasks.join_next().await {
         result??;

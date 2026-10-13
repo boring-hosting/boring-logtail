@@ -2,16 +2,22 @@
 
 //! Strict deployment configuration for the probe.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{error::Error, fmt, net::SocketAddr, time::Duration};
 
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_http_listen")]
+    pub http_listen: SocketAddr,
     pub runtime: RuntimeConfig,
     pub kubelet: KubeletConfig,
     pub prometheus: PrometheusConfig,
+}
+
+fn default_http_listen() -> SocketAddr {
+    "0.0.0.0:9090".parse().expect("static address is valid")
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -95,6 +101,7 @@ mod tests {
     use super::*;
 
     const YAML: &str = r#"
+http_listen: 0.0.0.0:9090
 runtime:
   interval: 15s
 kubelet:
@@ -112,6 +119,14 @@ prometheus:
         assert_eq!(config.runtime.interval, Duration::from_secs(15));
         assert_eq!(config.kubelet.timeout, Duration::from_secs(5));
         assert_eq!(config.prometheus.timeout, Duration::from_secs(5));
+        assert_eq!(config.http_listen.port(), 9090);
+    }
+
+    #[test]
+    fn defaults_the_runtime_http_listener_for_rolling_upgrades() {
+        let config: Config =
+            serde_yaml::from_str(&YAML.replace("http_listen: 0.0.0.0:9090\n", "")).unwrap();
+        assert_eq!(config.http_listen, default_http_listen());
     }
 
     #[test]
