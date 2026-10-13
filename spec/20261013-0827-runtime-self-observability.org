@@ -151,6 +151,23 @@ Ten-minute Prometheus medians captured on 2026-10-13 before this change:
 The post-rollout comparison uses the same ten-minute queries and per-Pod
 medians after the new revision reaches steady state.
 
+Ten-minute Prometheus medians captured on 2026-10-13 after revision
+=21ddf5e= reached steady state:
+
+| Program   | Pod count | RSS bytes                 | CPU cores                    |
+|-----------+-----------+---------------------------+------------------------------|
+| probe     |         2 | 1652736, 1677312          | 0.0002681335, 0.000400084   |
+| collector |         1 | 1785856                   | 0.000620764                 |
+| logtail   |         2 | 9156608, 9846784          | 0.0008328955, 0.0010713715  |
+
+Comparing the sorted per-program samples, the largest RSS increase was 8192
+bytes and the largest CPU increase was 0.000128708 cores. Both remain well
+inside the 5 MiB RSS and 5m CPU acceptance limits. Flux selected the shared
+sortable image tag =main-20261013T093515Z-21ddf5e= for all three images,
+committed the exact digests, and reconciled all five Pods Ready. Prometheus
+reports all five scrape targets up, the lifecycle endpoints answer successfully,
+and Grafana provisioned the =boring-pipeline-health= dashboard from Git.
+
 * TODO
 
 - [X] RSO1 Add typed registries and focused metric contract tests.
@@ -160,5 +177,5 @@ medians after the new revision reaches steady state.
       task supervision, configuration, and Kubernetes probes.
 - [X] RSO5 Add private scrape Services and the pipeline-health dashboard.
 - [X] RSO6 Pass local validation and measure the pre-rollout resource baseline.
-- [ ] RSO7 Publish through the existing workflow, observe the automatic Flux
+- [X] RSO7 Publish through the existing workflow, observe the automatic Flux
       bump, validate live queries/dashboard/health, and compare resource cost.
