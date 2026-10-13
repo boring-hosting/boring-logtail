@@ -1,0 +1,88 @@
+#+title: Flux image automation
+#+date: 2026-10-13 06:23 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-13.
+
+* Context
+
+The production collector, logtail, and probe images are pinned by digest in
+=boring-infra=. Each release currently requires a person to find three digests,
+edit the manifests, commit them, and reconcile Flux. The publish workflow tags
+images only with a Git commit SHA. Those tags are immutable but cannot be
+ordered by build time, so Flux cannot safely select the newest one.
+
+The production Flux installation does not yet include the image reflector or
+image automation controllers. Its Git source already uses SSH credentials; the
+same credentials can support automation if the deploy key has write access.
+
+* Decision
+
+Publish each successful =main= build under its existing full-SHA tag. After all
+three matrix builds succeed, a promotion job adds the same sortable immutable
+tag to collector, logtail, and probe:
+
+#+begin_example
+main-20261013T061637Z-6b444c2
+#+end_example
+
+Derive the timestamp from the commit, not the workflow start time. Re-running a
+workflow for one commit therefore addresses the same immutable tag. A failed
+matrix never publishes production-eligible tags. Do not add =latest= or another
+mutable production tag.
+
+Install Flux's =image-reflector-controller= and
+=image-automation-controller=. Define one private =ImageRepository= and one
+=ImagePolicy= for each of collector, logtail, and probe. Policies accept only
+the sortable =main-= tags, order their extracted timestamps ascending, and
+reflect each selected immutable tag's digest with =IfNotPresent=.
+
+Mark only the three image fields under =infrastructure/telemetry= for updates.
+An =ImageUpdateAutomation= checks out and pushes =main=, restricts setters to
+that directory and those three policies, and commits the selected full image
+references back to =boring-infra=. Production therefore remains pinned to both
+an immutable tag and digest, with every promotion recorded in Git.
+
+Use the existing GHCR pull secret for registry scans. Keep registry and Git
+credentials out of plaintext manifests. If the Flux SSH deploy key is
+read-only, enable write access on that existing key rather than adding a token
+to Git.
+
+#+begin_example
+main build -> immutable GHCR tags -> Flux policy -> boring-infra commit
+                                                    |
+                                                    v
+                                           telemetry reconcile
+#+end_example
+
+* Consequences
+
+- Every successful =main= image publication becomes eligible for production
+  without a manual digest-editing step.
+- Git remains the deployment audit log and reverting a promotion remains a
+  normal Git revert.
+- The three images are built from one commit, but registry publication and
+  policy scans can briefly promote them in separate automation commits. Flux
+  health checks remain the rollout gate.
+- A broken build cannot publish; a build that publishes but fails at runtime is
+  visible as a failed Flux reconciliation and is reverted through Git.
+
+* Acceptance
+
+- Re-running publication for one commit produces the same sortable tag.
+- Flux selects the newest matching immutable tag and reports its digest for all
+  three repositories.
+- Automation changes only the three telemetry image fields and pushes a commit
+  to =boring-infra/main=.
+- Rendered telemetry resources remain pinned by tag and digest.
+- Collector, logtail, and probe all become ready after an automated promotion.
+
+* TODO
+
+- [X] FIA1 Add deterministic sortable tags to the image publication workflow.
+- [X] FIA2 Install the Flux image controllers and their v1 CRDs.
+- [X] FIA3 Add private image repositories, policies, and scoped Git automation.
+- [X] FIA4 Mark the three telemetry images and document the automated release path.
+- [-] FIA5 Render, validate, and exercise one live automated promotion.

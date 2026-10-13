@@ -41,6 +41,8 @@ stateless ingestion and typed reads; Loki owns seven-day history.
 - [ ] Sustained throughput, burst, backpressure, restart, rotation, and metadata
   delay checks pass at documented bounds.
 - [ ] Ordinary builds and images require stable Rust only.
+- [ ] Publish sortable immutable image tags and let Flux commit digest-pinned
+  production promotions. See =spec/20261013-0623-flux-image-automation.org=.
 
 * Retired experiment
 
