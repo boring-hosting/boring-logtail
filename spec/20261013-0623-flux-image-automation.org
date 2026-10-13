@@ -4,7 +4,7 @@
 
 * Status
 
-Accepted on 2026-10-13.
+Implemented and validated in production on 2026-10-13.
 
 * Context
 
@@ -85,4 +85,16 @@ main build -> immutable GHCR tags -> Flux policy -> boring-infra commit
 - [X] FIA2 Install the Flux image controllers and their v1 CRDs.
 - [X] FIA3 Add private image repositories, policies, and scoped Git automation.
 - [X] FIA4 Mark the three telemetry images and document the automated release path.
-- [-] FIA5 Render, validate, and exercise one live automated promotion.
+- [X] FIA5 Render, validate, and exercise one live automated promotion.
+
+* Validation
+
+- =actionlint= 1.7.12 accepted the publication workflow.
+- SOPS decryption and all production Kustomize renders passed locally.
+- The generated Flux v2.9.5 controller bundle passed Kubernetes server-side
+  dry-run and both image controllers became ready in production.
+- Publication run =38358717282= built all three full-SHA images and published
+  =main-20261013T064528Z-4a84f4f= only after the matrix succeeded.
+- All three image policies selected that tag and resolved the expected digests.
+- Flux committed only the three marked telemetry image fields in =2eca0d4= and
+  =f38f6f5=, then reconciled collector, logtail, and probe to Ready.
