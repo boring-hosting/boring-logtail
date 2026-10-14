@@ -87,7 +87,7 @@ tracepoint contains the result, not the original arguments.
 We paired the two events with the value returned by
 =bpf_get_current_pid_tgid()=. Its upper 32 bits are the process identifier
 (PID), and its lower 32 bits are the thread identifier (TID).
-:NOTEEND:
+:NOTEEND: 
 
 At entry, the program saved a small value in a BPF hash map:
 

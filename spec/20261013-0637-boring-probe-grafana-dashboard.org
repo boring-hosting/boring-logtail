@@ -1,0 +1,81 @@
+#+title: Boring-probe Grafana dashboard
+#+date: 2026-10-13 06:37 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-13.
+
+* Context
+
+=boring-probe= pushes node, pod, and container CPU and memory samples from the
+kubelet Summary API into Prometheus. Grafana has the data source but no focused
+view of these metrics.
+
+The exported data contains current CPU cores, cumulative CPU time, memory
+bytes, and page-fault counters. It does not contain node capacity, pod resource
+requests or limits, pod phase, restart counts, network, disk, or cluster
+identity. The dashboard must not imply that these absent signals exist.
+
+* Decision
+
+Add an importable dashboard at
+=boring-probe/grafana/boring-probe-overview.json=. Keep one screen useful at
+cluster level, with filters for node, namespace, pod, and container. Use a
+Prometheus data-source variable so the JSON imports cleanly without a fixed
+data-source UID.
+
+The dashboard has three compact sections:
+
+- overview: sample freshness, reporting nodes, CPU cores in use, and working
+  set bytes;
+- cluster: CPU and memory by node, plus the busiest namespaces and pods;
+- pod detail: selected pod CPU and working set, container breakdown, and major
+  page-fault rate.
+
+Default to all nodes and namespaces. Pod and container detail follows the
+selected namespace and pod. Use stable label-based legends, readable units,
+short descriptions, shared crosshairs, restrained thresholds, and a 15-second
+refresh. Top lists limit visual noise rather than hiding series in PromQL.
+
+Report CPU as cores and memory as bytes. Do not show CPU or memory percentages
+until capacity, requests, or limits are exported. Use instantaneous
+=*_cpu_usage_cores= for usage views; reserve =rate()= for the cumulative
+page-fault counters. A freshness stat makes missing/stale remote-write samples
+visible without pretending it is a probe health metric.
+
+* Consequences
+
+- One dashboard covers cluster triage and a useful pod/container drill-down.
+- It cannot explain scheduling pressure, OOMs, restarts, network, or storage;
+  those require additional metrics rather than decorative panels.
+- A multi-cluster Prometheus would merge clusters because the probe currently
+  exports no cluster label.
+
+* Acceptance
+
+- The file parses as JSON and is accepted by Grafana's dashboard importer.
+- Every PromQL selector uses metric names and labels emitted by
+  =boring-probe=.
+- Data-source, node, namespace, pod, and container variables filter dependent
+  panels correctly, including the =All= selections.
+- The dashboard remains useful with one or many nodes and does not calculate
+  utilization percentages from incomplete data.
+- No panel depends on kube-state-metrics, node-exporter, or cAdvisor.
+
+* TODO
+
+- [X] D1 Add the dashboard JSON.
+- [X] D2 Validate its JSON shape, queries, variables, and metric vocabulary.
+
+* Validation
+
+- =jq= parsed the dashboard and verified its schema version, UID, refresh,
+  panel widths, unique panel IDs, data-source references, and variable set.
+- The nine metric names used by the panels match names emitted by the
+  Prometheus adapter; selectors use only its node, namespace, pod, and
+  container labels.
+- The dashboard contains no capacity-derived percentages, and
+  =git diff --check= passes.
+- No Grafana server is available in the workspace, so the final importer and
+  live-data rendering check remains an operator smoke test.

@@ -1,0 +1,96 @@
+#+title: Make boring-hosting the boring-logtail home
+#+date: 2026-10-10 08:47 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Proposed.
+
+* Context
+
+=boring-logtail= moved from its GitLab-era home to the public
+=boring-hosting/boring-logtail= GitHub repository. The complete local =main=
+history is present there; the older =alfredosa/boring-logtail= GitHub mirror is
+four commits behind.
+
+The implementation is healthy: all 54 workspace tests pass. Repository wiring
+is not. Image labels, manifests, and the manual push task still reference the
+old GitLab project and mutable =latest= images. There is no GitHub-native CI or
+release workflow.
+
+This change modernizes repository ownership and publication only. Valheim
+lifecycle observation needs its own later spec after this baseline is clean.
+
+* Decision
+
+Treat =https://github.com/boring-hosting/boring-logtail= as the canonical
+source repository while preserving GPL-3.0-or-later program licensing,
+GFDL-1.3-or-later documentation licensing, and existing Git history.
+
+#+begin_example
+pull request / main push -> format + test + lint + image build
+
+vX.Y.Z tag -> build two targets once
+             -> ghcr.io/boring-hosting/boring-logtail:X.Y.Z
+             -> ghcr.io/boring-hosting/boring-collector:X.Y.Z
+             -> record immutable image digests in the GitHub release
+#+end_example
+
+- Add a small GitHub Actions CI workflow for formatting, workspace tests,
+  relevant Clippy, and both container targets.
+- Add one release workflow triggered by a =vX.Y.Z= Git tag. Human-facing image
+  tags omit the =v= and remain plain =X.Y.Z=.
+- Do not publish or deploy =latest=. A release tag is never overwritten with
+  different bytes; deployments use OCI digests.
+- Update OCI source/revision/version labels and checked-in example manifests to
+  the =boring-hosting= GitHub/GHCR locations.
+- Remove the GitLab-specific manual push task. Keep local build and test tasks.
+- Keep the two runtime images and their existing interfaces unchanged.
+- Keep the old GitLab and personal GitHub remotes locally as explicitly named
+  provenance remotes; they are not publication destinations.
+- Do not commit or rewrite the maintainer's unfinished blog draft as part of
+  this work.
+
+* Consequences
+
+- Releases become reproducible and discoverable from the canonical source.
+- Production wiring can pin a digest while humans use one simple version.
+- Existing users of GitLab image names must migrate explicitly; no compatibility
+  aliases or duplicate publication are added.
+- The first release version is a maintainer decision. This spec does not infer
+  one from the current crate-internal =0.1.0= values.
+- Package visibility and source linking still need verification after the first
+  GHCR publication.
+
+* Acceptance
+
+- The GitHub repository contains the complete 15-commit =main= history.
+- CI passes formatting, all workspace tests, relevant Clippy, and both image
+  builds from a clean checkout.
+- A test release publishes distinct logtail and collector packages with the
+  same plain version tag and correct OCI source/revision/version metadata.
+- Published digests are captured in the GitHub release output.
+- No active README, task, image label, or example manifest references the old
+  GitLab registry or the stale personal mirror.
+- No checked-in deployment uses =latest=.
+- License files and SPDX headers remain intact.
+
+* TODO
+
+- [ ] GH1 Approve repository ownership, immutable publication, and release tag
+  conventions.
+- [ ] GH2 Add GitHub CI and prove the clean-checkout quality gates.
+- [ ] GH3 Add the two-target GHCR release workflow and OCI metadata.
+- [ ] GH4 Update README, local tasks, and example manifests; remove active
+  GitLab and mutable-tag references.
+- [ ] GH5 Publish one approved release and verify package visibility, source
+  links, tags, digests, and pullability.
+- [ ] GH6 Update =ROADMAP.org= and =TODO.org=, run the full validation gate,
+  and record results here.
+
+* Provenance
+
+- Canonical destination: =github.com/boring-hosting/boring-logtail=
+- Migrated head: =6948e7c0bec2d4a0e31741c337124796db836e43=
+- Legacy GitLab source: =gitlab.com/biomehub/boring-logtail=
+- Legacy GitHub mirror: =github.com/alfredosa/boring-logtail=
