@@ -10,8 +10,8 @@ use serde::Deserialize;
 use crate::{
     config::KubeletConfig,
     ports::{
-        ContainerStats, CpuStats, MemoryStats, NodeStats, PodReference, PodStats, StatsReadError,
-        StatsSnapshot, StatsSource,
+        ContainerStats, CpuStats, MemoryStats, NodeStats, PersistentVolumeClaimReference,
+        PodReference, PodStats, StatsReadError, StatsSnapshot, StatsSource, VolumeStats,
     },
 };
 
@@ -133,6 +133,8 @@ struct WirePodStats {
     start_time: String,
     cpu: Option<WireCpuStats>,
     memory: Option<WireMemoryStats>,
+    #[serde(default, rename = "volume")]
+    volumes: Vec<WireVolumeStats>,
     #[serde(default)]
     containers: Vec<WireContainerStats>,
 }
@@ -171,6 +173,26 @@ struct WireMemoryStats {
     rss_bytes: Option<u64>,
     page_faults: Option<u64>,
     major_page_faults: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireVolumeStats {
+    time: String,
+    name: String,
+    pvc_ref: Option<WirePersistentVolumeClaimReference>,
+    available_bytes: Option<u64>,
+    capacity_bytes: Option<u64>,
+    used_bytes: Option<u64>,
+    inodes_free: Option<u64>,
+    inodes: Option<u64>,
+    inodes_used: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct WirePersistentVolumeClaimReference {
+    name: String,
+    namespace: String,
 }
 
 impl TryFrom<WireSummary> for StatsSnapshot {
@@ -214,11 +236,39 @@ impl TryFrom<WirePodStats> for PodStats {
             start_time: parse_time(&stats.start_time)?,
             cpu: stats.cpu.map(TryInto::try_into).transpose()?,
             memory: stats.memory.map(TryInto::try_into).transpose()?,
+            volumes: stats
+                .volumes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             containers: stats
                 .containers
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl TryFrom<WireVolumeStats> for VolumeStats {
+    type Error = StatsReadError;
+
+    fn try_from(stats: WireVolumeStats) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: stats.name,
+            persistent_volume_claim: stats.pvc_ref.map(|reference| {
+                PersistentVolumeClaimReference {
+                    name: reference.name,
+                    namespace: reference.namespace,
+                }
+            }),
+            observed_at: parse_time(&stats.time)?,
+            available_bytes: stats.available_bytes,
+            capacity_bytes: stats.capacity_bytes,
+            used_bytes: stats.used_bytes,
+            inodes_free: stats.inodes_free,
+            inodes: stats.inodes,
+            inodes_used: stats.inodes_used,
         })
     }
 }
@@ -288,6 +338,17 @@ mod tests {
               "pods": [{
                 "podRef":{"name":"game-0","namespace":"games","uid":"pod-1"},
                 "startTime":"2026-10-11T10:00:10Z",
+                "volume":[{
+                  "time":"2026-10-11T10:01:00Z",
+                  "availableBytes":4096,
+                  "capacityBytes":8192,
+                  "usedBytes":3072,
+                  "inodesFree":90,
+                  "inodes":100,
+                  "inodesUsed":10,
+                  "name":"data",
+                  "pvcRef":{"name":"game-data","namespace":"games"}
+                }],
                 "containers":[{
                   "name":"server",
                   "startTime":"2026-10-11T10:00:11Z",
@@ -304,6 +365,16 @@ mod tests {
             Some(250_000_000)
         );
         assert_eq!(snapshot.pods[0].reference.uid, "pod-1");
+        assert_eq!(snapshot.pods[0].volumes[0].name, "data");
+        assert_eq!(snapshot.pods[0].volumes[0].capacity_bytes, Some(8192));
+        assert_eq!(
+            snapshot.pods[0].volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .name,
+            "game-data"
+        );
         assert_eq!(
             snapshot.pods[0].containers[0]
                 .memory

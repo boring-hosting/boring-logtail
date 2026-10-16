@@ -26,6 +26,7 @@ pub struct PodStats {
     pub start_time: SystemTime,
     pub cpu: Option<CpuStats>,
     pub memory: Option<MemoryStats>,
+    pub volumes: Vec<VolumeStats>,
     pub containers: Vec<ContainerStats>,
 }
 
@@ -42,6 +43,25 @@ pub struct ContainerStats {
     pub start_time: SystemTime,
     pub cpu: Option<CpuStats>,
     pub memory: Option<MemoryStats>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeStats {
+    pub name: String,
+    pub persistent_volume_claim: Option<PersistentVolumeClaimReference>,
+    pub observed_at: SystemTime,
+    pub available_bytes: Option<u64>,
+    pub capacity_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub inodes_free: Option<u64>,
+    pub inodes: Option<u64>,
+    pub inodes_used: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentVolumeClaimReference {
+    pub name: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,0 +1,56 @@
+#+title: Kubelet volume filesystem metrics
+#+date: 2026-10-16 08:05 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-16.
+
+* Context
+
+=boring-probe= already maps kubelet Summary CPU and memory measurements into
+an application-owned =StatsSnapshot= and publishes them with Prometheus Remote
+Write. The same Summary response contains timestamped filesystem measurements
+for Pod volumes and, when applicable, the referenced persistent volume claim.
+
+Valheim world persistence needs capacity and inode visibility without another
+sidecar, filesystem walk, or metrics scraper.
+
+* Decision
+
+Extend =PodStats= with application-owned volume filesystem statistics. Preserve
+the kubelet observation timestamp, missing values, volume name, and optional PVC
+reference. The kubelet adapter reads the =volume= array and the Prometheus
+adapter publishes present measurements as:
+
+- =k8s_volume_filesystem_available_bytes=
+- =k8s_volume_filesystem_capacity_bytes=
+- =k8s_volume_filesystem_used_bytes=
+- =k8s_volume_filesystem_inodes=
+- =k8s_volume_filesystem_inodes_free=
+- =k8s_volume_filesystem_inodes_used=
+
+Every series retains node, namespace, Pod name, and Pod UID labels. Volume name
+is always present; PVC name and namespace are present only when kubelet supplies
+a =pvcRef=.
+
+Name these as volume *filesystem* measurements rather than PVC utilization.
+Kubelet reports =statfs= values for the mounted filesystem. A dedicated CSI
+volume normally has claim-local values, while a =local-path= claim can expose
+the capacity and usage of its shared backing node filesystem. The probe must not
+pretend that these values are an enforced PVC quota or directory byte count.
+
+* Consequences
+
+- Prometheus can show backing-filesystem exhaustion and inode pressure for a
+  mounted claim without another workload.
+- Declared PVC request/capacity remains Kubernetes object state and is not
+  synthesized from kubelet measurements.
+- Per-directory usage, storage latency, and IOPS remain outside this interface.
+
+* Acceptance
+
+- A kubelet fixture maps all selected volume fields and its PVC reference.
+- Missing measurements remain absent instead of becoming zero.
+- Remote Write series use the kubelet timestamp and stable, sorted labels.
+- Focused formatting, tests, and strict Clippy pass.

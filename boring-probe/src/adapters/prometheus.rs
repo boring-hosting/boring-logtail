@@ -10,7 +10,10 @@ use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT};
 
 use crate::{
     config::PrometheusConfig,
-    ports::{CpuStats, MemoryStats, MetricsPushError, MetricsSink, PodReference, StatsSnapshot},
+    ports::{
+        CpuStats, MemoryStats, MetricsPushError, MetricsSink, PodReference, StatsSnapshot,
+        VolumeStats,
+    },
 };
 
 const REMOTE_WRITE_VERSION_HEADER: &str = "X-Prometheus-Remote-Write-Version";
@@ -124,6 +127,10 @@ fn write_request(snapshot: StatsSnapshot) -> Result<WriteRequest, MetricsPushErr
             pod.memory.as_ref(),
         )?;
 
+        for volume in pod.volumes {
+            append_volume_stats(&mut timeseries, &pod_labels, &volume)?;
+        }
+
         for container in pod.containers {
             let mut labels = pod_labels.clone();
             labels.insert("k8s_container_name", container.name);
@@ -138,6 +145,40 @@ fn write_request(snapshot: StatsSnapshot) -> Result<WriteRequest, MetricsPushErr
     }
 
     Ok(WriteRequest { timeseries })
+}
+
+fn append_volume_stats(
+    series: &mut Vec<TimeSeries>,
+    pod_labels: &BTreeMap<&'static str, String>,
+    volume: &VolumeStats,
+) -> Result<(), MetricsPushError> {
+    let mut labels = pod_labels.clone();
+    labels.insert("k8s_volume_name", volume.name.clone());
+    if let Some(claim) = &volume.persistent_volume_claim {
+        labels.insert("k8s_persistent_volume_claim_name", claim.name.clone());
+        labels.insert(
+            "k8s_persistent_volume_claim_namespace",
+            claim.namespace.clone(),
+        );
+    }
+
+    for (suffix, value) in [
+        ("available_bytes", volume.available_bytes),
+        ("capacity_bytes", volume.capacity_bytes),
+        ("used_bytes", volume.used_bytes),
+        ("inodes_free", volume.inodes_free),
+        ("inodes", volume.inodes),
+        ("inodes_used", volume.inodes_used),
+    ] {
+        append_optional(
+            series,
+            format!("k8s_volume_filesystem_{suffix}"),
+            &labels,
+            volume.observed_at,
+            value.map(|value| value as f64),
+        )?;
+    }
+    Ok(())
 }
 
 fn pod_labels(node: &str, pod: &PodReference) -> BTreeMap<&'static str, String> {
@@ -240,7 +281,9 @@ fn unix_millis(time: SystemTime) -> Result<i64, MetricsPushError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{ContainerStats, NodeStats, PodStats};
+    use crate::ports::{
+        ContainerStats, NodeStats, PersistentVolumeClaimReference, PodStats, VolumeStats,
+    };
     use std::time::Duration;
 
     fn at(seconds: u64) -> SystemTime {
@@ -269,6 +312,20 @@ mod tests {
                 start_time: at(2),
                 cpu: None,
                 memory: None,
+                volumes: vec![VolumeStats {
+                    name: "data".to_owned(),
+                    persistent_volume_claim: Some(PersistentVolumeClaimReference {
+                        name: "game-data".to_owned(),
+                        namespace: "games".to_owned(),
+                    }),
+                    observed_at: at(12),
+                    available_bytes: Some(4096),
+                    capacity_bytes: Some(8192),
+                    used_bytes: Some(3072),
+                    inodes_free: Some(90),
+                    inodes: Some(100),
+                    inodes_used: Some(10),
+                }],
                 containers: vec![ContainerStats {
                     name: "server".to_owned(),
                     start_time: at(3),
@@ -287,9 +344,24 @@ mod tests {
         };
 
         let request = write_request(snapshot).unwrap();
-        assert_eq!(request.timeseries.len(), 3);
+        assert_eq!(request.timeseries.len(), 9);
         assert_eq!(request.timeseries[0].samples[0].value, 0.25);
         assert_eq!(request.timeseries[0].samples[0].timestamp, 10_000);
+        let volume_capacity = request
+            .timeseries
+            .iter()
+            .find(|series| {
+                series.labels.iter().any(|label| {
+                    label.name == "__name__"
+                        && label.value == "k8s_volume_filesystem_capacity_bytes"
+                })
+            })
+            .unwrap();
+        assert_eq!(volume_capacity.samples[0].value, 8192.0);
+        assert_eq!(volume_capacity.samples[0].timestamp, 12_000);
+        assert!(volume_capacity.labels.iter().any(|label| {
+            label.name == "k8s_persistent_volume_claim_name" && label.value == "game-data"
+        }));
         for series in request.timeseries {
             assert!(
                 series
@@ -298,6 +370,30 @@ mod tests {
                     .all(|pair| pair[0].name < pair[1].name)
             );
         }
+    }
+
+    #[test]
+    fn omits_missing_volume_measurements_without_inventing_zeroes() {
+        let labels = BTreeMap::from([("k8s_pod_uid", "pod-1".to_owned())]);
+        let volume = VolumeStats {
+            name: "data".to_owned(),
+            persistent_volume_claim: None,
+            observed_at: at(12),
+            available_bytes: None,
+            capacity_bytes: Some(8192),
+            used_bytes: None,
+            inodes_free: None,
+            inodes: None,
+            inodes_used: None,
+        };
+        let mut series = Vec::new();
+
+        append_volume_stats(&mut series, &labels, &volume).unwrap();
+
+        assert_eq!(series.len(), 1);
+        assert!(series[0].labels.iter().any(|label| {
+            label.name == "__name__" && label.value == "k8s_volume_filesystem_capacity_bytes"
+        }));
     }
 
     #[test]
