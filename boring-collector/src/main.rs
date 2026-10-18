@@ -4,9 +4,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use boring_collector::{
     CollectorConfig, grpc, otlp,
-    ports::{LogReader, LogSink},
+    ports::{LogReader, LogSink, MetricsSink},
     runtime_metrics::RuntimeMetrics,
-    stores::LokiLogStore,
+    stores::{LokiLogStore, PrometheusMetricsStore},
 };
 use log::info;
 use tokio::{net::TcpListener, task::JoinSet};
@@ -24,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
     );
     let log_sink: Arc<dyn LogSink> = store.clone();
     let reader: Arc<dyn LogReader> = store;
+    let metrics_sink: Arc<dyn MetricsSink> = Arc::new(
+        PrometheusMetricsStore::new(config.prometheus_config()).map_err(anyhow::Error::msg)?,
+    );
     let otlp_listener = TcpListener::bind(config.otlp_grpc_listen).await?;
 
     let reader_listener = TcpListener::bind(config.reader_grpc_listen).await?;
@@ -35,10 +38,12 @@ async fn main() -> anyhow::Result<()> {
     info!("OTLP/gRPC listening on {}", config.otlp_grpc_listen);
     let otlp_stopped = stopped.clone();
     let otlp_metrics = metrics.clone();
+    let otlp_metrics_sink = metrics_sink.clone();
     tasks.spawn(async move {
         otlp::serve_observed(
             otlp_listener,
             log_sink,
+            otlp_metrics_sink,
             config.max_request_bytes,
             otlp_metrics,
             wait_for_stop(otlp_stopped),

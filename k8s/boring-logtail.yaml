@@ -27,6 +27,9 @@ data:
       request_timeout_ms: 10000
       max_concurrent_exports: 16
       handoff_buffer: 1024
+    prometheus:
+      otlp_endpoint: http://prometheus-server.observability.svc.cluster.local/api/v1/otlp/v1/metrics
+      request_timeout_ms: 5000
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -40,8 +43,8 @@ data:
     kubelet:
       endpoint: https://{node_name}:10250/stats/summary
       timeout: 5s
-    prometheus:
-      endpoint: http://prometheus-server.observability.svc.cluster.local/api/v1/write
+    collector:
+      endpoint: http://boring-collector:4317
       timeout: 5s
 ---
 apiVersion: v1

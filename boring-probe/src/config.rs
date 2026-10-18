@@ -13,7 +13,7 @@ pub struct Config {
     pub http_listen: SocketAddr,
     pub runtime: RuntimeConfig,
     pub kubelet: KubeletConfig,
-    pub prometheus: PrometheusConfig,
+    pub collector: CollectorConfig,
 }
 
 fn default_http_listen() -> SocketAddr {
@@ -37,7 +37,7 @@ pub struct KubeletConfig {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct PrometheusConfig {
+pub struct CollectorConfig {
     pub endpoint: String,
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
@@ -66,13 +66,13 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.runtime.interval.is_zero()
             || self.kubelet.timeout.is_zero()
-            || self.prometheus.timeout.is_zero()
+            || self.collector.timeout.is_zero()
         {
             return Err(ConfigError("durations must be non-zero"));
         }
 
         validate_endpoint("kubelet.endpoint", &self.kubelet.endpoint)?;
-        validate_endpoint("prometheus.endpoint", &self.prometheus.endpoint)?;
+        validate_endpoint("collector.endpoint", &self.collector.endpoint)?;
         Ok(())
     }
 }
@@ -107,8 +107,8 @@ runtime:
 kubelet:
   endpoint: https://node-name:10250/stats/summary
   timeout: 5s
-prometheus:
-  endpoint: http://prometheus:9090/api/v1/write
+collector:
+  endpoint: http://boring-collector:4317
   timeout: 5s
 "#;
 
@@ -118,7 +118,7 @@ prometheus:
         config.validate().unwrap();
         assert_eq!(config.runtime.interval, Duration::from_secs(15));
         assert_eq!(config.kubelet.timeout, Duration::from_secs(5));
-        assert_eq!(config.prometheus.timeout, Duration::from_secs(5));
+        assert_eq!(config.collector.timeout, Duration::from_secs(5));
         assert_eq!(config.http_listen.port(), 9090);
     }
 

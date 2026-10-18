@@ -3,7 +3,7 @@
 use std::{future::Future, sync::Arc};
 
 use crate::{
-    ports::{ExportError, LogSink},
+    ports::{ExportError, LogSink, MetricsSink},
     runtime_metrics::RuntimeMetrics,
 };
 use tonic_reflection::server::Builder as ReflectionBuilder;
@@ -34,7 +34,10 @@ struct OtlpLogsService {
 }
 
 #[derive(Clone)]
-struct OtlpMetricsService {}
+struct OtlpMetricsService {
+    sink: Arc<dyn MetricsSink>,
+    metrics: RuntimeMetrics,
+}
 
 #[tonic::async_trait]
 impl MetricsService for OtlpMetricsService {
@@ -59,12 +62,23 @@ impl MetricsService for OtlpMetricsService {
             })
             .sum();
 
-        println!("received {data_points} metric data points");
-
-        let metrics_resp = ExportMetricsServiceResponse::default();
-
-        let resp = Response::new(metrics_resp);
-        Ok(resp)
+        match self.sink.export(request).await {
+            Ok(response) => {
+                self.metrics.otlp_metrics_result("accepted", data_points);
+                Ok(Response::new(response))
+            }
+            Err(error) => {
+                self.metrics.otlp_metrics_result(
+                    if error.is_retryable() {
+                        "retryable"
+                    } else {
+                        "rejected"
+                    },
+                    data_points,
+                );
+                Err(export_status(error))
+            }
+        }
     }
 }
 
@@ -102,12 +116,14 @@ impl LogsService for OtlpLogsService {
 pub async fn serve(
     listener: TcpListener,
     log_sink: Arc<dyn LogSink>,
+    metrics_sink: Arc<dyn MetricsSink>,
     max_request_bytes: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     serve_observed(
         listener,
         log_sink,
+        metrics_sink,
         max_request_bytes,
         RuntimeMetrics::new(),
         shutdown,
@@ -118,19 +134,23 @@ pub async fn serve(
 pub async fn serve_observed(
     listener: TcpListener,
     log_sink: Arc<dyn LogSink>,
+    metrics_sink: Arc<dyn MetricsSink>,
     max_request_bytes: usize,
     metrics: RuntimeMetrics,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let service = LogsServiceServer::new(OtlpLogsService {
         sink: log_sink,
-        metrics,
+        metrics: metrics.clone(),
     })
     .max_decoding_message_size(max_request_bytes);
 
     // TODO: evaluate wtf the options are.
-    let metrics_service = MetricsServiceServer::new(OtlpMetricsService {})
-        .max_decoding_message_size(max_request_bytes);
+    let metrics_service = MetricsServiceServer::new(OtlpMetricsService {
+        sink: metrics_sink,
+        metrics,
+    })
+    .max_decoding_message_size(max_request_bytes);
 
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(OTLP_DESCRIPTOR_SET)
@@ -157,11 +177,15 @@ mod tests {
     use std::sync::Mutex;
 
     use opentelemetry_proto::tonic::{
-        collector::logs::v1::{
-            ExportLogsServiceRequest, ExportLogsServiceResponse,
-            logs_service_client::LogsServiceClient,
+        collector::{
+            logs::v1::{
+                ExportLogsServiceRequest, ExportLogsServiceResponse,
+                logs_service_client::LogsServiceClient,
+            },
+            metrics::v1::metrics_service_client::MetricsServiceClient,
         },
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        metrics::v1::{Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric},
     };
     use tonic_reflection::pb::v1::{
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
@@ -173,6 +197,28 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         records: Mutex<Vec<usize>>,
+        metric_points: Mutex<Vec<usize>>,
+    }
+
+    #[tonic::async_trait]
+    impl MetricsSink for RecordingSink {
+        async fn export(
+            &self,
+            batch: ExportMetricsServiceRequest,
+        ) -> Result<ExportMetricsServiceResponse, ExportError> {
+            let count = batch
+                .resource_metrics
+                .iter()
+                .flat_map(|resource| &resource.scope_metrics)
+                .flat_map(|scope| &scope.metrics)
+                .map(|metric| match &metric.data {
+                    Some(metric::Data::Gauge(gauge)) => gauge.data_points.len(),
+                    _ => 0,
+                })
+                .sum();
+            self.metric_points.lock().unwrap().push(count);
+            Ok(ExportMetricsServiceResponse::default())
+        }
     }
 
     #[tonic::async_trait]
@@ -199,14 +245,21 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let server_sink: Arc<dyn LogSink> = sink.clone();
+        let server_metrics_sink: Arc<dyn MetricsSink> = sink.clone();
         let server = tokio::spawn(async move {
-            serve(listener, server_sink, 1024 * 1024, async move {
-                while stopped.changed().await.is_ok() {
-                    if *stopped.borrow() {
-                        break;
+            serve(
+                listener,
+                server_sink,
+                server_metrics_sink,
+                1024 * 1024,
+                async move {
+                    while stopped.changed().await.is_ok() {
+                        if *stopped.borrow() {
+                            break;
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
         });
         let mut client = LogsServiceClient::connect(format!("http://{address}"))
@@ -231,13 +284,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_otlp_metrics_client_crosses_one_bulk_sink_call() {
+        let sink = Arc::new(RecordingSink::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let log_sink: Arc<dyn LogSink> = sink.clone();
+        let metrics_sink: Arc<dyn MetricsSink> = sink.clone();
+        let server = tokio::spawn(async move {
+            serve(listener, log_sink, metrics_sink, 1024 * 1024, async move {
+                while stopped.changed().await.is_ok() {
+                    if *stopped.borrow() {
+                        break;
+                    }
+                }
+            })
+            .await
+        });
+        let mut client = MetricsServiceClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        client
+            .export(ExportMetricsServiceRequest {
+                resource_metrics: vec![ResourceMetrics {
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics: vec![Metric {
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint::default()],
+                            })),
+                            ..Metric::default()
+                        }],
+                        ..ScopeMetrics::default()
+                    }],
+                    ..ResourceMetrics::default()
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(*sink.metric_points.lock().unwrap(), vec![1]);
+
+        drop(client);
+        stop.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn reflection_lists_otlp_logs_and_metrics() {
-        let sink: Arc<dyn LogSink> = Arc::new(RecordingSink::default());
+        let sink = Arc::new(RecordingSink::default());
+        let log_sink: Arc<dyn LogSink> = sink.clone();
+        let metrics_sink: Arc<dyn MetricsSink> = sink;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(async move {
-            serve(listener, sink, 1024 * 1024, async move {
+            serve(listener, log_sink, metrics_sink, 1024 * 1024, async move {
                 while stopped.changed().await.is_ok() {
                     if *stopped.borrow() {
                         break;

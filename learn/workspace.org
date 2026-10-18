@@ -1,11 +1,13 @@
 #+title: The BLT crate map
 #+license: GFDL-1.3-or-later
 
-BLT is two programs and two Cargo packages. OTLP/gRPC is their boundary.
+BLT is three programs and three Cargo packages. The collector is the trusted
+cluster ingress for logs and pushed metrics.
 
 #+begin_example
-boring-logtail -- OTLP/gRPC --> boring-collector --> Loki
- node agent                         cluster service
+boring-logtail -- OTLP Logs/gRPC --------> boring-collector --> Loki
+boring-probe --- OTLP Metrics/gRPC ------> boring-collector --> Prometheus
+instrumented apps -- OTLP Metrics/gRPC -> boring-collector --> Prometheus
 #+end_example
 
 * Node agent modules
@@ -13,17 +15,21 @@ boring-logtail -- OTLP/gRPC --> boring-collector --> Loki
 The =model/= module owns captured records and Kubernetes identity. The =otlp/=
 module maps those facts to OTLP Logs and owns bounded delivery and retry.
 
+=boring-probe= maps kubelet Summary snapshots into OTLP Metrics and sends them
+through the same collector service used by instrumented applications.
+
 * Collector modules
 
 The =ports/= module owns complete OTLP writes and typed log reads. The =stores/=
-module contains the Loki production adapter and the small in-memory adapter for
-tests and local experiments.
+module contains the Loki and Prometheus production adapters plus the small
+in-memory log adapter for tests and local experiments.
 
 * The binaries
 
 =boring-logtail= owns CRI-file lifecycle, partial joining, Kubernetes watches,
-and bounded collector delivery. =boring-collector= owns stateless OTLP ingress,
-bulk Loki delivery, health, and the trusted gRPC reader adapter.
+and bounded collector delivery. =boring-probe= owns kubelet Summary collection.
+=boring-collector= owns stateless OTLP ingress, bulk Loki and Prometheus
+delivery, health, and the trusted gRPC reader adapter.
 
 Put code with the facts or resource lifecycle it owns. Leave a moving boundary
 in its composition root until evidence earns another crate.

@@ -25,8 +25,10 @@ stateless ingestion and typed reads; Loki owns seven-day history.
 - [X] Reduce operator configuration to demonstrated product choices.
 - [X] Collapse single-consumer support crates into the two program packages.
 - [ ] Add another OTLP signal only when its backend and use are concrete.
-- [X] Wire kubelet CPU/memory snapshots through the Prometheus Remote Write
-  adapter and validate the live node path.
+- [ ] Make the collector the trusted OTLP Metrics ingress for the probe and
+  applications, then forward those batches into Prometheus.
+- [X] Map kubelet CPU/memory snapshots into pushed metrics and validate the live
+  node path.
 - [X] Export kubelet volume filesystem capacity, usage, and inode measurements
   with optional persistent-volume-claim identity.
 

@@ -33,6 +33,7 @@ struct Inner {
     loki_inflight: Gauge,
     otlp_requests: Family<Labels, Counter>,
     otlp_records: Family<Labels, Counter>,
+    otlp_metric_points: Family<Labels, Counter>,
     loki_saturation: Counter,
     loki_failures: Family<Labels, Counter>,
     loki_duration: Histogram,
@@ -44,6 +45,7 @@ impl RuntimeMetrics {
         let loki_inflight = Gauge::default();
         let otlp_requests = Family::default();
         let otlp_records = Family::default();
+        let otlp_metric_points = Family::default();
         let loki_saturation = Counter::default();
         let loki_failures = Family::default();
         let loki_duration = Histogram::new([0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0]);
@@ -61,6 +63,11 @@ impl RuntimeMetrics {
             prometheus_name("boring.collector.otlp.records"),
             "OTLP log records by result",
             otlp_records.clone(),
+        );
+        registry.register(
+            prometheus_name("boring.collector.otlp.metric.points"),
+            "OTLP metric data points by result",
+            otlp_metric_points.clone(),
         );
         registry.register(
             prometheus_name("boring.collector.loki.saturation"),
@@ -84,6 +91,7 @@ impl RuntimeMetrics {
             loki_inflight,
             otlp_requests,
             otlp_records,
+            otlp_metric_points,
             loki_saturation,
             loki_failures,
             loki_duration,
@@ -110,6 +118,12 @@ impl RuntimeMetrics {
             .otlp_records
             .get_or_create(&labels)
             .inc_by(records as u64);
+    }
+    pub fn otlp_metrics_result(&self, result: &'static str, points: usize) {
+        self.0
+            .otlp_metric_points
+            .get_or_create(&[("result", result)])
+            .inc_by(points as u64);
     }
     pub fn loki_started(&self) {
         self.0.loki_inflight.inc();
@@ -142,6 +156,7 @@ impl Default for RuntimeMetrics {
 fn prometheus_name(otel_name: &str) -> String {
     otel_name.replace('.', "_")
 }
+
 async fn metrics(State(state): State<RuntimeMetrics>) -> Response {
     Response::builder()
         .header(
@@ -151,6 +166,7 @@ async fn metrics(State(state): State<RuntimeMetrics>) -> Response {
         .body(Body::from(state.encode()))
         .unwrap()
 }
+
 async fn health(State(state): State<RuntimeMetrics>) -> StatusCode {
     if state.0.alive.load(Ordering::Acquire) {
         StatusCode::NO_CONTENT
@@ -158,6 +174,7 @@ async fn health(State(state): State<RuntimeMetrics>) -> StatusCode {
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
+
 async fn ready(State(state): State<RuntimeMetrics>) -> StatusCode {
     if state.0.alive.load(Ordering::Acquire) && state.0.ready.load(Ordering::Acquire) {
         StatusCode::NO_CONTENT
@@ -173,12 +190,14 @@ mod tests {
     async fn exposes_bounded_otlp_loki_and_lifecycle_contract() {
         let metrics = RuntimeMetrics::new();
         metrics.otlp_result("accepted", 3);
+        metrics.otlp_metrics_result("accepted", 4);
         metrics.loki_saturated();
         metrics.loki_failed("retryable");
         metrics.loki_started();
         metrics.loki_finished(0.1);
         let text = metrics.encode();
         assert!(text.contains("boring_collector_otlp_records_total{result=\"accepted\"} 3"));
+        assert!(text.contains("boring_collector_otlp_metric_points_total{result=\"accepted\"} 4"));
         assert!(text.contains("boring_collector_loki_exports_inflight 0"));
         assert!(text.len() < 64 * 1024);
         assert_eq!(

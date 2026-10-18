@@ -3,7 +3,7 @@
 //! Concrete adapters for the probe ports.
 
 mod kubelet;
-mod prometheus;
+mod otlp;
 
 pub use kubelet::{KubeletAdapterBuildError, KubeletStatsAdapter};
-pub use prometheus::PrometheusRemoteWriteAdapter;
+pub use otlp::OtlpMetricsAdapter;

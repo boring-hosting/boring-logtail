@@ -5,11 +5,20 @@ This file indexes deliberately deferred work and ideas worth revisiting. Active
 execution steps belong in the TODO section of their corresponding file under
 =spec/=.
 
-* DONE Choose the Prometheus ingestion protocol for boring-probe
+* DONE Choose the metrics protocol for boring-probe
 
-Remote Write 1.0 is the concrete sink protocol; the application port still
-owns only =StatsSnapshot=. See
-=spec/20261011-1637-kubelet-prometheus-adapters.org=.
+OTLP/gRPC is the concrete sink protocol; the application port still owns only
+=StatsSnapshot=. The original direct Remote Write choice in
+=spec/20261011-1637-kubelet-prometheus-adapters.org= is superseded by
+=spec/20261018-1420-otlp-metrics-prometheus.org= now that the collector metrics
+path has a concrete backend.
+
+* TODO Persist collector OTLP metrics in Prometheus
+
+Why: the Metrics service currently acknowledges and discards Avrustet batches,
+while boring-probe bypasses the collector. Send probe snapshots to that service
+as OTLP and forward unchanged OTLP metrics to Prometheus's native receiver.
+See =spec/20261018-1420-otlp-metrics-prometheus.org=.
 
 * TODO Give Kubernetes watcher tasks explicit application ownership
 

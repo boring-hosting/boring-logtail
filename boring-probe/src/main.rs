@@ -2,7 +2,7 @@ use std::{env, fs::File, time::Duration};
 
 use anyhow::{Context, Result};
 use boring_probe::{
-    adapters::{KubeletStatsAdapter, PrometheusRemoteWriteAdapter},
+    adapters::{KubeletStatsAdapter, OtlpMetricsAdapter},
     config::Config,
     ports::{MetricsSink, StatsSource},
     runtime_metrics::RuntimeMetrics,
@@ -33,19 +33,14 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config().context("load probe configuration")?;
 
     let kubelet = KubeletStatsAdapter::new(&config.kubelet)?;
-    let prometheus = PrometheusRemoteWriteAdapter::new(&config.prometheus);
+    let collector = OtlpMetricsAdapter::new(&config.collector)?;
 
     let metrics = RuntimeMetrics::new();
     let listener = tokio::net::TcpListener::bind(config.http_listen)
         .await
         .with_context(|| format!("bind runtime HTTP listener {}", config.http_listen))?;
-    let (task, shutdown) = run_observed(
-        config.runtime.interval,
-        kubelet,
-        prometheus,
-        metrics.clone(),
-    )
-    .await?;
+    let (task, shutdown) =
+        run_observed(config.runtime.interval, kubelet, collector, metrics.clone()).await?;
     let (http_shutdown, http_stopped) = oneshot::channel();
     let router = metrics.router();
     let http_task = tokio::spawn(async move {

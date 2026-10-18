@@ -35,7 +35,7 @@ struct Inner {
     last_success_timestamp: Gauge,
     reconciles: Family<Labels, Counter>,
     kubelet_read_duration: Histogram,
-    prometheus_push_duration: Histogram,
+    collector_push_duration: Histogram,
 }
 
 impl RuntimeMetrics {
@@ -46,7 +46,7 @@ impl RuntimeMetrics {
         let last_success_timestamp = Gauge::default();
         let reconciles = Family::default();
         let kubelet_read_duration = Histogram::new([0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]);
-        let prometheus_push_duration = Histogram::new([0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]);
+        let collector_push_duration = Histogram::new([0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]);
         registry.register(
             prometheus_name("boring.probe.snapshot.pods"),
             "Pods in the latest kubelet snapshot",
@@ -73,9 +73,9 @@ impl RuntimeMetrics {
             kubelet_read_duration.clone(),
         );
         registry.register(
-            prometheus_name("boring.probe.prometheus.push.duration"),
-            "Prometheus remote-write duration",
-            prometheus_push_duration.clone(),
+            prometheus_name("boring.probe.collector.push.duration"),
+            "Collector OTLP export duration",
+            collector_push_duration.clone(),
         );
         Self(Arc::new(Inner {
             registry,
@@ -86,7 +86,7 @@ impl RuntimeMetrics {
             last_success_timestamp,
             reconciles,
             kubelet_read_duration,
-            prometheus_push_duration,
+            collector_push_duration,
         }))
     }
 
@@ -115,7 +115,7 @@ impl RuntimeMetrics {
         self.0.kubelet_read_duration.observe(seconds);
     }
     pub fn push_duration(&self, seconds: f64) {
-        self.0.prometheus_push_duration.observe(seconds);
+        self.0.collector_push_duration.observe(seconds);
     }
     pub fn successful(&self) {
         let now = std::time::SystemTime::now()

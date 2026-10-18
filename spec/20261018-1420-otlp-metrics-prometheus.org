@@ -1,0 +1,114 @@
+#+title: Persist OTLP metrics in Prometheus
+#+date: 2026-10-18 14:20 UTC
+#+license: GFDL-1.3-or-later
+
+* Status
+
+Accepted on 2026-10-18 with the explicit probe-to-collector path.
+
+* Context
+
+Avrustet exports OTLP Metrics over gRPC to =boring-collector=. The collector's
+Metrics service currently counts the request's data points, prints that count,
+returns success, and discards the request. The unused =MetricsSink= port proves
+that a storage boundary was started, but no adapter or runtime wiring was ever
+implemented.
+
+This is why the collector logs roughly 38 data points per export while
+Prometheus contains only the independently published kubelet Summary metrics.
+
+=boring-probe='s existing Remote Write implementation is live, but it bypasses
+the collector and duplicates a protocol boundary:
+
+#+begin_example
+kubelet Summary -> boring-probe ---------------------> Prometheus Remote Write
+Avrustet OTLP    -> boring-collector -> discarded
+#+end_example
+
+Prometheus 3.15 already supports OTLP/HTTP protobuf ingestion at
+=/api/v1/otlp/v1/metrics= when =--web.enable-otlp-receiver= is set. This was
+verified against the deployed version and the Prometheus documentation on
+2026-10-18:
+https://prometheus.io/docs/guides/opentelemetry/
+
+* Decision
+
+Make =boring-collector= the single trusted OTLP metrics ingress:
+
+#+begin_example
+boring-probe -- OTLP/gRPC --> boring-collector -- OTLP/HTTP --> Prometheus
+Avrustet ----- OTLP/gRPC --> boring-collector -- OTLP/HTTP --> Prometheus
+#+end_example
+
+Replace the probe's Prometheus Remote Write adapter with an OTLP/gRPC adapter
+that maps the same kubelet measurements and labels. Point it at the collector's
+existing Metrics service. Do not add another collector route or ingress
+protocol.
+
+Add one collector Prometheus OTLP metrics adapter. It re-encodes the received
+=ExportMetricsServiceRequest= and posts it unchanged as
+=application/x-protobuf=. It does not translate OTLP into Remote Write or
+interpret individual gauges, sums, histograms, summaries, temporality, or
+resource attributes.
+
+The collector configuration gains a Prometheus metrics endpoint and request
+timeout. The production configuration points at:
+
+#+begin_example
+http://prometheus-server.observability.svc.cluster.local/api/v1/otlp/v1/metrics
+#+end_example
+
+Enable Prometheus's OTLP receiver and promote the resource attributes already
+injected into Valheim: service name, namespace, instance ID, version,
+environment, Kubernetes namespace, and Kubernetes deployment.
+
+The OTLP gRPC service passes one complete request to one =MetricsSink= call.
+Successful Prometheus responses return OTLP success. Transport failures, HTTP
+429, and HTTP 5xx become retryable gRPC =Unavailable= errors. Other HTTP errors
+become rejected gRPC =InvalidArgument= errors, so exporters do not silently
+lose accepted-looking batches.
+
+Reuse the collector's bounded gRPC request size and preserve the senders'
+existing retry behavior. Do not add a queue, worker, new process, extra ingress
+route, or protocol translator.
+
+* Consequences
+
+- Avrustet application metrics become queryable in the existing Prometheus.
+- OTLP metric semantics remain Prometheus's responsibility instead of being
+  partially reimplemented here.
+- Prometheus and the collector stay inside cluster-only Services; enabling the
+  receiver creates no public endpoint.
+- A Prometheus outage backpressures the exporter through retryable OTLP errors.
+  The collector remains stateless and does not promise durable metric buffering.
+- Probe kubelet metrics keep their names, labels, values, and timestamps while
+  using the collector's existing OTLP Metrics service.
+
+* Acceptance
+
+- A service test proves one OTLP gRPC request crosses one =MetricsSink= call
+  without changing its protobuf content.
+- Adapter tests prove the protobuf content type/body and 2xx, 429, 4xx, and 5xx
+  handling.
+- Probe adapter tests prove kubelet snapshots preserve metric names, labels,
+  values, timestamps, and missing measurements in OTLP.
+- Configuration tests prove endpoint trimming, URL validation, timeout, and
+  unknown-field rejection.
+- Runtime self-metrics count accepted, retryable, and rejected metric points;
+  the per-request =println!= is removed.
+- Focused tests, workspace formatting, workspace tests, and strict Clippy pass.
+- The local GitOps diff enables the Prometheus OTLP receiver, configures the
+  collector sink, points the probe at collector OTLP/gRPC, promotes the approved
+  resource attributes, and replaces the preliminary Valheim dashboard with the
+  Avrustet application dashboard adapted to the available kubelet series.
+- No image, commit, push, GitOps reconciliation, or live deployment occurs
+  before maintainer review.
+
+* TODO
+
+- [X] OMP1 Approve this decision and acceptance contract.
+- [X] OMP2 Add the configured Prometheus OTLP/HTTP metrics adapter and tests.
+- [X] OMP3 Wire probe and application OTLP Metrics through the collector.
+- [X] OMP4 Prepare and validate the local GitOps receiver/configuration diff.
+- [X] OMP5 Rework the GitOps Valheim dashboard around native Avrustet metrics.
+- [X] OMP6 Run focused and workspace validation; present the unpushed diff.
